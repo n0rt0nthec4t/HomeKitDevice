@@ -201,18 +201,15 @@ export default class HomeKitDevice {
     if (typeof this.addServices === 'function') {
       try {
         let postSetupDetails = await this.addServices();
-        if (this?.log?.info) {
+        this?.log?.info &&
           this.log.info('Setup %s %s as "%s"', this.deviceData.manufacturer, this.deviceData.model, this.deviceData.description);
-          if (this.historyService?.EveHome !== undefined) {
-            this.log.info('  += EveHome support as "%s"', this.historyService.EveHome.evetype);
-          }
-          if (typeof postSetupDetails === 'object') {
-            postSetupDetails.forEach((output) => {
-              if (this?.log?.info) {
-                this.log.info('  += %s', output);
-              }
-            });
-          }
+        if (this.historyService?.EveHome !== undefined) {
+          this?.log?.info && this.log.info('  += EveHome support as "%s"', this.historyService.EveHome.evetype);
+        }
+        if (typeof postSetupDetails === 'object') {
+          postSetupDetails.forEach((output) => {
+            this?.log?.info && this.log.info('  += %s', output);
+          });
         }
       } catch (error) {
         this?.log?.error && this.log.error('addServices call for device "%s" failed. Error was', this.deviceData.description, error);
@@ -229,10 +226,9 @@ export default class HomeKitDevice {
         pincode: this.accessory.pincode,
         category: this.accessory.category,
       });
-      if (this?.log?.info) {
-        this.log.info('  += Advertising as "%s"', this.accessory.displayName);
-        this.log.info('  += Pairing code is "%s"', this.accessory.pincode);
-      }
+
+      this?.log?.info && this.log.info('  += Advertising as "%s"', this.accessory.displayName);
+      this?.log?.info && this.log.info('  += Pairing code is "%s"', this.accessory.pincode);
     }
 
     return this.accessory; // Return our HomeKit accessory
