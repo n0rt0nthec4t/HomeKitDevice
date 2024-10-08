@@ -154,11 +154,11 @@ export default class HomeKitDevice {
       typeof this.deviceData?.manufacturer !== 'string' ||
       this.deviceData.manufacturer === '' ||
       (this.#platform === undefined &&
-        typeof this.deviceData?.hkPairingCode !== 'string' &&
-        (new RegExp(/^([0-9]{3}-[0-9]{2}-[0-9]{3})$/).test(this.deviceData.hkPairingCode) === true ||
-          new RegExp(/^([0-9]{4}-[0-9]{4})$/).test(this.deviceData.hkPairingCode) === true) &&
-        typeof this.deviceData?.hkUsername !== 'string' &&
-        new RegExp(/^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$/).test(this.deviceData.hkUsername) === false)
+        (typeof this.deviceData?.hkPairingCode !== 'string' ||
+          (new RegExp(/^([0-9]{3}-[0-9]{2}-[0-9]{3})$/).test(this.deviceData.hkPairingCode) === false &&
+            new RegExp(/^([0-9]{4}-[0-9]{4})$/).test(this.deviceData.hkPairingCode) === false) ||
+          typeof this.deviceData?.hkUsername !== 'string' ||
+          new RegExp(/^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$/).test(this.deviceData.hkUsername) === false))
     ) {
       return;
     }
