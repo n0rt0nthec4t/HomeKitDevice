@@ -35,7 +35,7 @@
 // HomeKitDevice.updateServices(deviceData)
 // HomeKitDevice.messageServices(type, message)
 //
-// Code version 8/10/2024
+// Code version 2025/05/22
 // Mark Hulskamp
 'use strict';
 
@@ -77,9 +77,9 @@ export default class HomeKitDevice {
       this.log = log;
     }
 
-    // Workout if we're running under HomeBridge or HAP-NodeJS library
+    // Workout if we're running under Homebridge or HAP-NodeJS library
     if (isNaN(api?.version) === false && typeof api?.hap === 'object' && api?.HAPLibraryVersion === undefined) {
-      // We have the HomeBridge version number and hap API object
+      // We have the Homebridge version number and hap API object
       this.hap = api.hap;
       this.#platform = api;
 
@@ -87,7 +87,7 @@ export default class HomeKitDevice {
     }
 
     if (typeof api?.HAPLibraryVersion === 'function' && api?.version === undefined && api?.hap === undefined) {
-      // As we're missing the HomeBridge entry points but have the HAP library version
+      // As we're missing the Homebridge entry points but have the HAP library version
       this.hap = api;
 
       this?.log?.debug && this.log.debug('HomeKitDevice module using HAP-NodeJS library for "%s"', deviceData?.description);
@@ -96,19 +96,10 @@ export default class HomeKitDevice {
     // Generate UUID for this device instance
     // Will either be a random generated one or HAP generated one
     // HAP is based upon defined plugin name and devices serial number
-    this.uuid = crypto.randomUUID();
-    if (
-      typeof HomeKitDevice.PLUGIN_NAME === 'string' &&
-      HomeKitDevice.PLUGIN_NAME !== '' &&
-      typeof deviceData.serialNumber === 'string' &&
-      deviceData.serialNumber !== '' &&
-      typeof this?.hap?.uuid?.generate === 'function'
-    ) {
-      this.uuid = this.hap.uuid.generate(HomeKitDevice.PLUGIN_NAME + '_' + deviceData.serialNumber.toUpperCase());
-    }
+    this.uuid = HomeKitDevice.generateUUID(HomeKitDevice.PLUGIN_NAME, api, deviceData.serialNumber);
 
     // See if we were passed in an existing accessory object or array of accessory objects
-    // Mainly used to restore a HomeBridge cached accessory
+    // Mainly used to restore a Homebridge cached accessory
     if (typeof accessory === 'object' && this.#platform !== undefined) {
       if (Array.isArray(accessory) === true) {
         this.accessory = accessory.find((accessory) => accessory?.UUID === this.uuid);
@@ -165,7 +156,7 @@ export default class HomeKitDevice {
 
     // If we do not have an existing accessory object, create a new one
     if (this.accessory === undefined && this.#platform !== undefined) {
-      // Create HomeBridge platform accessory
+      // Create Homebridge platform accessory
       this.accessory = new this.#platform.platformAccessory(this.deviceData.description, this.uuid);
       this.#platform.registerPlatformAccessories(HomeKitDevice.PLUGIN_NAME, HomeKitDevice.PLATFORM_NAME, [this.accessory]);
     }
@@ -430,5 +421,33 @@ export default class HomeKitDevice {
         break;
       }
     }
+  }
+
+  static generateUUID(PLUGIN_NAME, api, serialNumber) {
+    let hap = undefined;
+    let uuid = crypto.randomUUID();
+
+    // Workout if we're running under Homebridge or HAP-NodeJS library
+    if (isNaN(api?.version) === false && typeof api?.hap === 'object' && api?.HAPLibraryVersion === undefined) {
+      // We have the Homebridge version number and hap API object
+      hap = api.hap;
+    }
+
+    if (typeof api?.HAPLibraryVersion === 'function' && api?.version === undefined && api?.hap === undefined) {
+      // As we're missing the Homebridge entry points but have the HAP library version
+      hap = api;
+    }
+
+    if (
+      typeof PLUGIN_NAME === 'string' &&
+      PLUGIN_NAME !== '' &&
+      typeof serialNumber === 'string' &&
+      serialNumber !== '' &&
+      typeof hap?.uuid?.generate === 'function'
+    ) {
+      uuid = hap.uuid.generate(PLUGIN_NAME + '_' + serialNumber.toUpperCase());
+    }
+
+    return uuid;
   }
 }
