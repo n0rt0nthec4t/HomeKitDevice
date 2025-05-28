@@ -35,7 +35,7 @@
 // HomeKitDevice.updateServices(deviceData)
 // HomeKitDevice.messageServices(type, message)
 //
-// Code version 2025/05/22
+// Code version 2025/05/28
 // Mark Hulskamp
 'use strict';
 
@@ -102,7 +102,7 @@ export default class HomeKitDevice {
     // Mainly used to restore a Homebridge cached accessory
     if (typeof accessory === 'object' && this.#platform !== undefined) {
       if (Array.isArray(accessory) === true) {
-        this.accessory = accessory.find((accessory) => accessory?.UUID === this.uuid);
+        this.accessory = accessory.find((accessory) => this?.uuid !== undefined && accessory?.UUID === this.uuid);
       }
       if (Array.isArray(accessory) === false && accessory?.UUID === this.uuid) {
         this.accessory = accessory;
@@ -190,6 +190,8 @@ export default class HomeKitDevice {
         let postSetupDetails = await this.addServices();
         this?.log?.info &&
           this.log.info('Setup %s %s as "%s"', this.deviceData.manufacturer, this.deviceData.model, this.deviceData.description);
+        this?.log?.debug && this.log.debug('  += Serial number "%s"', this.deviceData.serialNumber);
+        this?.log?.debug && this.log.debug('  += Software version "%s"', this.deviceData.softwareVersion);
         if (this.historyService?.EveHome !== undefined) {
           this?.log?.info && this.log.info('  += EveHome support as "%s"', this.historyService.EveHome.evetype);
         }
