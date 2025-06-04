@@ -35,7 +35,7 @@
 // HomeKitDevice.updateServices(deviceData)
 // HomeKitDevice.messageServices(type, message)
 //
-// Code version 2025/05/28
+// Code version 2025/06/04
 // Mark Hulskamp
 'use strict';
 
@@ -191,7 +191,6 @@ export default class HomeKitDevice {
         this?.log?.info &&
           this.log.info('Setup %s %s as "%s"', this.deviceData.manufacturer, this.deviceData.model, this.deviceData.description);
         this?.log?.debug && this.log.debug('  += Serial number "%s"', this.deviceData.serialNumber);
-        this?.log?.debug && this.log.debug('  += Software version "%s"', this.deviceData.softwareVersion);
         if (this.historyService?.EveHome !== undefined) {
           this?.log?.info && this.log.info('  += EveHome support as "%s"', this.historyService.EveHome.evetype);
         }
