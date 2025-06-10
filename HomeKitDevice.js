@@ -30,18 +30,22 @@
 //
 // The following functions should be overriden in your class which extends this
 //
-// HomeKitDevice.addServices()
-// HomeKitDevice.removeServices()
-// HomeKitDevice.updateServices(deviceData)
-// HomeKitDevice.messageServices(type, message)
+// HomeKitDevice.setupDevice()
+// HomeKitDevice.removeDevice()
+// HomeKitDevice.updateDevice(deviceData)
+// HomeKitDevice.messageDevice(type, message)
 //
-// Code version 2025/06/04
+// Code version 2025/06/10
 // Mark Hulskamp
 'use strict';
 
 // Define nodejs module requirements
 import crypto from 'crypto';
 import EventEmitter from 'node:events';
+
+const HK_PIN_3_2_3 = /^\d{3}-\d{2}-\d{3}$/;
+const HK_PIN_4_4 = /^\d{4}-\d{4}$/;
+const MAC_ADDR = /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/;
 
 // Define our HomeKit device class
 export default class HomeKitDevice {
@@ -64,6 +68,7 @@ export default class HomeKitDevice {
   // Internal data only for this class
   #platform = undefined; // Homebridge platform api
   #eventEmitter = undefined; // Event emitter to use for comms
+  #postSetupDetails = []; // Use for extra output details once a device has been setup
 
   constructor(accessory, api, log, eventEmitter, deviceData) {
     // Validate the passed in logging object. We are expecting certain functions to be present
@@ -83,14 +88,14 @@ export default class HomeKitDevice {
       this.hap = api.hap;
       this.#platform = api;
 
-      this?.log?.debug && this.log.debug('HomeKitDevice module using Homebridge backend for "%s"', deviceData?.description);
+      this.postSetupDetail('Homebridge backend', 'debug');
     }
 
     if (typeof api?.HAPLibraryVersion === 'function' && api?.version === undefined && api?.hap === undefined) {
       // As we're missing the Homebridge entry points but have the HAP library version
       this.hap = api;
 
-      this?.log?.debug && this.log.debug('HomeKitDevice module using HAP-NodeJS library for "%s"', deviceData?.description);
+      this.postSetupDetail('HAP-NodeJS library', 'debug');
     }
 
     // Generate UUID for this device instance
@@ -146,10 +151,10 @@ export default class HomeKitDevice {
       this.deviceData.manufacturer === '' ||
       (this.#platform === undefined &&
         (typeof this.deviceData?.hkPairingCode !== 'string' ||
-          (new RegExp(/^([0-9]{3}-[0-9]{2}-[0-9]{3})$/).test(this.deviceData.hkPairingCode) === false &&
-            new RegExp(/^([0-9]{4}-[0-9]{4})$/).test(this.deviceData.hkPairingCode) === false) ||
+          (new RegExp(HK_PIN_3_2_3).test(this.deviceData.hkPairingCode) === false &&
+            new RegExp(HK_PIN_4_4).test(this.deviceData.hkPairingCode) === false) ||
           typeof this.deviceData?.hkUsername !== 'string' ||
-          new RegExp(/^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$/).test(this.deviceData.hkUsername) === false))
+          new RegExp(MAC_ADDR).test(this.deviceData.hkUsername) === false))
     ) {
       return;
     }
@@ -185,22 +190,30 @@ export default class HomeKitDevice {
       this.historyService = new HomeKitDevice.HISTORY(this.accessory, this.log, this.hap, {});
     }
 
-    if (typeof this.addServices === 'function') {
+    if (typeof this?.setupDevice === 'function') {
       try {
-        let postSetupDetails = await this.addServices();
-        this?.log?.info &&
-          this.log.info('Setup %s %s as "%s"', this.deviceData.manufacturer, this.deviceData.model, this.deviceData.description);
-        this?.log?.debug && this.log.debug('  += Serial number "%s"', this.deviceData.serialNumber);
+        this.postSetupDetail('Serial number "%s"', this.deviceData.serialNumber, 'debug');
+
+        await this.setupDevice();
+
         if (this.historyService?.EveHome !== undefined) {
-          this?.log?.info && this.log.info('  += EveHome support as "%s"', this.historyService.EveHome.evetype);
+          this.postSetupDetail('EveHome support as "%s"', this.historyService.EveHome.evetype);
         }
-        if (typeof postSetupDetails === 'object') {
-          postSetupDetails.forEach((output) => {
-            this?.log?.info && this.log.info('  += %s', output);
-          });
-        }
+
+        this?.log?.info?.('Setup %s %s as "%s"', this.deviceData.manufacturer, this.deviceData.model, this.deviceData.description);
+
+        this.#postSetupDetails.forEach((entry) => {
+          if (typeof entry === 'string') {
+            this?.log?.info?.('  += %s', entry);
+          } else if (typeof entry?.message === 'string') {
+            this?.log?.[['info', 'warn', 'debug', 'error'].includes(entry?.level) ? entry.level : 'info']?.(
+              '  += ' + entry.message,
+              ...(Array.isArray(entry?.args) ? entry.args : []),
+            );
+          }
+        });
       } catch (error) {
-        this?.log?.error && this.log.error('addServices call for device "%s" failed. Error was', this.deviceData.description, error);
+        this?.log?.error('setupDevice call for device "%s" failed. Error was', this.deviceData.description, error);
       }
     }
 
@@ -215,26 +228,26 @@ export default class HomeKitDevice {
         category: this.accessory.category,
       });
 
-      this?.log?.info && this.log.info('  += Advertising as "%s"', this.accessory.displayName);
-      this?.log?.info && this.log.info('  += Pairing code is "%s"', this.accessory.pincode);
+      this?.log?.info('  += Advertising as "%s"', this.accessory.displayName);
+      this?.log?.info('  += Pairing code is "%s"', this.accessory.pincode);
     }
-
+    this.#postSetupDetails = []; // Dont' need these anymore
     return this.accessory; // Return our HomeKit accessory
   }
 
   remove() {
-    this?.log?.warn && this.log.warn('Device "%s" has been removed', this.deviceData.description);
+    this?.log?.warn?.('Device "%s" has been removed', this.deviceData.description);
 
     if (this.#eventEmitter !== undefined) {
       // Remove listener for 'messages'
       this.#eventEmitter.removeAllListeners(this.uuid);
     }
 
-    if (typeof this.removeServices === 'function') {
+    if (typeof this?.removeDevice === 'function') {
       try {
-        this.removeServices();
+        this.removeDevice();
       } catch (error) {
-        this?.log?.error && this.log.error('removeServices call for device "%s" failed. Error was', this.deviceData.description, error);
+        this?.log?.error('removeDevice call for device "%s" failed. Error was', this.deviceData.description, error);
       }
     }
 
@@ -324,8 +337,8 @@ export default class HomeKitDevice {
           deviceData.serialNumber !== '' &&
           deviceData.serialNumber.toUpperCase() !== this.deviceData.serialNumber.toUpperCase()
         ) {
-          this?.log?.warn && this.log.warn('Serial number on "%s" has changed', deviceData.description);
-          this?.log?.warn && this.log.warn('This may cause the device to become unresponsive in HomeKit');
+          this?.log?.warn?.('Serial number on "%s" has changed', deviceData.description);
+          this?.log?.warn?.('This may cause the device to become unresponsive in HomeKit');
 
           // Update software version on the HomeKit accessory
           informationService.updateCharacteristic(this.hap.Characteristic.SerialNumber, deviceData.serialNumber);
@@ -335,19 +348,19 @@ export default class HomeKitDevice {
       if (typeof deviceData?.online === 'boolean' && deviceData.online !== this.deviceData.online) {
         // Output device online/offline status
         if (deviceData.online === false) {
-          this?.log?.warn && this.log.warn('Device "%s" is offline', deviceData.description);
+          this?.log?.warn?.('Device "%s" is offline', deviceData.description);
         }
 
         if (deviceData.online === true) {
-          this?.log?.success && this.log.success('Device "%s" is online', deviceData.description);
+          this?.log?.success?.('Device "%s" is online', deviceData.description);
         }
       }
 
-      if (typeof this.updateServices === 'function') {
+      if (typeof this?.updateDevice === 'function') {
         try {
-          this.updateServices(deviceData); // Pass updated data on for accessory to process as it needs
+          this.updateDevice(deviceData); // Pass updated data on for accessory to process as it needs
         } catch (error) {
-          this?.log?.error && this.log.error('updateServices call for device "%s" failed. Error was', deviceData.description, error);
+          this?.log?.error('updateDevice call for device "%s" failed. Error was', deviceData.description, error);
         }
       }
 
@@ -411,17 +424,94 @@ export default class HomeKitDevice {
 
       default: {
         // This is not a message we know about, so pass onto accessory for it to perform any processing
-        if (typeof this.messageServices === 'function') {
+        if (typeof this?.messageDevice === 'function') {
           try {
-            this.messageServices(type, message);
+            this.messageDevice(type, message);
           } catch (error) {
-            this?.log?.error &&
-              this.log.error('messageServices call for device "%s" failed. Error was', this.deviceData.description, error);
+            this?.log?.error('messageDevice call for device "%s" failed. Error was', this.deviceData.description, error);
           }
         }
         break;
       }
     }
+  }
+
+  setupService(hkServiceType, name = '', subType = undefined) {
+    let service = undefined;
+
+    if (
+      hkServiceType !== undefined &&
+      typeof this?.accessory?.getService === 'function' &&
+      typeof this?.accessory?.getServiceById === 'function' &&
+      typeof this?.accessory?.addService === 'function'
+    ) {
+      if (subType !== undefined) {
+        service = this.accessory.getServiceById(hkServiceType, subType);
+      } else {
+        service = this.accessory.getService(hkServiceType);
+      }
+
+      if (service === undefined) {
+        service = this.accessory.addService(hkServiceType, name, subType);
+      }
+    }
+
+    return service;
+  }
+
+  setupCharacteristic(hkService, hkCharacteristicType, { props, onSet, onGet } = {}) {
+    let characteristic = undefined;
+
+    if (
+      hkCharacteristicType !== undefined &&
+      typeof hkService?.getCharacteristic === 'function' &&
+      typeof hkService?.testCharacteristic === 'function' &&
+      typeof hkService?.addCharacteristic === 'function' &&
+      typeof hkService?.addOptionalCharacteristic === 'function'
+    ) {
+      if (hkService.testCharacteristic(hkCharacteristicType) === false) {
+        if (
+          Array.isArray(hkService?.optionalCharacteristics) &&
+          hkService.optionalCharacteristics.includes(hkCharacteristicType) &&
+          typeof hkService?.addOptionalCharacteristic === 'function'
+        ) {
+          hkService.addOptionalCharacteristic(hkCharacteristicType);
+        } else {
+          hkService.addCharacteristic(hkCharacteristicType);
+        }
+      }
+
+      characteristic = hkService.getCharacteristic(hkCharacteristicType);
+
+      // Apply optional config
+      if (typeof onSet === 'function') {
+        characteristic.onSet(onSet);
+      }
+      if (typeof onGet === 'function') {
+        characteristic.onGet(onGet);
+      }
+      if (typeof props === 'object' && typeof characteristic.setProps === 'function') {
+        characteristic.setProps(props);
+      }
+    }
+    return characteristic;
+  }
+
+  postSetupDetail(message, ...args) {
+    let level = 'info';
+
+    // If last arg is a valid log level, strip it off
+    let possibleLevel = args[args.length - 1];
+    if (typeof possibleLevel === 'string' && ['info', 'warn', 'debug', 'error'].includes(possibleLevel)) {
+      level = possibleLevel;
+      args = args.slice(0, -1); // remove the level string
+    }
+
+    this.#postSetupDetails.push({
+      level,
+      message,
+      args: args.length > 0 ? args : undefined,
+    });
   }
 
   static generateUUID(PLUGIN_NAME, api, serialNumber) {
