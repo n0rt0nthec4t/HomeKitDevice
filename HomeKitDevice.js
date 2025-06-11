@@ -37,7 +37,6 @@
 // HomeKitDevice.updateDevice(deviceData)
 // HomeKitDevice.messageDevice(type, message)
 //
-// Code version 2025.06.11
 // Mark Hulskamp
 'use strict';
 
@@ -45,13 +44,14 @@
 import crypto from 'crypto';
 import EventEmitter from 'node:events';
 
-export const HK_PIN_3_2_3 = /^\d{3}-\d{2}-\d{3}$/;
-export const HK_PIN_4_4 = /^\d{4}-\d{4}$/;
-export const MAC_ADDR = /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/;
+// Define constants
+const HK_PIN_3_2_3 = /^\d{3}-\d{2}-\d{3}$/;
+const HK_PIN_4_4 = /^\d{4}-\d{4}$/;
+const MAC_ADDR = /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/;
+const LOGLEVELS = ['info', 'success', 'warn', 'error', 'debug'];
 
 // Define our HomeKit device class
-export default class HomeKitDevice {
-  static ADD = 'HomeKitDevice.add'; // Device add message
+class HomeKitDevice {
   static UPDATE = 'HomeKitDevice.update'; // Device update message
   static REMOVE = 'HomeKitDevice.remove'; // Device remove message
   static SET = 'HomeKitDevice.set'; // Device set property message
@@ -61,8 +61,8 @@ export default class HomeKitDevice {
   static PLUGIN_NAME = undefined; // Homebridge plugin name
   static PLATFORM_NAME = undefined; // Homebridge platform name
   static HISTORY = undefined; // HomeKit History object
-  static TYPE = undefined; // String naming type of device
-  static VERSION = undefined; // Code version
+  static TYPE = 'base'; // String naming type of device
+  static VERSION = '2025.06.12'; // Code version
 
   deviceData = {}; // The devices data we store
   historyService = undefined; // HomeKit history service
@@ -78,13 +78,7 @@ export default class HomeKitDevice {
 
   constructor(accessory, api, log, eventEmitter, deviceData) {
     // Validate the passed in logging object. We are expecting certain functions to be present
-    if (
-      typeof log?.info === 'function' &&
-      typeof log?.success === 'function' &&
-      typeof log?.warn === 'function' &&
-      typeof log?.error === 'function' &&
-      typeof log?.debug === 'function'
-    ) {
+    if (LOGLEVELS.every((fn) => typeof log?.[fn] === 'function')) {
       this.log = log;
     }
 
@@ -408,14 +402,6 @@ export default class HomeKitDevice {
 
   #message(type, message) {
     switch (type) {
-      case HomeKitDevice.ADD: {
-        // Got message for device add
-        if (typeof message?.name === 'string' && isNaN(message?.category) === false && typeof message?.history === 'boolean') {
-          this.add(message.name, Number(message.category), message.history);
-        }
-        break;
-      }
-
       case HomeKitDevice.UPDATE: {
         // Got some device data, so process any updates
         this.update(message, false);
@@ -508,20 +494,18 @@ export default class HomeKitDevice {
       return;
     }
 
-    let availableLevels = Object.keys(this.log ?? {}).filter((key) => typeof this.log[key] === 'function');
+    let availableLevels = LOGLEVELS.filter((level) => typeof this.log?.[level] === 'function');
+    let level = availableLevels.includes('info') ? 'info' : availableLevels.length > 0 ? availableLevels[0] : undefined;
 
-    // Default to 'info' if available, or first available level if not
-    let level = availableLevels.includes('info') ? 'info' : (availableLevels[0] ?? undefined);
-
-    // Check if last arg is a known log level and override if valid
+    // Check if last arg is a valid log level override
     let lastArg = args[args.length - 1];
     if (typeof lastArg === 'string' && availableLevels.includes(lastArg)) {
       level = lastArg;
-      args = args.slice(0, -1);
+      args = args.slice(0, -1); // Remove the log level from args
     }
 
-    // If we have a valid log level, add to poost output details
     if (typeof level === 'string') {
+      // Add to post-setup details only if a valid log level is determined
       this.#postSetupDetails.push({
         level,
         message,
@@ -558,3 +542,7 @@ export default class HomeKitDevice {
     return uuid;
   }
 }
+
+// Define exports
+export { HK_PIN_3_2_3, HK_PIN_4_4, MAC_ADDR, HomeKitDevice };
+export default HomeKitDevice;
