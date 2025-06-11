@@ -27,6 +27,8 @@
 // HomeKitDevice.HOMEKITHISTORY
 // HomeKitDevice.PLUGIN_NAME
 // HomeKitDevice.PLATFORM_NAME
+// HomeKitDevice.TYPE
+// HomeKitDevice.VERSION
 //
 // The following functions should be overriden in your class which extends this
 //
@@ -35,7 +37,7 @@
 // HomeKitDevice.updateDevice(deviceData)
 // HomeKitDevice.messageDevice(type, message)
 //
-// Code version 2025/06/10
+// Code version 2025.06.11
 // Mark Hulskamp
 'use strict';
 
@@ -43,9 +45,9 @@
 import crypto from 'crypto';
 import EventEmitter from 'node:events';
 
-const HK_PIN_3_2_3 = /^\d{3}-\d{2}-\d{3}$/;
-const HK_PIN_4_4 = /^\d{4}-\d{4}$/;
-const MAC_ADDR = /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/;
+export const HK_PIN_3_2_3 = /^\d{3}-\d{2}-\d{3}$/;
+export const HK_PIN_4_4 = /^\d{4}-\d{4}$/;
+export const MAC_ADDR = /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/;
 
 // Define our HomeKit device class
 export default class HomeKitDevice {
@@ -54,14 +56,18 @@ export default class HomeKitDevice {
   static REMOVE = 'HomeKitDevice.remove'; // Device remove message
   static SET = 'HomeKitDevice.set'; // Device set property message
   static GET = 'HomeKitDevice.get'; // Device get property message
-  static PLUGIN_NAME = undefined; // Homebridge plugin name (override)
-  static PLATFORM_NAME = undefined; // Homebridge platform name (override)
-  static HISTORY = undefined; // HomeKit History object (override)
+
+  // Override this in the class which extends
+  static PLUGIN_NAME = undefined; // Homebridge plugin name
+  static PLATFORM_NAME = undefined; // Homebridge platform name
+  static HISTORY = undefined; // HomeKit History object
+  static TYPE = undefined; // String naming type of device
+  static VERSION = undefined; // Code version
 
   deviceData = {}; // The devices data we store
   historyService = undefined; // HomeKit history service
-  accessory = undefined; // Accessory service for this device
-  hap = undefined; // HomeKit Accessory Protocol API stub
+  accessory = undefined; // HomeKit accessory service for this device
+  hap = undefined; // HomeKit Accessory Protocol (HAP) API stub
   log = undefined; // Logging function object
   uuid = undefined; // UUID for this instance
 
@@ -436,7 +442,7 @@ export default class HomeKitDevice {
     }
   }
 
-  setupService(hkServiceType, name = '', subType = undefined) {
+  addHKService(hkServiceType, name = '', subType = undefined) {
     let service = undefined;
 
     if (
@@ -459,7 +465,7 @@ export default class HomeKitDevice {
     return service;
   }
 
-  setupCharacteristic(hkService, hkCharacteristicType, { props, onSet, onGet } = {}) {
+  addHKCharacteristic(hkService, hkCharacteristicType, { props, onSet, onGet } = {}) {
     let characteristic = undefined;
 
     if (
@@ -498,20 +504,30 @@ export default class HomeKitDevice {
   }
 
   postSetupDetail(message, ...args) {
-    let level = 'info';
-
-    // If last arg is a valid log level, strip it off
-    let possibleLevel = args[args.length - 1];
-    if (typeof possibleLevel === 'string' && ['info', 'warn', 'debug', 'error'].includes(possibleLevel)) {
-      level = possibleLevel;
-      args = args.slice(0, -1); // remove the level string
+    if (typeof message !== 'string' || message === '') {
+      return;
     }
 
-    this.#postSetupDetails.push({
-      level,
-      message,
-      args: args.length > 0 ? args : undefined,
-    });
+    let availableLevels = Object.keys(this.log ?? {}).filter((key) => typeof this.log[key] === 'function');
+
+    // Default to 'info' if available, or first available level if not
+    let level = availableLevels.includes('info') ? 'info' : (availableLevels[0] ?? undefined);
+
+    // Check if last arg is a known log level and override if valid
+    let lastArg = args[args.length - 1];
+    if (typeof lastArg === 'string' && availableLevels.includes(lastArg)) {
+      level = lastArg;
+      args = args.slice(0, -1);
+    }
+
+    // If we have a valid log level, add to poost output details
+    if (typeof level === 'string') {
+      this.#postSetupDetails.push({
+        level,
+        message,
+        args: args.length > 0 ? args : undefined,
+      });
+    }
   }
 
   static generateUUID(PLUGIN_NAME, api, serialNumber) {
