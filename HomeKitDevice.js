@@ -48,7 +48,13 @@ import EventEmitter from 'node:events';
 const HK_PIN_3_2_3 = /^\d{3}-\d{2}-\d{3}$/;
 const HK_PIN_4_4 = /^\d{4}-\d{4}$/;
 const MAC_ADDR = /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/;
-const LOGLEVELS = ['info', 'success', 'warn', 'error', 'debug'];
+const LOGLEVELS = {
+  info: 'info',
+  success: 'success',
+  warn: 'warn',
+  error: 'error',
+  debug: 'debug',
+};
 
 // Define our HomeKit device class
 class HomeKitDevice {
@@ -78,7 +84,7 @@ class HomeKitDevice {
 
   constructor(accessory, api, log, eventEmitter, deviceData) {
     // Validate the passed in logging object. We are expecting certain functions to be present
-    if (LOGLEVELS.every((fn) => typeof log?.[fn] === 'function')) {
+    if (Object.keys(LOGLEVELS).every((fn) => typeof log?.[fn] === 'function')) {
       this.log = log;
     }
 
@@ -88,14 +94,14 @@ class HomeKitDevice {
       this.hap = api.hap;
       this.#platform = api;
 
-      this.postSetupDetail('Homebridge backend', 'debug');
+      this.postSetupDetail('Homebridge backend', LOGLEVELS.debug);
     }
 
     if (typeof api?.HAPLibraryVersion === 'function' && api?.version === undefined && api?.hap === undefined) {
       // As we're missing the Homebridge entry points but have the HAP library version
       this.hap = api;
 
-      this.postSetupDetail('HAP-NodeJS library', 'debug');
+      this.postSetupDetail('HAP-NodeJS library', LOGLEVELS.debug);
     }
 
     // Generate UUID for this device instance
@@ -192,7 +198,7 @@ class HomeKitDevice {
 
     if (typeof this?.setupDevice === 'function') {
       try {
-        this.postSetupDetail('Serial number "%s"', this.deviceData.serialNumber, 'debug');
+        this.postSetupDetail('Serial number "%s"', this.deviceData.serialNumber, LOGLEVELS.debug);
 
         await this.setupDevice();
 
@@ -204,12 +210,11 @@ class HomeKitDevice {
 
         this.#postSetupDetails.forEach((entry) => {
           if (typeof entry === 'string') {
-            this?.log?.info?.('  += %s', entry);
+            this?.log?.[LOGLEVELS.info]?.('  += %s', entry);
           } else if (typeof entry?.message === 'string') {
-            this?.log?.[['info', 'warn', 'debug', 'error'].includes(entry?.level) ? entry.level : 'info']?.(
-              '  += ' + entry.message,
-              ...(Array.isArray(entry?.args) ? entry.args : []),
-            );
+            let level =
+              Object.hasOwn(LOGLEVELS, entry?.level) && typeof this?.log?.[entry?.level] === 'function' ? entry.level : LOGLEVELS.info;
+            this?.log?.[level]?.('  += ' + entry.message, ...(Array.isArray(entry?.args) ? entry.args : []));
           }
         });
       } catch (error) {
@@ -494,24 +499,22 @@ class HomeKitDevice {
       return;
     }
 
-    let availableLevels = LOGLEVELS.filter((level) => typeof this.log?.[level] === 'function');
-    let level = availableLevels.includes('info') ? 'info' : availableLevels.length > 0 ? availableLevels[0] : undefined;
+    let level = 'info';
+    let availableLevel = Object.keys(LOGLEVELS).find((lvl) => typeof this.log?.[lvl] === 'function') || 'info';
+    let lastArg = args.at(-1);
 
-    // Check if last arg is a valid log level override
-    let lastArg = args[args.length - 1];
-    if (typeof lastArg === 'string' && availableLevels.includes(lastArg)) {
+    if (typeof lastArg === 'string' && Object.hasOwn(LOGLEVELS, lastArg)) {
       level = lastArg;
-      args = args.slice(0, -1); // Remove the log level from args
+      args = args.slice(0, -1);
+    } else {
+      level = availableLevel;
     }
 
-    if (typeof level === 'string') {
-      // Add to post-setup details only if a valid log level is determined
-      this.#postSetupDetails.push({
-        level,
-        message,
-        args: args.length > 0 ? args : undefined,
-      });
-    }
+    this.#postSetupDetails.push({
+      level,
+      message,
+      args: args.length > 0 ? args : undefined,
+    });
   }
 
   static generateUUID(PLUGIN_NAME, api, serialNumber) {
