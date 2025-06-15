@@ -161,7 +161,7 @@ export default class HomeKitDevice {
           (HomeKitDevice.HK_PIN_3_2_3.test(this.deviceData.hkPairingCode) === false &&
             HomeKitDevice.HK_PIN_4_4.test(this.deviceData.hkPairingCode) === false) ||
           typeof this.deviceData?.hkUsername !== 'string' ||
-          HomeKitDevice.MAC_ADDR.test(this.deviceData.hkUsername).test(this.deviceData.hkUsername) === false))
+          HomeKitDevice.MAC_ADDR.test(this.deviceData.hkUsername) === false))
     ) {
       return;
     }
