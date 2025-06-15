@@ -68,7 +68,7 @@ class HomeKitDevice {
   static PLATFORM_NAME = undefined; // Homebridge platform name
   static HISTORY = undefined; // HomeKit History object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2025.06.12'; // Code version
+  static VERSION = '2025.06.15'; // Code version
 
   deviceData = {}; // The devices data we store
   historyService = undefined; // HomeKit history service
@@ -543,6 +543,18 @@ class HomeKitDevice {
     }
 
     return uuid;
+  }
+
+  static makeHomeKitName(name) {
+    // Strip invalid characters to meet HomeKit naming requirements
+    // Ensure only letters or numbers are at the beginning AND/OR end of string
+    // Matches against uni-code characters
+    return typeof name === 'string'
+      ? name
+          .replace(/[^\p{L}\p{N}\p{Z}\u2019.,-]/gu, '')
+          .replace(/^[^\p{L}\p{N}]*/gu, '')
+          .replace(/[^\p{L}\p{N}]+$/gu, '')
+      : name;
   }
 }
 
