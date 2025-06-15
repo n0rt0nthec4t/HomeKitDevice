@@ -45,10 +45,7 @@ import crypto from 'crypto';
 import EventEmitter from 'node:events';
 
 // Define constants
-const HK_PIN_3_2_3 = /^\d{3}-\d{2}-\d{3}$/;
-const HK_PIN_4_4 = /^\d{4}-\d{4}$/;
-const MAC_ADDR = /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/;
-const LOGLEVELS = {
+const LOG_LEVELS = {
   info: 'info',
   success: 'success',
   warn: 'warn',
@@ -57,11 +54,15 @@ const LOGLEVELS = {
 };
 
 // Define our HomeKit device class
-class HomeKitDevice {
+export default class HomeKitDevice {
   static UPDATE = 'HomeKitDevice.update'; // Device update message
   static REMOVE = 'HomeKitDevice.remove'; // Device remove message
   static SET = 'HomeKitDevice.set'; // Device set property message
   static GET = 'HomeKitDevice.get'; // Device get property message
+
+  static HK_PIN_3_2_3 = /^\d{3}-\d{2}-\d{3}$/;
+  static HK_PIN_4_4 = /^\d{4}-\d{4}$/;
+  static MAC_ADDR = /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/;
 
   // Override this in the class which extends
   static PLUGIN_NAME = undefined; // Homebridge plugin name
@@ -84,7 +85,7 @@ class HomeKitDevice {
 
   constructor(accessory, api, log, eventEmitter, deviceData) {
     // Validate the passed in logging object. We are expecting certain functions to be present
-    if (Object.keys(LOGLEVELS).every((fn) => typeof log?.[fn] === 'function')) {
+    if (Object.keys(LOG_LEVELS).every((fn) => typeof log?.[fn] === 'function')) {
       this.log = log;
     }
 
@@ -94,14 +95,14 @@ class HomeKitDevice {
       this.hap = api.hap;
       this.#platform = api;
 
-      this.postSetupDetail('Homebridge backend', LOGLEVELS.debug);
+      this.postSetupDetail('Homebridge backend', LOG_LEVELS.debug);
     }
 
     if (typeof api?.HAPLibraryVersion === 'function' && api?.version === undefined && api?.hap === undefined) {
       // As we're missing the Homebridge entry points but have the HAP library version
       this.hap = api;
 
-      this.postSetupDetail('HAP-NodeJS library', LOGLEVELS.debug);
+      this.postSetupDetail('HAP-NodeJS library', LOG_LEVELS.debug);
     }
 
     // Generate UUID for this device instance
@@ -157,10 +158,10 @@ class HomeKitDevice {
       this.deviceData.manufacturer === '' ||
       (this.#platform === undefined &&
         (typeof this.deviceData?.hkPairingCode !== 'string' ||
-          (new RegExp(HK_PIN_3_2_3).test(this.deviceData.hkPairingCode) === false &&
-            new RegExp(HK_PIN_4_4).test(this.deviceData.hkPairingCode) === false) ||
+          (HomeKitDevice.HK_PIN_3_2_3.test(this.deviceData.hkPairingCode) === false &&
+            HomeKitDevice.HK_PIN_4_4.test(this.deviceData.hkPairingCode) === false) ||
           typeof this.deviceData?.hkUsername !== 'string' ||
-          new RegExp(MAC_ADDR).test(this.deviceData.hkUsername) === false))
+          HomeKitDevice.MAC_ADDR.test(this.deviceData.hkUsername).test(this.deviceData.hkUsername) === false))
     ) {
       return;
     }
@@ -198,7 +199,7 @@ class HomeKitDevice {
 
     if (typeof this?.setupDevice === 'function') {
       try {
-        this.postSetupDetail('Serial number "%s"', this.deviceData.serialNumber, LOGLEVELS.debug);
+        this.postSetupDetail('Serial number "%s"', this.deviceData.serialNumber, LOG_LEVELS.debug);
 
         await this.setupDevice();
 
@@ -210,10 +211,10 @@ class HomeKitDevice {
 
         this.#postSetupDetails.forEach((entry) => {
           if (typeof entry === 'string') {
-            this?.log?.[LOGLEVELS.info]?.('  += %s', entry);
+            this?.log?.[LOG_LEVELS.info]?.('  += %s', entry);
           } else if (typeof entry?.message === 'string') {
             let level =
-              Object.hasOwn(LOGLEVELS, entry?.level) && typeof this?.log?.[entry?.level] === 'function' ? entry.level : LOGLEVELS.info;
+              Object.hasOwn(LOG_LEVELS, entry?.level) && typeof this?.log?.[entry?.level] === 'function' ? entry.level : LOG_LEVELS.info;
             this?.log?.[level]?.('  += ' + entry.message, ...(Array.isArray(entry?.args) ? entry.args : []));
           }
         });
@@ -500,10 +501,10 @@ class HomeKitDevice {
     }
 
     let level = 'info';
-    let availableLevel = Object.keys(LOGLEVELS).find((lvl) => typeof this.log?.[lvl] === 'function') || 'info';
+    let availableLevel = Object.keys(LOG_LEVELS).find((lvl) => typeof this.log?.[lvl] === 'function') || 'info';
     let lastArg = args.at(-1);
 
-    if (typeof lastArg === 'string' && Object.hasOwn(LOGLEVELS, lastArg)) {
+    if (typeof lastArg === 'string' && Object.hasOwn(LOG_LEVELS, lastArg)) {
       level = lastArg;
       args = args.slice(0, -1);
     } else {
@@ -557,7 +558,3 @@ class HomeKitDevice {
       : name;
   }
 }
-
-// Define exports
-export { HK_PIN_3_2_3, HK_PIN_4_4, MAC_ADDR, HomeKitDevice };
-export default HomeKitDevice;
