@@ -46,11 +46,11 @@ import EventEmitter from 'node:events';
 
 // Define constants
 const LOG_LEVELS = {
-  info: 'info',
-  success: 'success',
-  warn: 'warn',
-  error: 'error',
-  debug: 'debug',
+  INFO: 'info',
+  SUCCESS: 'success',
+  WARN: 'warn',
+  ERROR: 'error',
+  DEBUG: 'debug',
 };
 
 // Define our HomeKit device class
@@ -83,9 +83,9 @@ export default class HomeKitDevice {
   #eventEmitter = undefined; // Event emitter to use for comms
   #postSetupDetails = []; // Use for extra output details once a device has been setup
 
-  constructor(accessory, api, log, eventEmitter, deviceData) {
+  constructor(accessory = undefined, api = undefined, log = undefined, eventEmitter = undefined, deviceData = {}) {
     // Validate the passed in logging object. We are expecting certain functions to be present
-    if (Object.keys(LOG_LEVELS).every((fn) => typeof log?.[fn] === 'function')) {
+    if (Object.values(LOG_LEVELS).every((fn) => typeof log?.[fn] === 'function')) {
       this.log = log;
     }
 
@@ -95,14 +95,14 @@ export default class HomeKitDevice {
       this.hap = api.hap;
       this.#platform = api;
 
-      this.postSetupDetail('Homebridge backend', LOG_LEVELS.debug);
+      this.postSetupDetail('Homebridge backend', LOG_LEVELS.DEBUG);
     }
 
     if (typeof api?.HAPLibraryVersion === 'function' && api?.version === undefined && api?.hap === undefined) {
       // As we're missing the Homebridge entry points but have the HAP library version
       this.hap = api;
 
-      this.postSetupDetail('HAP-NodeJS library', LOG_LEVELS.debug);
+      this.postSetupDetail('HAP-NodeJS library', LOG_LEVELS.DEBUG);
     }
 
     // Generate UUID for this device instance
@@ -199,7 +199,7 @@ export default class HomeKitDevice {
 
     if (typeof this?.setupDevice === 'function') {
       try {
-        this.postSetupDetail('Serial number "%s"', this.deviceData.serialNumber, LOG_LEVELS.debug);
+        this.postSetupDetail('Serial number "%s"', this.deviceData.serialNumber, LOG_LEVELS.DEBUG);
 
         await this.setupDevice();
 
@@ -208,13 +208,16 @@ export default class HomeKitDevice {
         }
 
         this?.log?.info?.('Setup %s %s as "%s"', this.deviceData.manufacturer, this.deviceData.model, this.deviceData.description);
-
         this.#postSetupDetails.forEach((entry) => {
           if (typeof entry === 'string') {
-            this?.log?.[LOG_LEVELS.info]?.('  += %s', entry);
+            this?.log?.[LOG_LEVELS.INFO]?.('  += %s', entry);
           } else if (typeof entry?.message === 'string') {
             let level =
-              Object.hasOwn(LOG_LEVELS, entry?.level) && typeof this?.log?.[entry?.level] === 'function' ? entry.level : LOG_LEVELS.info;
+              Object.hasOwn(LOG_LEVELS, entry?.level?.toUpperCase?.()) &&
+              typeof this?.log?.[LOG_LEVELS[entry.level.toUpperCase()]] === 'function'
+                ? LOG_LEVELS[entry.level.toUpperCase()]
+                : LOG_LEVELS.INFO;
+
             this?.log?.[level]?.('  += ' + entry.message, ...(Array.isArray(entry?.args) ? entry.args : []));
           }
         });
@@ -237,7 +240,7 @@ export default class HomeKitDevice {
       this?.log?.info('  += Advertising as "%s"', this.accessory.displayName);
       this?.log?.info('  += Pairing code is "%s"', this.accessory.pincode);
     }
-    this.#postSetupDetails = []; // Dont' need these anymore
+    this.#postSetupDetails = []; // Don't need these anymore
     return this.accessory; // Return our HomeKit accessory
   }
 
@@ -500,19 +503,16 @@ export default class HomeKitDevice {
       return;
     }
 
-    let level = 'info';
-    let availableLevel = Object.keys(LOG_LEVELS).find((lvl) => typeof this.log?.[lvl] === 'function') || 'info';
+    let levelKey = 'INFO';
     let lastArg = args.at(-1);
 
-    if (typeof lastArg === 'string' && Object.hasOwn(LOG_LEVELS, lastArg)) {
-      level = lastArg;
+    if (typeof lastArg === 'string' && Object.hasOwn(LOG_LEVELS, lastArg.toUpperCase())) {
+      levelKey = lastArg.toUpperCase();
       args = args.slice(0, -1);
-    } else {
-      level = availableLevel;
     }
 
     this.#postSetupDetails.push({
-      level,
+      level: LOG_LEVELS[levelKey], // 'info', 'debug', etc.
       message,
       args: args.length > 0 ? args : undefined,
     });
@@ -552,9 +552,9 @@ export default class HomeKitDevice {
     // Matches against uni-code characters
     return typeof name === 'string'
       ? name
-        .replace(/[^\p{L}\p{N}\p{Z}\u2019.,-]/gu, '')
-        .replace(/^[^\p{L}\p{N}]*/gu, '')
-        .replace(/[^\p{L}\p{N}]+$/gu, '')
+          .replace(/[^\p{L}\p{N}\p{Z}\u2019.,-]/gu, '')
+          .replace(/^[^\p{L}\p{N}]*/gu, '')
+          .replace(/[^\p{L}\p{N}]+$/gu, '')
       : name;
   }
 }
