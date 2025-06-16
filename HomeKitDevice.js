@@ -545,9 +545,9 @@ export default class HomeKitDevice {
     // Matches against uni-code characters
     return typeof name === 'string'
       ? name
-        .replace(/[^\p{L}\p{N}\p{Z}\u2019.,-]/gu, '')
-        .replace(/^[^\p{L}\p{N}]*/gu, '')
-        .replace(/[^\p{L}\p{N}]+$/gu, '')
+          .replace(/[^\p{L}\p{N}\p{Z}\u2019.,-]/gu, '')
+          .replace(/^[^\p{L}\p{N}]*/gu, '')
+          .replace(/[^\p{L}\p{N}]+$/gu, '')
       : name;
   }
 }
