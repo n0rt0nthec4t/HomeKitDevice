@@ -55,11 +55,13 @@ const LOG_LEVELS = {
 
 // Define our HomeKit device class
 export default class HomeKitDevice {
-  static UPDATE = 'HomeKitDevice.update'; // Device update message
-  static REMOVE = 'HomeKitDevice.remove'; // Device remove message
-  static SET = 'HomeKitDevice.set'; // Device set property message
-  static GET = 'HomeKitDevice.get'; // Device get property message
+  // Device messages
+  static UPDATE = 'HomeKitDevice.update';
+  static REMOVE = 'HomeKitDevice.remove';
+  static SET = 'HomeKitDevice.set';
+  static GET = 'HomeKitDevice.get';
 
+  // HomeKit pin format and MAC address regex's
   static HK_PIN_3_2_3 = /^\d{3}-\d{2}-\d{3}$/;
   static HK_PIN_4_4 = /^\d{4}-\d{4}$/;
   static MAC_ADDR = /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/;
