@@ -1,21 +1,27 @@
 # Change Log
 
-All notable changes to `HomeKitDevice` module will be documented in this file
+All notable changes to the `HomeKitDevice` module are documented in this file.
 
 ## 2025/06/16
 
 ### Added
-- Introduced standardized async lifecycle methods: `onAdd()`, `onUpdate()`, `onRemove()`, and `onMessage()`
-- New `message(type, message)` dispatcher with internal handling of `UPDATE`, `REMOVE`
-- Defined static constants: `HomeKitDevice.UPDATE`, `REMOVE`, `SET`, `GET`
-- Introduced `makeValidHKName()` to sanitize HomeKit accessory names
-- Added structured logging helper `postSetupDetail()` with support for log level and arguments
+- Defined static backend constants: `HomeKitDevice.HOMEBRIDGE` and `HomeKitDevice.HAPNODEJS`
+- Added `backend` instance variable to reflect runtime context (`homebridge` or `hap-nodejs`)
+- Introduced standardized async lifecycle hooks: `onAdd()`, `onUpdate(deviceData)`, `onRemove()`, `onMessage(type, message)`
+- Exposed `message(type, message)` dispatcher with internal handling for `UPDATE` and `REMOVE`
+- Added static constants: `HomeKitDevice.UPDATE`, `REMOVE`, `SET`, `GET`
+- Added utility method `makeValidHKName()` for sanitizing HomeKit display names
+- Added `postSetupDetail()` for structured logging with optional log level and arguments
+- Added helper methods: `addHKService()` and `addHKCharacteristic()` for simplified service/characteristic setup
 
 ### Changed
-- Renamed legacy `setupDevice()`, `updateDevice()`, etc., to `onX()` equivalents for consistency
-- Normalized internal logging to use object-style `LOG_LEVELS` (`INFO`, `DEBUG`, `ERROR`, etc.)
-- All subclass hooks now support `async/await`
+- Made `uuid` and `platform` private fields (`#uuid`, `#platform`) for encapsulation
+- Refined backend detection and assignment to `backend` variable
+- Replaced legacy methods (`setupDevice()`, `updateDevice()`, etc.) with unified `onX()` lifecycle hooks
+- Standardized logging via `LOG_LEVELS` constants (`INFO`, `DEBUG`, `ERROR`, etc.)
+- Lifecycle methods are now fully `async`-aware for subclass overrides
+- Clarified runtime environment detection for Homebridge vs HAP-NodeJS
 
 ### Fixed
-- Improved UUID generation fallback when accessory not initialized
-- Better clone logic for `deviceData` using `structuredClone()` to prevent reference sharing
+- Improved fallback logic for UUID generation using `crypto.randomUUID()` if HAP not available
+- Fixed cloning of `deviceData` using `structuredClone()` to avoid shared object references

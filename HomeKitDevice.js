@@ -73,15 +73,20 @@ export default class HomeKitDevice {
   static TYPE = 'base'; // String naming type of device
   static VERSION = '2025.06.16'; // Code version
 
+  // Backend types
+  static HOMEBRIDGE = 'homebridge';
+  static HAPNODEJS = 'hap-nodejs';
+
   deviceData = {}; // The devices data we store
   historyService = undefined; // HomeKit history service
   accessory = undefined; // HomeKit accessory service for this device
   hap = undefined; // HomeKit Accessory Protocol (HAP) API stub
   log = undefined; // Logging function object
-  uuid = undefined; // UUID for this instance
+  backend = undefined; // Backend library type
 
   // Internal data only for this class
-  #platform = undefined; // Homebridge platform api
+  #uuid = undefined; // UUID for this instance
+  #platform = undefined; // Homebridge platform API
   #eventEmitter = undefined; // Event emitter to use for comms
   #postSetupDetails = []; // Use for extra output details once a device has been setup
 
@@ -91,34 +96,32 @@ export default class HomeKitDevice {
       this.log = log;
     }
 
-    // Workout if we're running under Homebridge or HAP-NodeJS library
-    if (isNaN(api?.version) === false && typeof api?.hap === 'object' && api?.HAPLibraryVersion === undefined) {
-      // We have the Homebridge version number and hap API object
+    // Determine runtime environment (Homebridge vs HAP-NodeJS)
+    if (typeof api?.hap === 'object' && isNaN(api?.version) === false && typeof api?.HAPLibraryVersion === 'undefined') {
       this.hap = api.hap;
       this.#platform = api;
-
+      this.backend = HomeKitDevice.HOMEBRIDGE;
       this.postSetupDetail('Homebridge backend', LOG_LEVELS.DEBUG);
     }
 
-    if (typeof api?.HAPLibraryVersion === 'function' && api?.version === undefined && api?.hap === undefined) {
-      // As we're missing the Homebridge entry points but have the HAP library version
+    if (typeof api?.hap === 'undefined' && isNaN(api?.version) === true && typeof api?.HAPLibraryVersion === 'function') {
       this.hap = api;
-
+      this.backend = HomeKitDevice.HAPNODEJS;
       this.postSetupDetail('HAP-NodeJS library', LOG_LEVELS.DEBUG);
     }
 
     // Generate UUID for this device instance
     // Will either be a random generated one or HAP generated one
     // HAP is based upon defined plugin name and devices serial number
-    this.uuid = HomeKitDevice.generateUUID(HomeKitDevice.PLUGIN_NAME, api, deviceData.serialNumber);
+    this.#uuid = HomeKitDevice.generateUUID(HomeKitDevice.PLUGIN_NAME, api, deviceData.serialNumber);
 
     // See if we were passed in an existing accessory object or array of accessory objects
     // Mainly used to restore a Homebridge cached accessory
-    if (typeof accessory === 'object' && this.#platform !== undefined) {
+    if (typeof accessory === 'object' && this.backend === HomeKitDevice.HOMEBRIDGE) {
       if (Array.isArray(accessory) === true) {
-        this.accessory = accessory.find((accessory) => this?.uuid !== undefined && accessory?.UUID === this.uuid);
+        this.accessory = accessory.find((accessory) => this?.uuid !== undefined && accessory?.UUID === this.#uuid);
       }
-      if (Array.isArray(accessory) === false && accessory?.UUID === this.uuid) {
+      if (Array.isArray(accessory) === false && accessory?.UUID === this.#uuid) {
         this.accessory = accessory;
       }
     }
@@ -127,27 +130,26 @@ export default class HomeKitDevice {
     // If valid, setup an event listener for messages to this device using our generated uuid
     if (eventEmitter instanceof EventEmitter === true) {
       this.#eventEmitter = eventEmitter;
-      this.#eventEmitter.addListener(this.uuid, this.message.bind(this));
+      this.#eventEmitter.addListener(this.#uuid, this.message.bind(this));
     }
 
     // Make a clone of current data and store in this object
     // Important that we done have a 'linked' copy of the object data
-    // eslint-disable-next-line no-undef
     this.deviceData = structuredClone(deviceData);
   }
 
   // Class functions
-  async add(accessoryName, accessoryCategory, useHistoryService) {
+  async add(hapAccessoryName, hapCategory, enableHistory = false) {
     if (
       this.hap === undefined ||
       typeof HomeKitDevice.PLUGIN_NAME !== 'string' ||
       HomeKitDevice.PLUGIN_NAME === '' ||
       typeof HomeKitDevice.PLATFORM_NAME !== 'string' ||
       HomeKitDevice.PLATFORM_NAME === '' ||
-      typeof accessoryName !== 'string' ||
-      accessoryName === '' ||
-      typeof this.hap.Categories[accessoryCategory] === 'undefined' ||
-      typeof useHistoryService !== 'boolean' ||
+      typeof hapAccessoryName !== 'string' ||
+      hapAccessoryName === '' ||
+      typeof this.hap.Categories[hapCategory] === 'undefined' ||
+      typeof enableHistory !== 'boolean' ||
       typeof this.deviceData !== 'object' ||
       typeof this.deviceData?.serialNumber !== 'string' ||
       this.deviceData.serialNumber === '' ||
@@ -169,19 +171,24 @@ export default class HomeKitDevice {
     }
 
     // If we do not have an existing accessory object, create a new one
-    if (this.accessory === undefined && this.#platform !== undefined) {
+    if (
+      this.accessory === undefined &&
+      typeof this.#platform?.platformAccessory === 'function' &&
+      typeof this.#platform?.registerPlatformAccessories === 'function' &&
+      this.backend === HomeKitDevice.HOMEBRIDGE
+    ) {
       // Create Homebridge platform accessory
-      this.accessory = new this.#platform.platformAccessory(this.deviceData.description, this.uuid);
+      this.accessory = new this.#platform.platformAccessory(this.deviceData.description, this.#uuid);
       this.#platform.registerPlatformAccessories(HomeKitDevice.PLUGIN_NAME, HomeKitDevice.PLATFORM_NAME, [this.accessory]);
     }
 
-    if (this.accessory === undefined && this.#platform === undefined) {
+    if (this.accessory === undefined && this.backend === HomeKitDevice.HAPNODEJS) {
       // Create HAP-NodeJS libray accessory
-      this.accessory = new this.hap.Accessory(accessoryName, this.uuid);
+      this.accessory = new this.hap.Accessory(hapAccessoryName, this.#uuid);
 
       this.accessory.username = this.deviceData.hkUsername;
       this.accessory.pincode = this.deviceData.hkPairingCode;
-      this.accessory.category = accessoryCategory;
+      this.accessory.category = hapCategory;
     }
 
     // Setup accessory information
@@ -195,8 +202,8 @@ export default class HomeKitDevice {
     }
 
     // Setup our history service if module has been defined and requested to be active for this device
-    if (typeof HomeKitDevice?.HISTORY === 'function' && this.historyService === undefined && useHistoryService === true) {
-      this.historyService = new HomeKitDevice.HISTORY(this.accessory, this.log, this.hap, {});
+    if (typeof HomeKitDevice?.HISTORY === 'function' && this.historyService === undefined && enableHistory === true) {
+      this.historyService = new HomeKitDevice.HISTORY(this.accessory, this.hap, this.log, this.#eventEmitter, {});
     }
 
     if (typeof this?.onAdd === 'function') {
@@ -224,7 +231,7 @@ export default class HomeKitDevice {
           }
         });
       } catch (error) {
-        this?.log?.error('onAdd call for device "%s" failed. Error was', this.deviceData.description, error);
+        this?.log?.error?.('onAdd call for device "%s" failed. Error was', this.deviceData.description, error);
       }
     }
 
@@ -232,15 +239,15 @@ export default class HomeKitDevice {
     await this.update(this.deviceData, true);
 
     // If using HAP-NodeJS library, publish accessory on local network
-    if (this.#platform === undefined && this.accessory !== undefined) {
+    if (this.accessory !== undefined && this.backend === HomeKitDevice.HAPNODEJS) {
       this.accessory.publish({
         username: this.accessory.username,
         pincode: this.accessory.pincode,
         category: this.accessory.category,
       });
 
-      this?.log?.info('  += Advertising as "%s"', this.accessory.displayName);
-      this?.log?.info('  += Pairing code is "%s"', this.accessory.pincode);
+      this?.log?.info?.('  += Advertising as "%s"', this.accessory.displayName);
+      this?.log?.info?.('  += Pairing code is "%s"', this.accessory.pincode);
     }
     this.#postSetupDetails = []; // Don't need these anymore
     return this.accessory; // Return our HomeKit accessory
@@ -249,20 +256,18 @@ export default class HomeKitDevice {
   async remove() {
     this?.log?.warn?.('Device "%s" has been removed', this.deviceData.description);
 
-    if (this.#eventEmitter !== undefined) {
-      // Remove listener for 'messages'
-      this.#eventEmitter.removeAllListeners(this.uuid);
-    }
+    // Remove listener for 'messages'
+    this.#eventEmitter?.removeAllListeners?.(this.#uuid);
 
     if (typeof this?.onRemove === 'function') {
       try {
         await this.onRemove();
       } catch (error) {
-        this?.log?.error('onRemove call for device "%s" failed. Error was', this.deviceData.description, error);
+        this?.log?.error?.('onRemove call for device "%s" failed. Error was', this.deviceData.description, error);
       }
     }
 
-    if (this.accessory !== undefined && this.#platform !== undefined) {
+    if (this.accessory !== undefined && typeof this.#platform?.unregisterPlatformAccessories === 'function') {
       // Unregister the accessory from Homebridge platform
       this.#platform.unregisterPlatformAccessories(HomeKitDevice.PLUGIN_NAME, HomeKitDevice.PLATFORM_NAME, [this.accessory]);
     }
@@ -277,7 +282,7 @@ export default class HomeKitDevice {
     this.historyService = undefined;
     this.hap = undefined;
     this.log = undefined;
-    this.uuid = undefined;
+    this.#uuid = undefined;
     this.#platform = undefined;
     this.#eventEmitter = undefined;
 
@@ -315,8 +320,8 @@ export default class HomeKitDevice {
         // Update details associated with the accessory
         // ie: Name, Manufacturer, Model, Serial # and firmware version
         if (typeof deviceData?.description === 'string' && deviceData.description !== this.deviceData.description) {
-          // Update serial number on the HomeKit accessory
-          informationService.updateCharacteristic(this.hap.Characteristic.Name, this.deviceData.description);
+          // Update devices description on the HomeKit accessory
+          informationService.updateCharacteristic(this.hap.Characteristic.Name, deviceData.description);
         }
 
         if (
@@ -371,12 +376,11 @@ export default class HomeKitDevice {
         try {
           await this.onUpdate(deviceData); // Pass updated data on for accessory to process as it needs
         } catch (error) {
-          this?.log?.error('onUpdate call for device "%s" failed. Error was', deviceData.description, error);
+          this?.log?.error?.('onUpdate call for device "%s" failed. Error was', deviceData.description, error);
         }
       }
 
       // Finally, update our internally stored data with the new data
-      // eslint-disable-next-line no-undef
       this.deviceData = structuredClone(deviceData);
     }
   }
@@ -387,11 +391,11 @@ export default class HomeKitDevice {
     }
 
     // Send event with data to set
-    this.#eventEmitter.emit(HomeKitDevice.SET, this.uuid, values);
+    this.#eventEmitter.emit(HomeKitDevice.SET, this.#uuid, values);
 
-    // Update the internal data for the set values, as could take sometime once we emit the event
+    // Update the internal data for the set values, as could take some time once we emit the event
     Object.entries(values).forEach(([key, value]) => {
-      if (this.deviceData[key] !== undefined) {
+      if (typeof this.deviceData?.[key] !== 'undefined') {
         this.deviceData[key] = value;
       }
     });
@@ -404,10 +408,10 @@ export default class HomeKitDevice {
 
     // Send event with data to get
     // Once get has completed, we'll get an event back with the requested data
-    this.#eventEmitter.emit(HomeKitDevice.GET, this.uuid, values);
+    this.#eventEmitter.emit(HomeKitDevice.GET, this.#uuid, values);
 
     // This should always return, but we probably should put in a timeout?
-    let results = await EventEmitter.once(this.#eventEmitter, HomeKitDevice.GET + '->' + this.uuid);
+    let results = await EventEmitter.once(this.#eventEmitter, HomeKitDevice.GET + '->' + this.#uuid);
     return results?.[0];
   }
 
@@ -425,7 +429,7 @@ export default class HomeKitDevice {
       try {
         await this.onMessage(type, message);
       } catch (error) {
-        this?.log?.error('onMessage call for device "%s" failed. Error was', this.deviceData.description, error);
+        this?.log?.error?.('onMessage call for device "%s" failed. Error was', this.deviceData.description, error);
       }
     }
   }
@@ -453,7 +457,7 @@ export default class HomeKitDevice {
     return service;
   }
 
-  addHKCharacteristic(hkService, hkCharacteristicType, { props, onSet, onGet } = {}) {
+  addHKCharacteristic(hkService, hkCharacteristicType, { props, onSet, onGet, initialValue } = {}) {
     let characteristic = undefined;
 
     if (
@@ -464,11 +468,7 @@ export default class HomeKitDevice {
       typeof hkService?.addOptionalCharacteristic === 'function'
     ) {
       if (hkService.testCharacteristic(hkCharacteristicType) === false) {
-        if (
-          Array.isArray(hkService?.optionalCharacteristics) &&
-          hkService.optionalCharacteristics.includes(hkCharacteristicType) &&
-          typeof hkService?.addOptionalCharacteristic === 'function'
-        ) {
+        if (Array.isArray(hkService?.optionalCharacteristics) && hkService.optionalCharacteristics.includes(hkCharacteristicType)) {
           hkService.addOptionalCharacteristic(hkCharacteristicType);
         } else {
           hkService.addCharacteristic(hkCharacteristicType);
@@ -487,7 +487,13 @@ export default class HomeKitDevice {
       if (typeof props === 'object' && typeof characteristic.setProps === 'function') {
         characteristic.setProps(props);
       }
+
+      // Set initial value if provided
+      if (typeof initialValue !== 'undefined' && typeof characteristic.updateValue === 'function') {
+        characteristic.updateValue(initialValue);
+      }
     }
+
     return characteristic;
   }
 
@@ -512,17 +518,13 @@ export default class HomeKitDevice {
   }
 
   static generateUUID(PLUGIN_NAME, api, serialNumber) {
-    let hap = undefined;
+    let hap;
     let uuid = crypto.randomUUID();
 
-    // Workout if we're running under Homebridge or HAP-NodeJS library
-    if (isNaN(api?.version) === false && typeof api?.hap === 'object' && api?.HAPLibraryVersion === undefined) {
-      // We have the Homebridge version number and hap API object
+    // Determine runtime environment (Homebridge vs HAP-NodeJS)
+    if (typeof api?.hap === 'object' && isNaN(api?.version) === false && typeof api?.HAPLibraryVersion === 'undefined') {
       hap = api.hap;
-    }
-
-    if (typeof api?.HAPLibraryVersion === 'function' && api?.version === undefined && api?.hap === undefined) {
-      // As we're missing the Homebridge entry points but have the HAP library version
+    } else if (typeof api?.HAPLibraryVersion === 'function' && typeof api?.version === 'undefined' && typeof api?.hap === 'undefined') {
       hap = api;
     }
 
