@@ -30,12 +30,12 @@
 // HomeKitDevice.TYPE
 // HomeKitDevice.VERSION
 //
-// The following functions should be overriden in your class which extends this
+// The following functions should be defined in your class which extends this
 //
-// HomeKitDevice.setupDevice()
-// HomeKitDevice.removeDevice()
-// HomeKitDevice.updateDevice(deviceData)
-// HomeKitDevice.messageDevice(type, message)
+// HomeKitDevice.onAdd()
+// HomeKitDevice.onRemove()
+// HomeKitDevice.onUpdate(deviceData)
+// HomeKitDevice.onMessage(type, message)
 //
 // Mark Hulskamp
 'use strict';
@@ -69,7 +69,7 @@ export default class HomeKitDevice {
   static PLATFORM_NAME = undefined; // Homebridge platform name
   static HISTORY = undefined; // HomeKit History object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2025.06.15'; // Code version
+  static VERSION = '2025.06.16'; // Code version
 
   deviceData = {}; // The devices data we store
   historyService = undefined; // HomeKit history service
@@ -125,7 +125,7 @@ export default class HomeKitDevice {
     // If valid, setup an event listener for messages to this device using our generated uuid
     if (eventEmitter instanceof EventEmitter === true) {
       this.#eventEmitter = eventEmitter;
-      this.#eventEmitter.addListener(this.uuid, this.#message.bind(this));
+      this.#eventEmitter.addListener(this.uuid, this.message.bind(this));
     }
 
     // Make a clone of current data and store in this object
@@ -197,11 +197,11 @@ export default class HomeKitDevice {
       this.historyService = new HomeKitDevice.HISTORY(this.accessory, this.log, this.hap, {});
     }
 
-    if (typeof this?.setupDevice === 'function') {
+    if (typeof this?.onAdd === 'function') {
       try {
         this.postSetupDetail('Serial number "%s"', this.deviceData.serialNumber, LOG_LEVELS.DEBUG);
 
-        await this.setupDevice();
+        await this.onAdd();
 
         if (this.historyService?.EveHome !== undefined) {
           this.postSetupDetail('EveHome support as "%s"', this.historyService.EveHome.evetype);
@@ -222,12 +222,12 @@ export default class HomeKitDevice {
           }
         });
       } catch (error) {
-        this?.log?.error('setupDevice call for device "%s" failed. Error was', this.deviceData.description, error);
+        this?.log?.error('onAdd call for device "%s" failed. Error was', this.deviceData.description, error);
       }
     }
 
     // Perform an initial update using current data
-    this.update(this.deviceData, true);
+    await this.update(this.deviceData, true);
 
     // If using HAP-NodeJS library, publish accessory on local network
     if (this.#platform === undefined && this.accessory !== undefined) {
@@ -244,7 +244,7 @@ export default class HomeKitDevice {
     return this.accessory; // Return our HomeKit accessory
   }
 
-  remove() {
+  async remove() {
     this?.log?.warn?.('Device "%s" has been removed', this.deviceData.description);
 
     if (this.#eventEmitter !== undefined) {
@@ -252,11 +252,11 @@ export default class HomeKitDevice {
       this.#eventEmitter.removeAllListeners(this.uuid);
     }
 
-    if (typeof this?.removeDevice === 'function') {
+    if (typeof this?.onRemove === 'function') {
       try {
-        this.removeDevice();
+        await this.onRemove();
       } catch (error) {
-        this?.log?.error('removeDevice call for device "%s" failed. Error was', this.deviceData.description, error);
+        this?.log?.error('onRemove call for device "%s" failed. Error was', this.deviceData.description, error);
       }
     }
 
@@ -284,7 +284,7 @@ export default class HomeKitDevice {
     // delete this;
   }
 
-  update(deviceData, forceUpdate) {
+  async update(deviceData, forceUpdate) {
     if (typeof deviceData !== 'object' || typeof forceUpdate !== 'boolean') {
       return;
     }
@@ -365,11 +365,11 @@ export default class HomeKitDevice {
         }
       }
 
-      if (typeof this?.updateDevice === 'function') {
+      if (typeof this?.onUpdate === 'function') {
         try {
-          this.updateDevice(deviceData); // Pass updated data on for accessory to process as it needs
+          await this.onUpdate(deviceData); // Pass updated data on for accessory to process as it needs
         } catch (error) {
-          this?.log?.error('updateDevice call for device "%s" failed. Error was', deviceData.description, error);
+          this?.log?.error('onUpdate call for device "%s" failed. Error was', deviceData.description, error);
         }
       }
 
@@ -409,30 +409,21 @@ export default class HomeKitDevice {
     return results?.[0];
   }
 
-  #message(type, message) {
-    switch (type) {
-      case HomeKitDevice.UPDATE: {
-        // Got some device data, so process any updates
-        this.update(message, false);
-        break;
-      }
-
-      case HomeKitDevice.REMOVE: {
-        // Got message for device removal
-        this.remove();
-        break;
-      }
-
-      default: {
-        // This is not a message we know about, so pass onto accessory for it to perform any processing
-        if (typeof this?.messageDevice === 'function') {
-          try {
-            this.messageDevice(type, message);
-          } catch (error) {
-            this?.log?.error('messageDevice call for device "%s" failed. Error was', this.deviceData.description, error);
-          }
-        }
-        break;
+  async message(type, message) {
+    if (type === HomeKitDevice.UPDATE) {
+      // Got some device data, so process any updates
+      this.update(message, false);
+    }
+    if (type === HomeKitDevice.REMOVE) {
+      // Got message for device removal
+      this.remove();
+    }
+    if (type !== HomeKitDevice.UPDATE && type !== HomeKitDevice.REMOVE && typeof this?.onMessage === 'function') {
+      // This is not a type message we know about, so pass onto accessory for it to perform any processing
+      try {
+        await this.onMessage(type, message);
+      } catch (error) {
+        this?.log?.error('onMessage call for device "%s" failed. Error was', this.deviceData.description, error);
       }
     }
   }
@@ -546,7 +537,7 @@ export default class HomeKitDevice {
     return uuid;
   }
 
-  static makeHomeKitName(name) {
+  static makeValidHKName(name) {
     // Strip invalid characters to meet HomeKit naming requirements
     // Ensure only letters or numbers are at the beginning AND/OR end of string
     // Matches against uni-code characters
