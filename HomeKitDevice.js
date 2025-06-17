@@ -54,7 +54,7 @@ const LOG_LEVELS = {
 };
 
 // Define our HomeKit device class
-export default class HomeKitDevice {
+export default class HomeKitDevice extends EventEmitter {
   // Device messages
   static UPDATE = 'HomeKitDevice.update';
   static REMOVE = 'HomeKitDevice.remove';
@@ -71,11 +71,15 @@ export default class HomeKitDevice {
   static PLATFORM_NAME = undefined; // Homebridge platform name
   static HISTORY = undefined; // HomeKit History object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2025.06.16'; // Code version
+  static VERSION = '2025.06.17'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
   static HAPNODEJS = 'hap-nodejs';
+
+  // Internal device and listener registry
+  static #listeners = {};
+  static #deviceRegistry = new Map();
 
   deviceData = {}; // The devices data we store
   historyService = undefined; // HomeKit history service
@@ -87,10 +91,11 @@ export default class HomeKitDevice {
   // Internal data only for this class
   #uuid = undefined; // UUID for this instance
   #platform = undefined; // Homebridge platform API
-  #eventEmitter = undefined; // Event emitter to use for comms
   #postSetupDetails = []; // Use for extra output details once a device has been setup
 
-  constructor(accessory = undefined, api = undefined, log = undefined, eventEmitter = undefined, deviceData = {}) {
+  constructor(accessory = undefined, api = undefined, log = undefined, deviceData = {}) {
+    super(); // Setup event emitter for our class ONLY
+
     // Validate the passed in logging object. We are expecting certain functions to be present
     if (Object.values(LOG_LEVELS).every((fn) => typeof log?.[fn] === 'function')) {
       this.log = log;
@@ -114,6 +119,8 @@ export default class HomeKitDevice {
     // Will either be a random generated one or HAP generated one
     // HAP is based upon defined plugin name and devices serial number
     this.#uuid = HomeKitDevice.generateUUID(HomeKitDevice.PLUGIN_NAME, api, deviceData.serialNumber);
+    this.on(this.#uuid, this.message.bind(this));
+    HomeKitDevice.#deviceRegistry.set(this.#uuid, this);
 
     // See if we were passed in an existing accessory object or array of accessory objects
     // Mainly used to restore a Homebridge cached accessory
@@ -124,13 +131,6 @@ export default class HomeKitDevice {
       if (Array.isArray(accessory) === false && accessory?.UUID === this.#uuid) {
         this.accessory = accessory;
       }
-    }
-
-    // Validate if eventEmitter object passed to us is an instance of EventEmitter
-    // If valid, setup an event listener for messages to this device using our generated uuid
-    if (eventEmitter instanceof EventEmitter === true) {
-      this.#eventEmitter = eventEmitter;
-      this.#eventEmitter.addListener(this.#uuid, this.message.bind(this));
     }
 
     // Make a clone of current data and store in this object
@@ -203,7 +203,7 @@ export default class HomeKitDevice {
 
     // Setup our history service if module has been defined and requested to be active for this device
     if (typeof HomeKitDevice?.HISTORY === 'function' && this.historyService === undefined && enableHistory === true) {
-      this.historyService = new HomeKitDevice.HISTORY(this.accessory, this.hap, this.log, this.#eventEmitter, {});
+      this.historyService = new HomeKitDevice.HISTORY(this.accessory, this.hap, this.log, {});
     }
 
     if (typeof this?.onAdd === 'function') {
@@ -256,8 +256,10 @@ export default class HomeKitDevice {
   async remove() {
     this?.log?.warn?.('Device "%s" has been removed', this.deviceData.description);
 
-    // Remove listener for 'messages'
-    this.#eventEmitter?.removeAllListeners?.(this.#uuid);
+    // Remove listener for 'messages' and cleanup from device/listener registry
+    this?.removeAllListeners?.(this.#uuid);
+    HomeKitDevice.#deviceRegistry.delete(this.#uuid);
+    delete HomeKitDevice.#listeners[this.#uuid];
 
     if (typeof this?.onRemove === 'function') {
       try {
@@ -284,7 +286,6 @@ export default class HomeKitDevice {
     this.log = undefined;
     this.#uuid = undefined;
     this.#platform = undefined;
-    this.#eventEmitter = undefined;
 
     // Do we destroy this object??
     // this = null;
@@ -385,53 +386,63 @@ export default class HomeKitDevice {
     }
   }
 
-  async set(values) {
-    if (typeof values !== 'object' || this.#eventEmitter === undefined) {
-      return;
-    }
-
-    // Send event with data to set
-    this.#eventEmitter.emit(HomeKitDevice.SET, this.#uuid, values);
-
-    // Update the internal data for the set values, as could take some time once we emit the event
-    Object.entries(values).forEach(([key, value]) => {
-      if (typeof this.deviceData?.[key] !== 'undefined') {
-        this.deviceData[key] = value;
+  static async message(uuid, type, messageOrCallback) {
+    if (typeof messageOrCallback === 'function') {
+      // Register handler
+      if (typeof this.#listeners?.[uuid] !== 'object') {
+        this.#listeners[uuid] = {};
       }
-    });
-  }
 
-  async get(values) {
-    if (typeof values !== 'object' || this.#eventEmitter === undefined) {
+      this.#listeners[uuid][type] = messageOrCallback;
       return;
     }
 
-    // Send event with data to get
-    // Once get has completed, we'll get an event back with the requested data
-    this.#eventEmitter.emit(HomeKitDevice.GET, this.#uuid, values);
+    // Route message to device instance
+    let device = this.#deviceRegistry.get(uuid);
+    if (device && typeof device.message === 'function') {
+      let result = await device.message(type, messageOrCallback);
 
-    // This should always return, but we probably should put in a timeout?
-    let results = await EventEmitter.once(this.#eventEmitter, HomeKitDevice.GET + '->' + this.#uuid);
-    return results?.[0];
+      if (type === HomeKitDevice.SET && typeof messageOrCallback === 'object') {
+        for (let [key, value] of Object.entries(messageOrCallback)) {
+          if (typeof device.deviceData?.[key] !== 'undefined') {
+            device.deviceData[key] = value;
+          }
+        }
+      }
+
+      return result;
+    }
   }
 
   async message(type, message) {
+    let result;
+    let handled = false;
+
+    let handler = HomeKitDevice.#listeners?.[this.uuid]?.[type];
+    if (typeof handler === 'function') {
+      result = await handler(message);
+      handled = true;
+    }
+
     if (type === HomeKitDevice.UPDATE) {
-      // Got some device data, so process any updates
-      this.update(message, false);
+      await this.update(message, false);
+      handled = true;
     }
+
     if (type === HomeKitDevice.REMOVE) {
-      // Got message for device removal
-      this.remove();
+      await this.remove();
+      handled = true;
     }
-    if (type !== HomeKitDevice.UPDATE && type !== HomeKitDevice.REMOVE && typeof this?.onMessage === 'function') {
-      // This is not a type message we know about, so pass onto accessory for it to perform any processing
+
+    if (handled === false && typeof this?.onMessage === 'function') {
       try {
-        await this.onMessage(type, message);
+        result = await this.onMessage(type, message);
       } catch (error) {
         this?.log?.error?.('onMessage call for device "%s" failed. Error was', this.deviceData.description, error);
       }
     }
+
+    return result;
   }
 
   addHKService(hkServiceType, name = '', subType = undefined) {
@@ -551,5 +562,9 @@ export default class HomeKitDevice {
           .replace(/^[^\p{L}\p{N}]*/gu, '')
           .replace(/[^\p{L}\p{N}]+$/gu, '')
       : name;
+  }
+
+  get uuid() {
+    return this.#uuid;
   }
 }
