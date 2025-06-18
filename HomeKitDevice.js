@@ -1,41 +1,31 @@
 // HomeKitDevice class
 //
-// This is the base class for all HomeKit accessories we code for in Homebridge/HAP-NodeJS
+// Base class for all HomeKit accessories using Homebridge or HAP-NodeJS.
 //
-// The deviceData structure should at a minimum contain the following elements:
+// Provides internal device tracking, metadata validation, lifecycle management,
+// HomeKit messaging, and optional EveHome-compatible history logging.
 //
-// Homebridge Plugin:
+// The `deviceData` object must include:
+//   serialNumber, softwareVersion, description, manufacturer, model
 //
-// serialNumber
-// softwareVersion
-// description
-// manufacturer
-// model
+// For HAP-NodeJS standalone mode, also required:
+//   hkUsername, hkPairingCode
 //
-// HAP-NodeJS Library Accessory:
+// The following static constants should be defined in subclasses:
+//   HomeKitDevice.PLUGIN_NAME       // Required (string)
+//   HomeKitDevice.PLATFORM_NAME     // Required (string)
+//   HomeKitDevice.TYPE              // Optional (device type string)
+//   HomeKitDevice.VERSION           // Optional (device code version)
+//   HomeKitDevice.HOMEKITHISTORY    // Optional (Eve-compatible history module)
 //
-// serialNumber
-// softwareVersion
-// description
-// manufacturer
-// model
-// hkUsername
-// hkPairingCode
+// The following instance methods may be overridden by subclasses:
+//   async onAdd()                   // Called once during setup
+//   async onRemove()                // Called when device is removed
+//   async onUpdate(deviceData)      // Called when device is updated
+//   async onMessage(type, message)  // Called for unhandled 'SET'/'GET'/custom messages
+//   async onHistory(type, entry)    // Called after a history entry is logged
 //
-// Following constants should be overridden in the module loading this class file
-//
-// HomeKitDevice.HOMEKITHISTORY
-// HomeKitDevice.PLUGIN_NAME
-// HomeKitDevice.PLATFORM_NAME
-// HomeKitDevice.TYPE
-// HomeKitDevice.VERSION
-//
-// The following functions should be defined in your class which extends this
-//
-// HomeKitDevice.onAdd()
-// HomeKitDevice.onRemove()
-// HomeKitDevice.onUpdate(deviceData)
-// HomeKitDevice.onMessage(type, message)
+// See README.md for usage examples and detailed documentation.
 //
 // Mark Hulskamp
 'use strict';
@@ -71,7 +61,7 @@ export default class HomeKitDevice extends EventEmitter {
   static PLATFORM_NAME = undefined; // Homebridge platform name
   static HISTORY = undefined; // HomeKit History object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2025.06.17'; // Code version
+  static VERSION = '2025.06.18'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
@@ -443,6 +433,65 @@ export default class HomeKitDevice extends EventEmitter {
     }
 
     return result;
+  }
+
+  async addHistory(target, entry, options = {}) {
+    if (
+      typeof this.historyService !== 'object' ||
+      typeof this.historyService.addHistory !== 'function' ||
+      typeof entry !== 'object' ||
+      typeof target !== 'object' ||
+      typeof target.UUID !== 'string'
+    ) {
+      return;
+    }
+
+    if (isNaN(entry?.time) === true) {
+      entry.time = Math.floor(Date.now() / 1000);
+    }
+
+    if (options.force !== true && typeof this.historyService.lastHistory === 'function') {
+      let last = this.historyService.lastHistory(target);
+      if (typeof last === 'object') {
+        let changed = Object.keys(entry).some((key) => {
+          if (key === 'time') {
+            return false;
+          }
+          let v = entry[key];
+          let lv = last[key];
+          return typeof v === 'object' ? JSON.stringify(v) !== JSON.stringify(lv) : v !== lv;
+        });
+        if (changed === false) {
+          return; // No changes, so skip
+        }
+      }
+    }
+
+    this.historyService.addHistory(target, entry, isNaN(options?.timegap) === false ? options.timegap : undefined);
+
+    if (typeof this?.onHistory === 'function') {
+      try {
+        await this.onHistory(target, entry);
+      } catch (error) {
+        this?.log?.error?.('onHistory call for device "%s" failed. Error was', this.deviceData.description, error);
+      }
+    }
+  }
+
+  setupEveHomeLink(service, options = {}) {
+    // Only proceed if eveHistory is enabled and link function exists
+    if (
+      this.deviceData?.eveHistory === true &&
+      typeof this.historyService?.linkToEveHome === 'function' &&
+      typeof service === 'object' &&
+      typeof service.UUID === 'string' &&
+      typeof this?.accessory?.getService === 'function' &&
+      Array.isArray(this.accessory?.services) === true &&
+      this.accessory.services.includes(service) === true // Validate service belongs to this accessory
+    ) {
+      // Perform EveHome linkage
+      this.historyService.linkToEveHome(service, options);
+    }
   }
 
   addHKService(hkServiceType, name = '', subType = undefined) {

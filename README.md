@@ -1,8 +1,7 @@
 # HomeKitDevice
 
 Base class for all HomeKit accessories using HAP-NodeJS or Homebridge.  
-Provides internal device tracking, metadata validation, lifecycle management, and message routing.  
-Supports optional EveHome history integration.
+Provides internal device tracking, metadata validation, lifecycle management, HomeKit messaging, and optional EveHome-compatible history logging.
 
 ---
 
@@ -10,158 +9,111 @@ Supports optional EveHome history integration.
 
 This module provides:
 
-- Lifecycle methods: `onAdd`, `onRemove`, `onUpdate`, `onMessage`
+- Device tracking and UUID generation
+- HomeKit Accessory setup for Homebridge and HAP-NodeJS
+- Lifecycle methods: `onAdd`, `onRemove`, `onUpdate`, `onMessage`, `onHistory`
 - Static and instance `.message()` routing
-- Device registry (by UUID)
-- SET/GET characteristic handler support
-- Device metadata validation
+- Characteristic handler registration (`SET`, `GET`, custom)
+- Helper methods for setting up services and characteristics
+- Optional `addHistory()` support for flat-file logging
+- Optional EveHome linkage via `setupEveHomeLink()`
 
 ---
 
-## Example: Subclassing
+## Usage Example
 
 ```js
 import HomeKitDevice from './HomeKitDevice.js';
 
 export default class MyDevice extends HomeKitDevice {
-  onAdd() {
-    this.log.info('Device added');
-  }
+  static PLUGIN_NAME = 'my-homebridge-plugin';
+  static PLATFORM_NAME = 'MyPlatform';
+  static TYPE = 'Sensor';
+  static VERSION = '2025.06.18';
 
-  onRemove() {
-    this.log.info('Device removed');
-  }
+  async onAdd() {
+    this.tempService = this.addHKService(this.hap.Service.TemperatureSensor);
+    this.addHKCharacteristic(this.tempService, this.hap.Characteristic.CurrentTemperature, {
+      onGet: () => this.deviceData?.temperature ?? 0,
+    });
 
-  onUpdate(deviceData) {
-    this.deviceData = deviceData;
-  }
-
-  onMessage(type, message) {
-    if (type === 'SET') {
-      this.targetState = message;
+    if (this.deviceData?.eveHistory === true) {
+      this.setupEveHomeLink(this.tempService);
     }
   }
-}
-```
 
----
+  async onUpdate(deviceData) {
+    this.tempService.updateCharacteristic(this.hap.Characteristic.CurrentTemperature, deviceData.temperature);
+    this.addHistory(this.tempService, { temperature: deviceData.temperature }, { timegap: 300 });
+  }
 
-## Required `deviceData`
-
-Each device must be initialized with the following structure:
-
-```js
-const deviceData = {
-  serialNumber: 'ABC123456',
-  softwareVersion: '1.0.0',
-  description: 'ABC Device',
-  manufacturer: 'Device',
-  model: '123456',
-
-  // Required when using HAP-NodeJS (standalone mode)
-  hkUsername: '11:22:33:44:55:66',
-  hkPairingCode: '123-45-678'
-};
-```
-
----
-
-## Static Constants to Define
-
-Define the following constants in your module or subclass:
-
-```js
-HomeKitDevice.PLUGIN_NAME = 'homebridge-xxxxx';
-HomeKitDevice.PLATFORM_NAME = 'SomePlatform';
-HomeKitDevice.TYPE = 'ADevice';
-HomeKitDevice.VERSION = 'x.x.x';
-
-// Optional [EveHome-compatible history integration](https://github.com/n0rt0nthec4t/HomeKitHistory)
-HomeKitDevice.HOMEKITHISTORY = HomeKitHistory;
-```
-
----
-
-## Lifecycle Methods
-
-These methods are called automatically by the framework:
-
-| Method                  | Description                                        |
-|-------------------------|----------------------------------------------------|
-| `onAdd()`               | Called when the device is first added              |
-| `onRemove()`            | Called when the device is removed                  |
-| `onUpdate(deviceData)`  | Called with new `deviceData` on config update      |
-| `onMessage(type, msg)`  | Called for messages like `'SET'`, `'GET'`, etc.    |
-
----
-
-## Message Types
-
-These are the only types handled by the base class:
-
-| Type       | Routed To               | Description                                      |
-|------------|-------------------------|--------------------------------------------------|
-| `'SET'`    | Registered handler or `onMessage` | Set a value (e.g. from HomeKit)        |
-| `'GET'`    | Registered handler or `onMessage` | Get a value (return value or Promise)  |
-| `'UPDATE'` | `onUpdate(deviceData)`  | Update the device data                          |
-| `'REMOVE'` | `onRemove()`            | Remove the device                               |
-
----
-
-## Static Messaging API
-
-Send or register messages by UUID.
-
-### Send a message to a device
-
-```js
-await HomeKitDevice.message(uuid, 'SET', true);
-const value = await HomeKitDevice.message(uuid, 'GET');
-await HomeKitDevice.message(uuid, 'UPDATE', updatedDeviceData);
-await HomeKitDevice.message(uuid, 'REMOVE');
-```
-
-### Register handlers for SET / GET
-
-```js
-HomeKitDevice.message(uuid, 'SET', (value) => {
-  this.state = value;
-});
-
-HomeKitDevice.message(uuid, 'GET', () => {
-  return this.state;
-});
-```
-
----
-
-## Instance Messaging API
-
-Use `.message()` from within a device instance:
-
-```js
-await this.message('SET', false);
-const state = await this.message('GET');
-```
-
----
-
-## Example: Handling onMessage
-
-```js
-onMessage(type, message) {
-  if (type === 'SET') {
-    this.mode = message;
-  } else if (type === 'GET') {
-    return this.mode;
+  async onHistory(type, entry) {
+    // Optional hook triggered after history is logged
+    this.log.debug('History added:', type, entry);
   }
 }
 ```
 
 ---
 
-## Notes
+## Messaging System
 
-- `.set()` and `.get()` are deprecated — use `.message('SET')` / `'GET'`
-- Devices are auto-registered and routable via UUID
-- Only `'SET'`, `'GET'`, `'UPDATE'`, and `'REMOVE'` are reserved message typesare reserved message types
+The `HomeKitDevice.message()` static method supports routing messages to active instances:
+
+| Type                          | Description                                  |
+|-------------------------------|----------------------------------------------|
+| `HomeKitDevice.UPDATE`        | Trigger device `.update()`                   |
+| `HomeKitDevice.REMOVE`        | Trigger device `.remove()`                   |
+| `HomeKitDevice.SET`           | Trigger `.deviceData` update with data merge |
+| `HomeKitDevice.GET`           | Reserved for future                         |
+| Custom strings                | Passed to `.onMessage(type, message)`        |
+
+---
+
+## History Logging
+
+Devices can log flat-file history using:
+
+```js
+this.addHistory(service, { temperature: 25.3 }, { timegap: 300, force: true });
+```
+
+- `service`: a valid HomeKit characteristic or service object
+- `entry`: object of key/value pairs (e.g., `{ status: 1, temperature: 23.1 }`)
+- `options`: optional object with:
+  - `timegap` (seconds): minimum spacing between entries of same type
+  - `force` (true/false): bypass change detection and log anyway
+
+If `entry.time` is missing, it will default to the current time.
+
+To support EveHome linkage, subclass must call:
+
+```js
+this.setupEveHomeLink(service);
+```
+
+If `deviceData.eveHistory === true`, this will invoke `historyService.linkToEveHome(...)`.
+
+---
+
+## Requirements
+
+Device `deviceData` must include:
+
+- `serialNumber` (string)
+- `softwareVersion` (string)
+- `description` (string)
+- `manufacturer` (string)
+- `model` (string)
+
+For **HAP-NodeJS** mode (standalone), also required:
+
+- `hkUsername` (MAC-style)
+- `hkPairingCode` (`XXX-XX-XXX` or `XXXX-XXXX`)
+
+---
+
+## License
+
+Apache 2.0  
+© Mark Hulskamp

@@ -2,6 +2,21 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2025/06/18
+
+### Added
+- `addHistory()` method to `HomeKitDevice`:
+  - Supports safe history logging with change detection and optional force
+  - Accepts either service or characteristic as target
+  - Automatically adds `entry.time` if missing
+- `onHistory(type, entry)` lifecycle hook:
+  - Invoked after each successful history entry
+  - Allows subclasses to respond to logged events
+- `setupEveHomeLink(service, options)` method:
+  - Conditionally links a service to EveHome if `deviceData.eveHistory` is enabled
+  - Validates service ownership before linking
+  - Can be called from `.onAdd()` for dynamic EveHome compatibility
+
 ## 2025/06/17
 
 ### Added
