@@ -485,7 +485,6 @@ export default class HomeKitDevice extends EventEmitter {
       typeof this.historyService?.linkToEveHome === 'function' &&
       typeof service === 'object' &&
       typeof service.UUID === 'string' &&
-      typeof this?.accessory?.getService === 'function' &&
       Array.isArray(this.accessory?.services) === true &&
       this.accessory.services.includes(service) === true // Validate service belongs to this accessory
     ) {
