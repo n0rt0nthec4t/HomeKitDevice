@@ -548,8 +548,8 @@ export default class HomeKitDevice extends EventEmitter {
       }
 
       // Set initial value if provided
-      if (typeof initialValue !== 'undefined' && typeof characteristic.updateValue === 'function') {
-        characteristic.updateValue(initialValue);
+      if (typeof initialValue !== 'undefined' && typeof hkService?.updateCharacteristic === 'function') {
+        hkService.updateCharacteristic(hkCharacteristicType, initialValue);
       }
     }
 
