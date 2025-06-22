@@ -527,7 +527,10 @@ export default class HomeKitDevice extends EventEmitter {
       typeof hkService?.addOptionalCharacteristic === 'function'
     ) {
       if (hkService.testCharacteristic(hkCharacteristicType) === false) {
-        if (Array.isArray(hkService?.optionalCharacteristics) && hkService.optionalCharacteristics.includes(hkCharacteristicType)) {
+        if (
+          Array.isArray(hkService?.optionalCharacteristics) === true &&
+          hkService.optionalCharacteristics.includes(hkCharacteristicType) === true
+        ) {
           hkService.addOptionalCharacteristic(hkCharacteristicType);
         } else {
           hkService.addCharacteristic(hkCharacteristicType);
