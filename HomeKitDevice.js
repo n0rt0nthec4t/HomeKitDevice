@@ -335,7 +335,7 @@ export default class HomeKitDevice extends EventEmitter {
     // Handle built-in types with special behavior
     if (type === HomeKitDevice.ADD || type === HomeKitDevice.REMOVE || type === HomeKitDevice.SET) {
       // Call the dynamic on<Type> method (e.g. onAdd, onRemove, onSet)
-      await callHandler(methodName, this[methodName].bind(this), message, ...args);
+      await callHandler(methodName, this?.[methodName]?.bind?.(this), message, ...args);
 
       // Call any static handler registered via HomeKitDevice.message(uuid, type, handler)
       await callHandler('handler for ' + type, handler, message, ...args);
@@ -379,7 +379,7 @@ export default class HomeKitDevice extends EventEmitter {
         this.#updateAccessoryInformation(merged);
 
         if (changed === true || (typeof args?.[0] === 'object' && args?.[0]?.force === true)) {
-          await callHandler('onUpdate', this.onUpdate.bind(this), merged, ...args);
+          await callHandler('onUpdate', this?.[methodName]?.bind?.(this), merged, ...args);
           await callHandler('handler for UPDATE', handler, merged, ...args);
         }
 
@@ -425,7 +425,7 @@ export default class HomeKitDevice extends EventEmitter {
       }
 
       // Call onHistory if present
-      await callHandler('onHistory', this.onHistory.bind(this), target, entry, options);
+      await callHandler('onHistory', this?.[methodName]?.bind?.(this), target, entry, options);
       await callHandler('handler for HISTORY', handler, target, entry, options);
 
       handled = true;
@@ -433,13 +433,13 @@ export default class HomeKitDevice extends EventEmitter {
 
     // Dynamically handle any on<Type> method (e.g., onGet etc
     if (handled === false && typeof this?.[methodName] === 'function') {
-      result = await callHandler(methodName, this[methodName].bind(this), message, ...args);
+      result = await callHandler(methodName, this?.[methodName]?.bind?.(this), message, ...args);
       handled = true;
     }
 
     // Always call generic handler if present
     if (handled === false && typeof this?.onMessage === 'function') {
-      result = await callHandler('onMessage', this.onMessage.bind(this), type, message, ...args);
+      result = await callHandler('onMessage', this?.[methodName]?.bind?.(this), type, message, ...args);
       handled = true;
     }
 
