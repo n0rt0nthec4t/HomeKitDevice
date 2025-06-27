@@ -11,8 +11,9 @@ The `HomeKitDevice` module provides:
 
 - Lifecycle hooks (`onAdd`, `onUpdate`, `onRemove`, `onSet`, `onGet`, `onMessage`, `onHistory`)
 - Static and instance `.message()` routing
+- Public wrapper methods (`add()`, `update()`, `remove()`, `get()`, `set()`, `history()`)
 - Safe characteristic binding (`addHKService`, `addHKCharacteristic`)
-- EveHome-compatible history support (`addHistory`, `setupEveHomeLink`)
+- EveHome-compatible history support (`history`, `setupEveHomeLink`)
 - Internal device registry for UUID-based lookup and messaging
 
 Supports both Homebridge plugins and standalone HAP-NodeJS environments.
