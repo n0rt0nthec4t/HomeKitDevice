@@ -9,7 +9,7 @@ Provides internal device tracking, metadata validation, lifecycle management, me
 
 The `HomeKitDevice` module provides:
 
-- Lifecycle hooks (`onAdd`, `onUpdate`, `onRemove`, `onMessage`, `onHistory`)
+- Lifecycle hooks (`onAdd`, `onUpdate`, `onRemove`, `onSet`, `onGet`, `onMessage`, `onHistory`)
 - Static and instance `.message()` routing
 - Safe characteristic binding (`addHKService`, `addHKCharacteristic`)
 - EveHome-compatible history support (`addHistory`, `setupEveHomeLink`)
@@ -163,29 +163,33 @@ This routes to the device’s `onMessage(type, message)` handler.
 
 ## Lifecycle Hooks
 
-| Method                  | Called when...                                          |
-|-------------------------|---------------------------------------------------------|
-| `onAdd()`               | Accessory is being initialized                          |
-| `onUpdate(deviceData)`  | Device configuration or metadata is updated             |
-| `onRemove()`            | Device is removed or unpaired                           |
-| `onMessage(type, msg)`  | Internal message received via `.message()`              |
-| `onHistory(type, entry)`| After a history entry is successfully logged            |
+| Method                      | Called when...                                                 |
+|-----------------------------|----------------------------------------------------------------|
+| `onAdd(message)`            | A `.ADD` message is received when the accessory is initialized |
+| `onUpdate(deviceData)`      | A `.UPDATE` message updates the device configuration/state     |
+| `onRemove(message)`         | A `.REMOVE` message is received to shut down/unregister device |
+| `onSet(message)`            | A `.SET` message is received with new values to apply          |
+| `onGet(message)`            | A `.GET` message is received to query current values/state     |
+| `onMessage(type, mmessage)` | A message was received that was not handled by known types     |
+| `onHistory(type, entry)`    | After a history entry is successfully logged                   |
 
 ---
 
 ## Static Constants
 
-The following static constants are provided for internal message routing and validation:
+These constants are used internally for structured messaging and lifecycle dispatch:
 
-| Constant         | Description                                                    |
-|------------------|----------------------------------------------------------------|
-| `SET`            | Used to deliver set-value messages to the device               |
-| `GET`            | Used to request the current value/state from the device        |
-| `UPDATE`         | Used to notify the device of updated configuration or state    |
-| `REMOVE`         | Used to instruct the device to unregister or shut down         |
-| `HK_PIN_3_2_3`   | RegExp for PIN format `xxx-xx-xxx`                             |
-| `HK_PIN_4_4`     | RegExp for PIN format `xxxx-xxxx`                              |
-| `MAC_ADDR`       | RegExp for HomeKit username format `XX:XX:XX:XX:XX:XX`         |
+| Constant                  | Description                                                      |
+|---------------------------|------------------------------------------------------------------|
+| `HomeKitDevice.ADD`       | Sent during accessory initialization (`onAdd`)                   |
+| `HomeKitDevice.UPDATE`    | Sent to apply updated device data (`onUpdate`)                   |
+| `HomeKitDevice.REMOVE`    | Sent to unregister the accessory (`onRemove`)                    |
+| `HomeKitDevice.SET`       | Sent to apply new values (`onSet`)                               |
+| `HomeKitDevice.GET`       | Sent to query device state (`onGet`)                             |
+| `HomeKitDevice.HISTORY`   | Sent when a history entry is logged (`onHistory`)                |
+| `HomeKitDevice.HK_PIN_3_2_3` | RegExp for PIN format `xxx-xx-xxx`                            |
+| `HomeKitDevice.HK_PIN_4_4`   | RegExp for PIN format `xxxx-xxxx`                             |
+| `HomeKitDevice.MAC_ADDR`     | RegExp for HomeKit username format `XX:XX:XX:XX:XX:XX`        |
 
 ---
 

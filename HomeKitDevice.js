@@ -3,7 +3,7 @@
 // Base class for all HomeKit accessories using Homebridge or HAP-NodeJS.
 //
 // Provides internal device tracking, metadata validation, lifecycle management,
-// HomeKit messaging, and optional EveHome-compatible history logging.
+// centralized message dispatch, and optional EveHome-compatible history logging.
 //
 // The `deviceData` object must include:
 //   serialNumber, softwareVersion, description, manufacturer, model
@@ -18,12 +18,20 @@
 //   HomeKitDevice.VERSION           // Optional (device code version)
 //   HomeKitDevice.HOMEKITHISTORY    // Optional (Eve-compatible history module)
 //
-// The following instance methods may be overridden by subclasses:
-//   async onAdd()                   // Called once during setup
-//   async onRemove()                // Called when device is removed
-//   async onUpdate(deviceData)      // Called when device is updated
-//   async onMessage(type, message)  // Called for unhandled 'SET'/'GET'/custom messages
-//   async onHistory(type, entry)    // Called after a history entry is logged
+// The following instance methods can be optionally implemented by subclasses:
+//   async onAdd(message, ...args)       // Called when HomeKitDevice.ADD is received
+//   async onUpdate(deviceData, ...args) // Called when HomeKitDevice.UPDATE is received
+//   async onRemove(message, ...args)    // Called when HomeKitDevice.REMOVE is received
+//   async onHistory(target, entry)      // Called after a history entry is logged
+//   async onGet(message, ...args)       // Called when HomeKitDevice.GET is received
+//   async onSet(message, ...args)       // Called when HomeKitDevice.SET is received
+//   async onMessage(type, message)      // Called for unhandled or custom message types
+//
+// Messages should be sent via:
+//   await device.message(type, message, ...args);
+//
+// All internal lifecycle events (`add`, `update`, `remove`, `history`, `get`, `set`) and external
+// interactions should use the `message()` dispatch system for consistency.
 //
 // See README.md for usage examples and detailed documentation.
 //
@@ -46,10 +54,12 @@ const LOG_LEVELS = {
 // Define our HomeKit device class
 export default class HomeKitDevice extends EventEmitter {
   // Device messages
-  static UPDATE = 'HomeKitDevice.update';
-  static REMOVE = 'HomeKitDevice.remove';
-  static SET = 'HomeKitDevice.set';
-  static GET = 'HomeKitDevice.get';
+  static ADD = 'HomeKitDevice.onAdd';
+  static UPDATE = 'HomeKitDevice.onUpdate';
+  static REMOVE = 'HomeKitDevice.onRemove';
+  static HISTORY = 'HomeKitDevice.onHistory';
+  static SET = 'HomeKitDevice.onSet';
+  static GET = 'HomeKitDevice.onGet';
 
   // HomeKit pin format and MAC address regex's
   static HK_PIN_3_2_3 = /^\d{3}-\d{2}-\d{3}$/;
@@ -61,7 +71,7 @@ export default class HomeKitDevice extends EventEmitter {
   static PLATFORM_NAME = undefined; // Homebridge platform name
   static HISTORY = undefined; // HomeKit History object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2025.06.21'; // Code version
+  static VERSION = '2025.06.27'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
@@ -183,6 +193,11 @@ export default class HomeKitDevice extends EventEmitter {
 
     // Setup accessory information
     let informationService = this.accessory.getService(this.hap.Service.AccessoryInformation);
+    if (informationService === undefined) {
+      this?.log?.error?.('AccessoryInformation service not found on accessory for "%s"', this.deviceData.description);
+      return;
+    }
+
     if (informationService !== undefined) {
       informationService.updateCharacteristic(this.hap.Characteristic.Manufacturer, this.deviceData.manufacturer);
       informationService.updateCharacteristic(this.hap.Characteristic.Model, this.deviceData.model);
@@ -196,37 +211,32 @@ export default class HomeKitDevice extends EventEmitter {
       this.historyService = new HomeKitDevice.HISTORY(this.accessory, this.hap, this.log, {});
     }
 
-    if (typeof this?.onAdd === 'function') {
-      try {
-        this.postSetupDetail('Serial number "%s"', this.deviceData.serialNumber, LOG_LEVELS.DEBUG);
+    this.postSetupDetail('Serial number "%s"', this.deviceData.serialNumber, LOG_LEVELS.DEBUG);
 
-        await this.onAdd();
+    // Trigger registered handlers (onAdd + listeners)
+    await this.message(HomeKitDevice.ADD);
 
-        if (this.historyService?.EveHome !== undefined) {
-          this.postSetupDetail('EveHome support as "%s"', this.historyService.EveHome.evetype);
-        }
-
-        this?.log?.info?.('Setup %s %s as "%s"', this.deviceData.manufacturer, this.deviceData.model, this.deviceData.description);
-        this.#postSetupDetails.forEach((entry) => {
-          if (typeof entry === 'string') {
-            this?.log?.[LOG_LEVELS.INFO]?.('  += %s', entry);
-          } else if (typeof entry?.message === 'string') {
-            let level =
-              Object.hasOwn(LOG_LEVELS, entry?.level?.toUpperCase?.()) &&
-              typeof this?.log?.[LOG_LEVELS[entry.level.toUpperCase()]] === 'function'
-                ? LOG_LEVELS[entry.level.toUpperCase()]
-                : LOG_LEVELS.INFO;
-
-            this?.log?.[level]?.('  += ' + entry.message, ...(Array.isArray(entry?.args) ? entry.args : []));
-          }
-        });
-      } catch (error) {
-        this?.log?.error?.('onAdd call for device "%s" failed. Error was', this.deviceData.description, error);
-      }
+    if (this.historyService?.EveHome !== undefined) {
+      this.postSetupDetail('EveHome support as "%s"', this.historyService.EveHome.evetype);
     }
 
-    // Perform an initial update using current data
-    await this.update(this.deviceData, true);
+    this?.log?.info?.('Setup %s %s as "%s"', this.deviceData.manufacturer, this.deviceData.model, this.deviceData.description);
+    this.#postSetupDetails.forEach((entry) => {
+      if (typeof entry === 'string') {
+        this?.log?.[LOG_LEVELS.INFO]?.('  += %s', entry);
+      } else if (typeof entry?.message === 'string') {
+        let level =
+          Object.hasOwn(LOG_LEVELS, entry?.level?.toUpperCase?.()) &&
+          typeof this?.log?.[LOG_LEVELS[entry.level.toUpperCase()]] === 'function'
+            ? LOG_LEVELS[entry.level.toUpperCase()]
+            : LOG_LEVELS.INFO;
+
+        this?.log?.[level]?.('  += ' + entry.message, ...(Array.isArray(entry?.args) ? entry.args : []));
+      }
+    });
+
+    // Trigger registered handlers (onUpdate + listeners) for initial device data updates
+    await this.message(HomeKitDevice.UPDATE, this.deviceData, { force: true });
 
     // If using HAP-NodeJS library, publish accessory on local network
     if (this.accessory !== undefined && this.backend === HomeKitDevice.HAPNODEJS) {
@@ -244,198 +254,20 @@ export default class HomeKitDevice extends EventEmitter {
   }
 
   async remove() {
-    this?.log?.warn?.('Device "%s" has been removed', this.deviceData.description);
-
-    // Remove listener for 'messages' and cleanup from device/listener registry
-    this?.removeAllListeners?.(this.#uuid);
-    HomeKitDevice.#deviceRegistry.delete(this.#uuid);
-    delete HomeKitDevice.#listeners[this.#uuid];
-
-    if (typeof this?.onRemove === 'function') {
-      try {
-        await this.onRemove();
-      } catch (error) {
-        this?.log?.error?.('onRemove call for device "%s" failed. Error was', this.deviceData.description, error);
-      }
-    }
-
-    if (this.accessory !== undefined && typeof this.#platform?.unregisterPlatformAccessories === 'function') {
-      // Unregister the accessory from Homebridge platform
-      this.#platform.unregisterPlatformAccessories(HomeKitDevice.PLUGIN_NAME, HomeKitDevice.PLATFORM_NAME, [this.accessory]);
-    }
-
-    if (this.accessory !== undefined && this.#platform === undefined) {
-      // Unpublish the accessory from HAP-NodeJS library
-      this.accessory.unpublish();
-    }
-
-    this.deviceData = {};
-    this.accessory = undefined;
-    this.historyService = undefined;
-    this.hap = undefined;
-    this.log = undefined;
-    this.#uuid = undefined;
-    this.#platform = undefined;
-
-    // Do we destroy this object??
-    // this = null;
-    // delete this;
+    // Trigger registered handlers (onRemove + listeners)
+    await this.message(HomeKitDevice.REMOVE);
   }
 
-  async update(deviceData, forceUpdate) {
-    if (typeof deviceData !== 'object' || typeof forceUpdate !== 'boolean') {
+  async update(deviceData, ...args) {
+    if (typeof deviceData !== 'object') {
       return;
     }
 
-    // Updated data may only contain selected fields, so we'll handle that here by taking our internally stored data
-    // and merge with the updates to ensure we have a complete data object
-    Object.entries(this.deviceData).forEach(([key, value]) => {
-      if (typeof deviceData[key] === 'undefined') {
-        // Updated data doesn't have this key, so add it to our internally stored data
-        deviceData[key] = value;
-      }
-    });
-
-    // Check updated device data with our internally stored data. Flag if changes between the two
-    let changedData = false;
-    Object.keys(deviceData).forEach((key) => {
-      if (JSON.stringify(deviceData[key]) !== JSON.stringify(this.deviceData[key])) {
-        changedData = true;
-      }
-    });
-
-    // If we have any changed data OR we've been requested to force an update, do so here
-    if ((changedData === true || forceUpdate === true) && this.accessory !== undefined) {
-      let informationService = this.accessory.getService(this.hap.Service.AccessoryInformation);
-      if (informationService !== undefined) {
-        // Update details associated with the accessory
-        // ie: Name, Manufacturer, Model, Serial # and firmware version
-        if (typeof deviceData?.description === 'string' && deviceData.description !== this.deviceData.description) {
-          // Update devices description on the HomeKit accessory
-          informationService.updateCharacteristic(this.hap.Characteristic.Name, deviceData.description);
-        }
-
-        if (
-          typeof deviceData?.manufacturer === 'string' &&
-          deviceData.manufacturer !== '' &&
-          deviceData.manufacturer !== this.deviceData.manufacturer
-        ) {
-          // Update manufacturer number on the HomeKit accessory
-          informationService.updateCharacteristic(this.hap.Characteristic.Manufacturer, deviceData.manufacturer);
-        }
-
-        if (typeof deviceData?.model === 'string' && deviceData.model !== '' && deviceData.model !== this.deviceData.model) {
-          // Update model on the HomeKit accessory
-          informationService.updateCharacteristic(this.hap.Characteristic.Model, deviceData.model);
-        }
-
-        if (
-          typeof deviceData?.softwareVersion === 'string' &&
-          deviceData.softwareVersion !== '' &&
-          deviceData.softwareVersion !== this.deviceData.softwareVersion
-        ) {
-          // Update software version on the HomeKit accessory
-          informationService.updateCharacteristic(this.hap.Characteristic.FirmwareRevision, deviceData.softwareVersion);
-        }
-
-        // Check for devices serial number changing. Really shouldn't occur, but handle case anyway
-        if (
-          typeof deviceData?.serialNumber === 'string' &&
-          deviceData.serialNumber !== '' &&
-          deviceData.serialNumber.toUpperCase() !== this.deviceData.serialNumber.toUpperCase()
-        ) {
-          this?.log?.warn?.('Serial number on "%s" has changed', deviceData.description);
-          this?.log?.warn?.('This may cause the device to become unresponsive in HomeKit');
-
-          // Update software version on the HomeKit accessory
-          informationService.updateCharacteristic(this.hap.Characteristic.SerialNumber, deviceData.serialNumber);
-        }
-      }
-
-      if (typeof deviceData?.online === 'boolean' && deviceData.online !== this.deviceData.online) {
-        // Output device online/offline status
-        if (deviceData.online === false) {
-          this?.log?.warn?.('Device "%s" is offline', deviceData.description);
-        }
-
-        if (deviceData.online === true) {
-          this?.log?.success?.('Device "%s" is online', deviceData.description);
-        }
-      }
-
-      if (typeof this?.onUpdate === 'function') {
-        try {
-          await this.onUpdate(deviceData); // Pass updated data on for accessory to process as it needs
-        } catch (error) {
-          this?.log?.error?.('onUpdate call for device "%s" failed. Error was', deviceData.description, error);
-        }
-      }
-
-      // Finally, update our internally stored data with the new data
-      this.deviceData = structuredClone(deviceData);
-    }
+    // Trigger registered handlers (onUpdate + listeners)
+    await this.message(HomeKitDevice.UPDATE, deviceData, ...args);
   }
 
-  static async message(uuid, type, messageOrCallback) {
-    if (typeof messageOrCallback === 'function') {
-      // Register handler
-      if (typeof this.#listeners?.[uuid] !== 'object') {
-        this.#listeners[uuid] = {};
-      }
-
-      this.#listeners[uuid][type] = messageOrCallback;
-      return;
-    }
-
-    // Route message to device instance
-    let device = this.#deviceRegistry.get(uuid);
-    if (device && typeof device.message === 'function') {
-      let result = await device.message(type, messageOrCallback);
-
-      if (type === HomeKitDevice.SET && typeof messageOrCallback === 'object') {
-        for (let [key, value] of Object.entries(messageOrCallback)) {
-          if (typeof device.deviceData?.[key] !== 'undefined') {
-            device.deviceData[key] = value;
-          }
-        }
-      }
-
-      return result;
-    }
-  }
-
-  async message(type, message) {
-    let result;
-    let handled = false;
-
-    let handler = HomeKitDevice.#listeners?.[this.uuid]?.[type];
-    if (typeof handler === 'function') {
-      result = await handler(message);
-      handled = true;
-    }
-
-    if (type === HomeKitDevice.UPDATE) {
-      await this.update(message, false);
-      handled = true;
-    }
-
-    if (type === HomeKitDevice.REMOVE) {
-      await this.remove();
-      handled = true;
-    }
-
-    if (handled === false && typeof this?.onMessage === 'function') {
-      try {
-        result = await this.onMessage(type, message);
-      } catch (error) {
-        this?.log?.error?.('onMessage call for device "%s" failed. Error was', this.deviceData.description, error);
-      }
-    }
-
-    return result;
-  }
-
-  async addHistory(target, entry, options = {}) {
+  async history(target, entry, options = {}) {
     if (
       typeof this.historyService !== 'object' ||
       typeof this.historyService.addHistory !== 'function' ||
@@ -446,36 +278,183 @@ export default class HomeKitDevice extends EventEmitter {
       return;
     }
 
-    if (isNaN(entry?.time) === true) {
-      entry.time = Math.floor(Date.now() / 1000);
+    // Trigger registered handlers (onHistory + listeners)
+    await this.message(HomeKitDevice.HISTORY, target, entry, options);
+  }
+
+  async set(values, ...args) {
+    if (typeof values !== 'object' || values === null) {
+      return;
     }
 
-    if (options.force !== true && typeof this.historyService.lastHistory === 'function') {
-      let last = this.historyService.lastHistory(target);
-      if (typeof last === 'object') {
-        let changed = Object.keys(entry).some((key) => {
-          if (key === 'time') {
-            return false;
+    // Trigger registered handlers (onSet + listeners)
+    await this.message(HomeKitDevice.SET, values, ...args);
+  }
+
+  async get(values, ...args) {
+    // Trigger registered handlers (onGet + listeners)
+    return await this.message(HomeKitDevice.GET, values, ...args);
+  }
+
+  static async message(uuid, type, message = undefined, ...args) {
+    if (typeof message === 'function') {
+      // Register handler
+      if (typeof this.#listeners?.[uuid] !== 'object') {
+        this.#listeners[uuid] = {};
+      }
+
+      this.#listeners[uuid][type] = message;
+      return;
+    }
+
+    // Route message to device instance
+    let device = this.#deviceRegistry.get(uuid);
+    if (device !== undefined && typeof device.message === 'function') {
+      return await device.message(type, message, ...args);
+    }
+  }
+
+  async message(type, message, ...args) {
+    let result;
+    let handled = false;
+    let handler = HomeKitDevice.#listeners?.[this.#uuid]?.[type];
+
+    // Dynamically extract the handler method name from the type string (e.g., "HomeKitDevice.onAdd" becomes "onAdd")
+    // This allows consistent routing to instance methods like onAdd, onSet, onUpdate, etc.
+    let methodName = typeof type === 'string' ? type.match(/\.?(on[A-Z][a-zA-Z0-9]*)$/)?.[1] || undefined : undefined;
+
+    // Internal helper to call handlers with error trapping
+    const callHandler = async (label, fn, ...params) => {
+      try {
+        return await fn?.(...params);
+      } catch (error) {
+        this?.log?.error?.('%s call for device "%s" failed. Error was', label, this.deviceData.description, error);
+      }
+    };
+
+    // Handle built-in types with special behavior
+    if (type === HomeKitDevice.ADD || type === HomeKitDevice.REMOVE || type === HomeKitDevice.SET) {
+      // Call the dynamic on<Type> method (e.g. onAdd, onRemove, onSet)
+      await callHandler(methodName, this[methodName].bind(this), message, ...args);
+
+      // Call any static handler registered via HomeKitDevice.message(uuid, type, handler)
+      await callHandler('handler for ' + type, handler, message, ...args);
+      handled = true;
+
+      // Special teardown for REMOVE
+      if (type === HomeKitDevice.REMOVE) {
+        this?.log?.warn?.('Device "%s" has been removed', this.deviceData.description);
+        this?.removeAllListeners?.();
+        HomeKitDevice.#deviceRegistry.delete(this.#uuid);
+        delete HomeKitDevice.#listeners[this.#uuid];
+
+        if (this.accessory !== undefined && typeof this.#platform?.unregisterPlatformAccessories === 'function') {
+          this.#platform.unregisterPlatformAccessories(HomeKitDevice.PLUGIN_NAME, HomeKitDevice.PLATFORM_NAME, [this.accessory]);
+        }
+
+        if (this.accessory !== undefined && this.#platform === undefined) {
+          this.accessory.unpublish();
+        }
+
+        this.deviceData = {};
+        this.accessory = undefined;
+        this.historyService = undefined;
+        this.hap = undefined;
+        this.log = undefined;
+        this.#uuid = undefined;
+        this.#platform = undefined;
+      }
+
+      // Update the internal data for the set values, as could take some time once we emit the event
+      if (type === HomeKitDevice.SET && typeof message === 'object' && message !== null) {
+        Object.entries(message).forEach(([key, value]) => {
+          if (this.deviceData?.[key] !== undefined) {
+            this.deviceData[key] = value;
           }
-          let v = entry[key];
-          let lv = last[key];
-          return typeof v === 'object' ? JSON.stringify(v) !== JSON.stringify(lv) : v !== lv;
         });
-        if (changed === false) {
-          return; // No changes, so skip
+      }
+    } else if (type === HomeKitDevice.UPDATE) {
+      if (typeof message === 'object' && message !== null) {
+        let { merged, changed } = this.#mergeDeviceData(message);
+        this.#updateAccessoryInformation(merged);
+
+        if (changed === true || (typeof args?.[0] === 'object' && args?.[0]?.force === true)) {
+          await callHandler('onUpdate', this.onUpdate.bind(this), merged, ...args);
+          await callHandler('handler for UPDATE', handler, merged, ...args);
+        }
+
+        // Finally, update our internally stored data with the new data
+        this.deviceData = structuredClone(merged);
+      }
+
+      handled = true;
+    } else if (type === HomeKitDevice.HISTORY) {
+      let [target, entry, options = {}] = [message, args[0], args[1]];
+      let skipHistory = false;
+
+      if (
+        typeof this.historyService === 'object' &&
+        typeof this.historyService?.addHistory === 'function' &&
+        typeof entry === 'object' &&
+        typeof target === 'object' &&
+        typeof target.UUID === 'string'
+      ) {
+        if (isNaN(entry?.time) === true) {
+          entry.time = Math.floor(Date.now() / 1000);
+        }
+
+        if (options?.force !== true && typeof this.historyService?.lastHistory === 'function') {
+          let last = this.historyService.lastHistory(target);
+          if (typeof last === 'object') {
+            let changed = Object.keys(entry).some((key) => {
+              if (key === 'time') {
+                return false;
+              }
+              let v = entry[key];
+              let lv = last[key];
+              return typeof v === 'object' ? JSON.stringify(v) !== JSON.stringify(lv) : v !== lv;
+            });
+            if (changed === false) {
+              skipHistory = true; // Skip history if no changes
+            }
+          }
+        }
+        if (skipHistory === false) {
+          this.historyService.addHistory(target, entry, isNaN(options?.timegap) === false ? options.timegap : undefined);
         }
       }
+
+      // Call onHistory if present
+      await callHandler('onHistory', this.onHistory.bind(this), target, entry, options);
+      await callHandler('handler for HISTORY', handler, target, entry, options);
+
+      handled = true;
     }
 
-    this.historyService.addHistory(target, entry, isNaN(options?.timegap) === false ? options.timegap : undefined);
-
-    if (typeof this?.onHistory === 'function') {
-      try {
-        await this.onHistory(target, entry);
-      } catch (error) {
-        this?.log?.error?.('onHistory call for device "%s" failed. Error was', this.deviceData.description, error);
-      }
+    // Dynamically handle any on<Type> method (e.g., onGet etc
+    if (handled === false && typeof this?.[methodName] === 'function') {
+      result = await callHandler(methodName, this[methodName].bind(this), message, ...args);
+      handled = true;
     }
+
+    // Always call generic handler if present
+    if (handled === false && typeof this?.onMessage === 'function') {
+      result = await callHandler('onMessage', this.onMessage.bind(this), type, message, ...args);
+      handled = true;
+    }
+
+    // Always call static message listener if present
+    if (handled === false && typeof handler === 'function') {
+      result = await callHandler('handler for ' + type, handler, message, ...args);
+      handled = true;
+    }
+
+    // Log if unhandled message type
+    if (handled === false) {
+      this?.log?.warn?.('Unhandled message type "%s" for device "%s"', type, this.deviceData.description);
+    }
+
+    return result;
   }
 
   setupEveHomeLink(service, options = {}) {
@@ -617,5 +596,95 @@ export default class HomeKitDevice extends EventEmitter {
 
   get uuid() {
     return this.#uuid;
+  }
+
+  #mergeDeviceData(deviceDataUpdates = {}) {
+    let merged = { ...deviceDataUpdates };
+
+    // Updated data may only contain selected fields, so we'll handle that here by taking our internally stored data
+    // and merge with the updates to ensure we have a complete data object
+    Object.entries(this.deviceData).forEach(([key, value]) => {
+      if (typeof merged[key] === 'undefined') {
+        // Updated data doesn't have this key, so add it to our internally stored data
+        merged[key] = value;
+      }
+    });
+
+    // Check updated device data with our internally stored data. Flag if changes between the two
+    let changed = false;
+    Object.keys(merged).forEach((key) => {
+      if (JSON.stringify(merged[key]) !== JSON.stringify(this.deviceData[key])) {
+        changed = true;
+      }
+    });
+
+    return { merged, changed };
+  }
+
+  #updateAccessoryInformation(deviceData) {
+    // Always update accessory information if we have changed data
+    if (this.accessory === undefined) {
+      return;
+    }
+
+    let informationService = this.accessory.getService(this.hap.Service.AccessoryInformation);
+    if (informationService === undefined) {
+      this?.log?.error?.('AccessoryInformation service not found on accessory for "%s"', this.deviceData.description);
+      return;
+    }
+
+    // Update details associated with the accessory
+    // ie: Name, Manufacturer, Model, Serial # and firmware version
+    if (typeof deviceData?.description === 'string' && deviceData.description !== this.deviceData.description) {
+      // Update devices description on the HomeKit accessory
+      informationService.updateCharacteristic(this.hap.Characteristic.Name, deviceData.description);
+    }
+
+    if (
+      typeof deviceData?.manufacturer === 'string' &&
+      deviceData.manufacturer !== '' &&
+      deviceData.manufacturer !== this.deviceData.manufacturer
+    ) {
+      // Update manufacturer number on the HomeKit accessory
+      informationService.updateCharacteristic(this.hap.Characteristic.Manufacturer, deviceData.manufacturer);
+    }
+
+    if (typeof deviceData?.model === 'string' && deviceData.model !== '' && deviceData.model !== this.deviceData.model) {
+      // Update model on the HomeKit accessory
+      informationService.updateCharacteristic(this.hap.Characteristic.Model, deviceData.model);
+    }
+
+    if (
+      typeof deviceData?.softwareVersion === 'string' &&
+      deviceData.softwareVersion !== '' &&
+      deviceData.softwareVersion !== this.deviceData.softwareVersion
+    ) {
+      // Update software version on the HomeKit accessory
+      informationService.updateCharacteristic(this.hap.Characteristic.FirmwareRevision, deviceData.softwareVersion);
+    }
+
+    // Check for devices serial number changing. Really shouldn't occur, but handle case anyway
+    if (
+      typeof deviceData?.serialNumber === 'string' &&
+      deviceData.serialNumber !== '' &&
+      deviceData.serialNumber.toUpperCase() !== this.deviceData.serialNumber?.toUpperCase()
+    ) {
+      this?.log?.warn?.('Serial number on "%s" has changed', deviceData.description);
+      this?.log?.warn?.('This may cause the device to become unresponsive in HomeKit');
+
+      // Update serial number on the HomeKit accessory
+      informationService.updateCharacteristic(this.hap.Characteristic.SerialNumber, deviceData.serialNumber);
+    }
+
+    if (typeof deviceData?.online === 'boolean' && deviceData.online !== this.deviceData.online) {
+      // Output device online/offline status
+      if (deviceData.online === false) {
+        this?.log?.warn?.('Device "%s" is offline', deviceData.description);
+      }
+
+      if (deviceData.online === true) {
+        this?.log?.success?.('Device "%s" is online', deviceData.description);
+      }
+    }
   }
 }

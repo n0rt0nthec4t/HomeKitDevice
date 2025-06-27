@@ -2,6 +2,36 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2025/06/27
+
+### Added
+- Added `get()`, `set()`, and `history()` wrapper methods to simplify triggering standard lifecycle message flows.
+- Added automatic deduplication and time patching logic for `.HISTORY` messages.
+
+### Changed
+- Refactored `.message()` to consolidate dynamic and static handler calls using a unified `callHandler()` helper.
+- Optional chaining (`fn?.(...args)`) now used in `callHandler()` to simplify function existence checks.
+- `methodName` is now extracted via regex only if `type` is a string; added fallback logging for invalid or unknown message types.
+- Dynamic methods (e.g., `onAdd`, `onSet`) and static handlers now both update `handled` consistently after invocation.
+- Internal `deviceData` is now updated after `.SET` message handlers complete, preserving legacy behavior.
+
+### Fixed
+- Fixed a regression where `type.match(...)` could throw when `type` was not a string.
+- Fixed `get()` not returning values from `onGet` or static handlers due to missing `return`.
+
+## 2025/06/26
+
+### Added
+- Added `onSet(message)` and `onGet(message)` lifecycle hooks for direct handling of `.SET` and `.GET` messages.
+- Instance `.message()` now supports `.SET` and `.GET` with dedicated handling and fallback to `onMessage()`.
+- Updated README with full lifecycle hook and static constant reference tables.
+
+### Changed
+- Consolidated internal `.message()` dispatch logic to reduce duplication and ensure consistent fallback behavior.
+
+### Fixed
+- `.GET` messages now return results from `onGet()` or registered handler properly.
+
 ## 2025/06/18
 
 ### Added
