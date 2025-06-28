@@ -2,6 +2,17 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2025/06/28
+
+### Added
+- EveHome command handling is now routed via `.message()` using `HomeKitDevice.HISTORY.GET` and `.SET` message types.
+- Devices can now respond to Eve-specific requests by implementing `onMessage(type, message)` instead of defining `getcommand`/`setcommand` callbacks.
+- `addHKService()` accepts `eveOptions` object to defer Eve linkage until `.add()` completes.
+
+### Changed
+- `HomeKitDevice.HISTORY` replaces `HOMEKITHISTORY` as the standard reference for Eve-compatible history modules.
+
+
 ## 2025/06/27
 
 ### Added

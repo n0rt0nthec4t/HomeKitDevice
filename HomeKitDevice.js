@@ -8,15 +8,18 @@
 // The `deviceData` object must include:
 //   serialNumber, softwareVersion, description, manufacturer, model
 //
+// For enabling EveHome history support, include in the `deviceData`:
+//   eveHistory
+//
 // For HAP-NodeJS standalone mode, also required:
 //   hkUsername, hkPairingCode
 //
 // The following static constants should be defined in subclasses:
-//   HomeKitDevice.PLUGIN_NAME       // Required (string)
-//   HomeKitDevice.PLATFORM_NAME     // Required (string)
-//   HomeKitDevice.TYPE              // Optional (device type string)
-//   HomeKitDevice.VERSION           // Optional (device code version)
-//   HomeKitDevice.HOMEKITHISTORY    // Optional (Eve-compatible history module)
+//   HomeKitDevice.PLUGIN_NAME           // Required (string)
+//   HomeKitDevice.PLATFORM_NAME         // Required (string)
+//   HomeKitDevice.TYPE                  // Optional (device type string)
+//   HomeKitDevice.VERSION               // Optional (device code version)
+//   HomeKitDevice.HISTORY               // Optional (Eve-compatible history module)
 //
 // The following instance methods can be optionally implemented by subclasses:
 //   async onAdd(message, ...args)       // Called when HomeKitDevice.ADD is received
@@ -71,7 +74,7 @@ export default class HomeKitDevice extends EventEmitter {
   static PLATFORM_NAME = undefined; // Homebridge platform name
   static HISTORY = undefined; // HomeKit History object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2025.06.27'; // Code version
+  static VERSION = '2025.06.28'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
@@ -119,6 +122,8 @@ export default class HomeKitDevice extends EventEmitter {
     // Will either be a random generated one or HAP generated one
     // HAP is based upon defined plugin name and devices serial number
     this.#uuid = HomeKitDevice.generateUUID(HomeKitDevice.PLUGIN_NAME, api, deviceData.serialNumber);
+
+    // Register this device instance in the static device registry
     this.on(this.#uuid, this.message.bind(this));
     HomeKitDevice.#deviceRegistry.set(this.#uuid, this);
 
@@ -315,13 +320,14 @@ export default class HomeKitDevice extends EventEmitter {
   }
 
   async message(type, message, ...args) {
-    let result;
+    let result = { call: undefined, handler: undefined };
     let handled = false;
     let handler = HomeKitDevice.#listeners?.[this.#uuid]?.[type];
 
     // Dynamically extract the handler method name from the type string (e.g., "HomeKitDevice.onAdd" becomes "onAdd")
     // This allows consistent routing to instance methods like onAdd, onSet, onUpdate, etc.
     let methodName = typeof type === 'string' ? type.match(/\.?(on[A-Z][a-zA-Z0-9]*)$/)?.[1] || undefined : undefined;
+    let instanceMethod = typeof this?.[methodName] === 'function' ? this[methodName].bind(this) : undefined;
 
     // Internal helper to call handlers with error trapping
     const callHandler = async (label, fn, ...params) => {
@@ -334,12 +340,25 @@ export default class HomeKitDevice extends EventEmitter {
 
     // Handle built-in types with special behavior
     if (type === HomeKitDevice.ADD || type === HomeKitDevice.REMOVE || type === HomeKitDevice.SET) {
-      // Call the dynamic on<Type> method (e.g. onAdd, onRemove, onSet)
-      await callHandler(methodName, this?.[methodName]?.bind?.(this), message, ...args);
-
-      // Call any static handler registered via HomeKitDevice.message(uuid, type, handler)
+      // Call the dynamic on<Type> method (ie. onAdd, onRemove, onSet) and after
+      // Any static handler registered via HomeKitDevice.message(uuid, type, handler)
+      await callHandler(methodName, instanceMethod, message, ...args);
       await callHandler('handler for ' + type, handler, message, ...args);
       handled = true;
+
+      // Special setup for ADD
+      if (type === HomeKitDevice.ADD) {
+        // After the accessory is initialized and onAdd has run, link any EveHome services that requested it
+        if (this.deviceData?.eveHistory === true && typeof this.historyService?.linkToEveHome === 'function') {
+          for (let service of this.accessory?.services || []) {
+            let options = service?.[HomeKitDevice?.HISTORY?.EVE_OPTIONS];
+            if (options !== undefined) {
+              delete service[HomeKitDevice?.HISTORY?.EVE_OPTIONS];
+              this.historyService.linkToEveHome(service, options);
+            }
+          }
+        }
+      }
 
       // Special teardown for REMOVE
       if (type === HomeKitDevice.REMOVE) {
@@ -366,12 +385,14 @@ export default class HomeKitDevice extends EventEmitter {
       }
 
       // Update the internal data for the set values, as could take some time once we emit the event
-      if (type === HomeKitDevice.SET && typeof message === 'object' && message !== null) {
-        Object.entries(message).forEach(([key, value]) => {
-          if (this.deviceData?.[key] !== undefined) {
-            this.deviceData[key] = value;
-          }
-        });
+      if (type === HomeKitDevice.SET) {
+        if (typeof message === 'object' && message !== null) {
+          Object.entries(message).forEach(([key, value]) => {
+            if (this.deviceData?.[key] !== undefined) {
+              this.deviceData[key] = value;
+            }
+          });
+        }
       }
     } else if (type === HomeKitDevice.UPDATE) {
       if (typeof message === 'object' && message !== null) {
@@ -379,14 +400,14 @@ export default class HomeKitDevice extends EventEmitter {
         this.#updateAccessoryInformation(merged);
 
         if (changed === true || (typeof args?.[0] === 'object' && args?.[0]?.force === true)) {
-          await callHandler('onUpdate', this?.[methodName]?.bind?.(this), merged, ...args);
+          // Call the onUpdate method and after any static handler registered via HomeKitDevice.message(uuid, type, handler)
+          await callHandler('onUpdate', this?.onUpdate?.bind?.(this), merged, ...args);
           await callHandler('handler for UPDATE', handler, merged, ...args);
         }
 
         // Finally, update our internally stored data with the new data
         this.deviceData = structuredClone(merged);
       }
-
       handled = true;
     } else if (type === HomeKitDevice.HISTORY) {
       let [target, entry, options = {}] = [message, args[0], args[1]];
@@ -424,55 +445,41 @@ export default class HomeKitDevice extends EventEmitter {
         }
       }
 
-      // Call onHistory if present
-      await callHandler('onHistory', this?.[methodName]?.bind?.(this), target, entry, options);
+      // Call the onHistory method and after any static handler registered via HomeKitDevice.message(uuid, type, handler)
+      await callHandler('onHistory', this?.onHistory?.bind?.(this), target, entry, options);
       await callHandler('handler for HISTORY', handler, target, entry, options);
 
       handled = true;
     }
 
-    // Dynamically handle any on<Type> method (e.g., onGet etc
-    if (handled === false && typeof this?.[methodName] === 'function') {
-      result = await callHandler(methodName, this?.[methodName]?.bind?.(this), message, ...args);
+    // Dynamically handle any remaining on<Type> method (e.g., onGet etc that we havent handled yet)
+    // Any static handler registered via HomeKitDevice.message(uuid, type, handler)
+    if (handled === false && (typeof this?.[methodName] === 'function' || typeof handler === 'function')) {
+      result.call = await callHandler(methodName, instanceMethod, message, ...args);
+      result.handler = await callHandler('handler for ' + type, handler, message, ...args);
       handled = true;
     }
 
-    // Always call generic handler if present
+    // Call generic handler if present and we haven't handled the message yet
     if (handled === false && typeof this?.onMessage === 'function') {
-      result = await callHandler('onMessage', this?.[methodName]?.bind?.(this), type, message, ...args);
+      result.call = await callHandler('onMessage', this?.onMessage?.bind?.(this), type, message, ...args);
       handled = true;
     }
 
-    // Always call static message listener if present
-    if (handled === false && typeof handler === 'function') {
-      result = await callHandler('handler for ' + type, handler, message, ...args);
-      handled = true;
-    }
-
-    // Log if unhandled message type
-    if (handled === false) {
+    // No handler at all — not even onMessage()
+    if (
+      handled === false &&
+      typeof this?.onMessage !== 'function' &&
+      typeof handler !== 'function' &&
+      typeof this?.[methodName] !== 'function'
+    ) {
       this?.log?.warn?.('Unhandled message type "%s" for device "%s"', type, this.deviceData.description);
     }
 
     return result;
   }
 
-  setupEveHomeLink(service, options = {}) {
-    // Only proceed if eveHistory is enabled and link function exists
-    if (
-      this.deviceData?.eveHistory === true &&
-      typeof this.historyService?.linkToEveHome === 'function' &&
-      typeof service === 'object' &&
-      typeof service.UUID === 'string' &&
-      Array.isArray(this.accessory?.services) === true &&
-      this.accessory.services.includes(service) === true // Validate service belongs to this accessory
-    ) {
-      // Perform EveHome linkage
-      this.historyService.linkToEveHome(service, options);
-    }
-  }
-
-  addHKService(hkServiceType, name = '', subType = undefined) {
+  addHKService(hkServiceType, name = '', subType = undefined, eveOptions = undefined) {
     let service = undefined;
 
     if (
@@ -489,6 +496,16 @@ export default class HomeKitDevice extends EventEmitter {
 
       if (service === undefined) {
         service = this.accessory.addService(hkServiceType, name, subType);
+      }
+
+      // Setup for EveHome history if enabled. The actual linkage will be done in .add() after returning from .onAdd()
+      if (
+        service !== undefined &&
+        typeof eveOptions === 'object' &&
+        this.deviceData?.eveHistory === true &&
+        typeof this.historyService?.linkToEveHome === 'function'
+      ) {
+        service[HomeKitDevice?.HISTORY?.EVE_OPTIONS] = eveOptions;
       }
     }
 
