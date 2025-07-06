@@ -176,6 +176,23 @@ This routes to the device’s `onMessage(type, message)` handler.
 
 ---
 
+## Lifecycle Hook Resolution
+
+When a lifecycle message such as `.ADD`, `.UPDATE`, or `.REMOVE` is dispatched, the `HomeKitDevice` class now walks the prototype chain of the target instance to invoke all defined hook methods.
+
+This means any `onAdd()`, `onUpdate()`, `onRemove()`, etc. methods defined in parent classes (such as base device types or mixins) will also be called, in order from the instance itself up the prototype chain.
+
+Each hook is only invoked once per `(handler, context)` pair to avoid duplicate calls when the same function appears multiple times along the chain.
+
+This enables shared logic across subclasses without needing to manually call `super.onUpdate()` or similar.
+
+For example:
+
+- If both `Base` and `Extended` define an `onUpdate()` method and `Extended` extends `Base`, both methods will be called.
+- Ordering is guaranteed: subclass first, parent classes later.
+
+---
+
 ## Static Constants
 
 These constants are used internally for structured messaging and lifecycle dispatch:
@@ -206,5 +223,11 @@ static VERSION = '2025.06.18';
 
 ## License
 
-MIT License  
-(c) Mark Hulskamp
+This project is licensed under the Apache License, Version 2.0.  
+You may obtain a copy of the License at [http://www.apache.org/licenses/LICENSE-2.0](http://www.apache.org/licenses/LICENSE-2.0)
+
+Unless required by applicable law or agreed to in writing, software  
+distributed under the License is distributed on an "AS IS" BASIS,  
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  
+See the License for the specific language governing permissions and  
+limitations under the License.

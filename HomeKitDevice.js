@@ -63,6 +63,7 @@ export default class HomeKitDevice extends EventEmitter {
   static HISTORY = 'HomeKitDevice.onHistory';
   static SET = 'HomeKitDevice.onSet';
   static GET = 'HomeKitDevice.onGet';
+  static MESSAGE = 'HomeKitDevice.onMessage';
 
   // HomeKit pin format and MAC address regex's
   static HK_PIN_3_2_3 = /^\d{3}-\d{2}-\d{3}$/;
@@ -74,7 +75,7 @@ export default class HomeKitDevice extends EventEmitter {
   static PLATFORM_NAME = undefined; // Homebridge platform name
   static HISTORY = undefined; // HomeKit History object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2025.06.28'; // Code version
+  static VERSION = '2025.07.07'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
@@ -124,7 +125,6 @@ export default class HomeKitDevice extends EventEmitter {
     this.#uuid = HomeKitDevice.generateUUID(HomeKitDevice.PLUGIN_NAME, api, deviceData.serialNumber);
 
     // Register this device instance in the static device registry
-    this.on(this.#uuid, this.message.bind(this));
     HomeKitDevice.#deviceRegistry.set(this.#uuid, this);
 
     // See if we were passed in an existing accessory object or array of accessory objects
@@ -302,17 +302,34 @@ export default class HomeKitDevice extends EventEmitter {
   }
 
   static async message(uuid, type, message = undefined, ...args) {
-    if (typeof message === 'function') {
-      // Register handler
-      if (typeof this.#listeners?.[uuid] !== 'object') {
+    if (typeof message === 'function' || (typeof message === 'object' && message !== null && message.constructor !== Object)) {
+      if (this.#listeners?.[uuid] === undefined) {
         this.#listeners[uuid] = {};
       }
+      if (Array.isArray(this.#listeners[uuid][type]) === false) {
+        this.#listeners[uuid][type] = [];
+      }
 
-      this.#listeners[uuid][type] = message;
+      let handler, context;
+
+      if (typeof message === 'function' || typeof message === 'string') {
+        handler = message;
+        context = undefined;
+      } else {
+        context = message;
+        handler = typeof type === 'string' ? type.match(/\.?(on[A-Z][a-zA-Z0-9]*)$/)?.[1] : undefined;
+      }
+
+      if (handler !== undefined) {
+        if (this.#listeners?.[uuid]?.[type]?.find?.((h) => h.handler === handler && h.context === context) === undefined) {
+          this.#listeners[uuid][type].push({ handler, context });
+        }
+      }
+
       return;
     }
 
-    // Route message to device instance
+    // Handle message delivery
     let device = this.#deviceRegistry.get(uuid);
     if (device !== undefined && typeof device.message === 'function') {
       return await device.message(type, message, ...args);
@@ -322,28 +339,90 @@ export default class HomeKitDevice extends EventEmitter {
   async message(type, message, ...args) {
     let result = { call: undefined, handler: undefined };
     let handled = false;
-    let handler = HomeKitDevice.#listeners?.[this.#uuid]?.[type];
+    let handler =
+      Array.isArray(HomeKitDevice.#listeners?.[this.#uuid]?.[type]) === true
+        ? HomeKitDevice.#listeners[this.#uuid][type]
+        : HomeKitDevice.#listeners?.[this.#uuid]?.[type] !== undefined
+          ? [HomeKitDevice.#listeners[this.#uuid][type]]
+          : [];
 
     // Dynamically extract the handler method name from the type string (e.g., "HomeKitDevice.onAdd" becomes "onAdd")
     // This allows consistent routing to instance methods like onAdd, onSet, onUpdate, etc.
-    let methodName = typeof type === 'string' ? type.match(/\.?(on[A-Z][a-zA-Z0-9]*)$/)?.[1] || undefined : undefined;
-    let instanceMethod = typeof this?.[methodName] === 'function' ? this[methodName].bind(this) : undefined;
+    let methodName = typeof type === 'string' ? type.match(/\.?(on[A-Z][a-zA-Z0-9]*)$/)?.[1] : undefined;
 
-    // Internal helper to call handlers with error trapping
-    const callHandler = async (label, fn, ...params) => {
-      try {
-        return await fn?.(...params);
-      } catch (error) {
-        this?.log?.error?.('%s call for device "%s" failed. Error was', label, this.deviceData.description, error);
+    // Internal helper to call handlers with error trapping. Will also walk up the prototype chain
+    const callLifecycleHook = async (labelOrFn, ...params) => {
+      let results = [];
+      let called = new Set(); // track calls using context + function identity
+
+      const callMethodWithProtoChain = async (obj, method, contextLabel) => {
+        let current = obj;
+        let seen = new Set();
+
+        while (current && typeof current === 'object' && seen.has(current) === false) {
+          seen.add(current);
+
+          let fn = current?.[method];
+          if (typeof fn === 'function') {
+            let key = fn + '@' + obj;
+            if (called.has(key) === false) {
+              called.add(key);
+              try {
+                results.push(await fn.apply(obj, params));
+              } catch (error) {
+                this?.log?.warn?.('Error in %s.%s(): %s', contextLabel, method, String(error?.stack || error));
+              }
+            }
+          }
+
+          current = Object.getPrototypeOf(current);
+        }
+      };
+
+      if (typeof labelOrFn === 'string') {
+        await callMethodWithProtoChain(this, labelOrFn, this?.constructor?.name ?? 'this');
+      } else if (typeof labelOrFn === 'function') {
+        let key = labelOrFn + '@' + this;
+        if (called.has(key) === false) {
+          called.add(key);
+          try {
+            results.push(await labelOrFn(...params));
+          } catch (error) {
+            this?.log?.warn?.('Error in inline function handler: %s', String(error?.stack || error));
+          }
+        }
+      } else if (Array.isArray(labelOrFn) === true) {
+        let [label, list] = labelOrFn;
+
+        for (let item of list || []) {
+          let fn = item?.handler;
+          let context = item?.context ?? this;
+          let key = fn + '@' + context;
+
+          if (typeof fn === 'function') {
+            if (called.has(key) === false) {
+              called.add(key);
+              try {
+                results.push(await fn.call(context, ...params));
+              } catch (error) {
+                this?.log?.warn?.('Error in registered %s(): %s', label, String(error?.stack || error));
+              }
+            }
+          } else if (typeof fn === 'string' && context) {
+            await callMethodWithProtoChain(context, fn, context?.constructor?.name ?? 'handler');
+          }
+        }
       }
+
+      return results.length === 1 ? results[0] : results;
     };
 
     // Handle built-in types with special behavior
     if (type === HomeKitDevice.ADD || type === HomeKitDevice.REMOVE || type === HomeKitDevice.SET) {
       // Call the dynamic on<Type> method (ie. onAdd, onRemove, onSet) and after
       // Any static handler registered via HomeKitDevice.message(uuid, type, handler)
-      await callHandler(methodName, instanceMethod, message, ...args);
-      await callHandler('handler for ' + type, handler, message, ...args);
+      await callLifecycleHook(methodName, message, ...args);
+      await callLifecycleHook(['handler for ' + type, handler], message, ...args);
       handled = true;
 
       // Special setup for ADD
@@ -401,8 +480,8 @@ export default class HomeKitDevice extends EventEmitter {
 
         if (changed === true || (typeof args?.[0] === 'object' && args?.[0]?.force === true)) {
           // Call the onUpdate method and after any static handler registered via HomeKitDevice.message(uuid, type, handler)
-          await callHandler('onUpdate', this?.onUpdate?.bind?.(this), merged, ...args);
-          await callHandler('handler for UPDATE', handler, merged, ...args);
+          await callLifecycleHook('onUpdate', merged, ...args);
+          await callLifecycleHook(['handler for UPDATE', handler], merged, ...args);
         }
 
         // Finally, update our internally stored data with the new data
@@ -436,47 +515,48 @@ export default class HomeKitDevice extends EventEmitter {
               return typeof v === 'object' ? JSON.stringify(v) !== JSON.stringify(lv) : v !== lv;
             });
             if (changed === false) {
-              skipHistory = true; // Skip history if no changes
+              skipHistory = true;
             }
           }
         }
+
         if (skipHistory === false) {
           this.historyService.addHistory(target, entry, isNaN(options?.timegap) === false ? options.timegap : undefined);
         }
       }
 
       // Call the onHistory method and after any static handler registered via HomeKitDevice.message(uuid, type, handler)
-      await callHandler('onHistory', this?.onHistory?.bind?.(this), target, entry, options);
-      await callHandler('handler for HISTORY', handler, target, entry, options);
+      await callLifecycleHook('onHistory', target, entry, options);
+      await callLifecycleHook(['handler for HISTORY', handler], target, entry, options);
 
       handled = true;
     }
 
-    // Dynamically handle any remaining on<Type> method (e.g., onGet etc that we havent handled yet)
+    // Dynamically handle any remaining on<Type> method (e.g., onGet etc that we haven’t handled yet)
     // Any static handler registered via HomeKitDevice.message(uuid, type, handler)
-    if (handled === false && (typeof this?.[methodName] === 'function' || typeof handler === 'function')) {
-      result.call = await callHandler(methodName, instanceMethod, message, ...args);
-      result.handler = await callHandler('handler for ' + type, handler, message, ...args);
+    if (handled === false && (typeof this?.[methodName] === 'function' || (Array.isArray(handler) === true && handler.length > 0))) {
+      // Use string method name so we get inheritance merging;
+      result.call = await callLifecycleHook(methodName, message, ...args);
+      result.handler = await callLifecycleHook(['handler for ' + type, handler], message, ...args);
       handled = true;
     }
 
     // Call generic handler if present and we haven't handled the message yet
-    if (handled === false && typeof this?.onMessage === 'function') {
-      result.call = await callHandler('onMessage', this?.onMessage?.bind?.(this), type, message, ...args);
+    if (handled === false) {
+      result.call = await callLifecycleHook('onMessage', type, message, ...args);
       handled = true;
     }
 
     // No handler at all — not even onMessage()
-    if (
-      handled === false &&
-      typeof this?.onMessage !== 'function' &&
-      typeof handler !== 'function' &&
-      typeof this?.[methodName] !== 'function'
-    ) {
+    if (handled === false && (Array.isArray(handler) === false || handler.length === 0) && typeof this?.[methodName] !== 'function') {
       this?.log?.warn?.('Unhandled message type "%s" for device "%s"', type, this.deviceData.description);
     }
 
-    return result;
+    if (typeof result.call === 'object' && typeof result.handler === 'object') {
+      return Object.assign({}, result.call, result.handler);
+    }
+
+    return result.call !== undefined ? result.call : result.handler;
   }
 
   addHKService(hkServiceType, name = '', subType = undefined, eveOptions = undefined) {

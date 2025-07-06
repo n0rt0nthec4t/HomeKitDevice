@@ -2,6 +2,18 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2025/07/07
+
+### Changed
+- Improved `HomeKitDevice.message()` to avoid duplicate handler registration by checking for existing `{ handler, context }` using `=== undefined` for explicit comparison.
+- Simplified registration checks by using inline conditional logic for detecting plain objects and function-based handlers.
+- Refactored `callLifecycleHook()` to:
+  - Traverse prototype chain from instance to base class for method resolution.
+  - Use a `Set` to track and prevent duplicate function/context calls.
+  - Improve error logging with clearer context labels.
+- Unified lifecycle hook dispatch for string-based, function, and array-of-handlers invocation models.
+- Applied optional chaining consistently throughout message routing and lifecycle handling logic.
+
 ## 2025/06/28
 
 ### Added
