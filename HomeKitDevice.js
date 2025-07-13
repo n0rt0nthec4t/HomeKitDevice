@@ -64,6 +64,7 @@ export default class HomeKitDevice extends EventEmitter {
   static SET = 'HomeKitDevice.onSet';
   static GET = 'HomeKitDevice.onGet';
   static MESSAGE = 'HomeKitDevice.onMessage';
+  static SHUTDOWN = 'HomeKitDevice.onShutdown';
 
   // HomeKit pin format and MAC address regex's
   static HK_PIN_3_2_3 = /^\d{3}-\d{2}-\d{3}$/;
@@ -75,7 +76,7 @@ export default class HomeKitDevice extends EventEmitter {
   static PLATFORM_NAME = undefined; // Homebridge platform name
   static HISTORY = undefined; // HomeKit History object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2025.07.07'; // Code version
+  static VERSION = '2025.07.13'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
