@@ -76,7 +76,7 @@ export default class HomeKitDevice extends EventEmitter {
   static PLATFORM_NAME = undefined; // Homebridge platform name
   static HISTORY = undefined; // HomeKit History object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2025.07.13'; // Code version
+  static VERSION = '2025.07.21'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
@@ -303,6 +303,10 @@ export default class HomeKitDevice extends EventEmitter {
   }
 
   static async message(uuid, type, message = undefined, ...args) {
+    if (typeof uuid !== 'string' || uuid === '' || typeof type !== 'string' || type === '') {
+      return;
+    }
+
     if (typeof message === 'function' || (typeof message === 'object' && message !== null && message.constructor !== Object)) {
       if (this.#listeners?.[uuid] === undefined) {
         this.#listeners[uuid] = {};
@@ -338,6 +342,10 @@ export default class HomeKitDevice extends EventEmitter {
   }
 
   async message(type, message, ...args) {
+    if (typeof type !== 'string' || type === '') {
+      return;
+    }
+
     let result = { call: undefined, handler: undefined };
     let handled = false;
     let handler =
