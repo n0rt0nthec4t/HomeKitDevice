@@ -76,11 +76,11 @@ export default class HomeKitDevice extends EventEmitter {
   static PLATFORM_NAME = undefined; // Homebridge platform name
   static HISTORY = undefined; // HomeKit History object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2025.07.21'; // Code version
+  static VERSION = '2025.07.22'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
-  static HAPNODEJS = 'hap-nodejs';
+  static HAP_NODEJS = 'hap-nodejs';
 
   // Internal device and listener registry
   static #listeners = {};
@@ -116,7 +116,7 @@ export default class HomeKitDevice extends EventEmitter {
 
     if (typeof api?.hap === 'undefined' && isNaN(api?.version) === true && typeof api?.HAPLibraryVersion === 'function') {
       this.hap = api;
-      this.backend = HomeKitDevice.HAPNODEJS;
+      this.backend = HomeKitDevice.HAP_NODEJS;
       this.postSetupDetail('HAP-NodeJS library', LOG_LEVELS.DEBUG);
     }
 
@@ -188,7 +188,7 @@ export default class HomeKitDevice extends EventEmitter {
       this.#platform.registerPlatformAccessories(HomeKitDevice.PLUGIN_NAME, HomeKitDevice.PLATFORM_NAME, [this.accessory]);
     }
 
-    if (this.accessory === undefined && this.backend === HomeKitDevice.HAPNODEJS) {
+    if (this.accessory === undefined && this.backend === HomeKitDevice.HAP_NODEJS) {
       // Create HAP-NodeJS libray accessory
       this.accessory = new this.hap.Accessory(hapAccessoryName, this.#uuid);
 
@@ -226,7 +226,7 @@ export default class HomeKitDevice extends EventEmitter {
       this.postSetupDetail('EveHome support as "%s"', this.historyService.EveHome.evetype);
     }
 
-    this?.log?.info?.('Setup %s %s as "%s"', this.deviceData.manufacturer, this.deviceData.model, this.deviceData.description);
+    this?.log?.success?.('Setup %s %s as "%s"', this.deviceData.manufacturer, this.deviceData.model, this.deviceData.description);
     this.#postSetupDetails.forEach((entry) => {
       if (typeof entry === 'string') {
         this?.log?.[LOG_LEVELS.INFO]?.('  += %s', entry);
@@ -245,7 +245,7 @@ export default class HomeKitDevice extends EventEmitter {
     await this.message(HomeKitDevice.UPDATE, this.deviceData, { force: true });
 
     // If using HAP-NodeJS library, publish accessory on local network
-    if (this.accessory !== undefined && this.backend === HomeKitDevice.HAPNODEJS) {
+    if (this.accessory !== undefined && this.backend === HomeKitDevice.HAP_NODEJS) {
       this.accessory.publish({
         username: this.accessory.username,
         pincode: this.accessory.pincode,
@@ -307,7 +307,7 @@ export default class HomeKitDevice extends EventEmitter {
       return;
     }
 
-    if (typeof message === 'function' || (typeof message === 'object' && message !== null && message.constructor !== Object)) {
+    if (typeof message === 'function' || (typeof message === 'object' && message !== null && message?.constructor !== Object)) {
       if (this.#listeners?.[uuid] === undefined) {
         this.#listeners[uuid] = {};
       }
@@ -335,10 +335,7 @@ export default class HomeKitDevice extends EventEmitter {
     }
 
     // Handle message delivery
-    let device = this.#deviceRegistry.get(uuid);
-    if (device !== undefined && typeof device.message === 'function') {
-      return await device.message(type, message, ...args);
-    }
+    return await this.#deviceRegistry.get(uuid)?.message?.(type, message, ...args);
   }
 
   async message(type, message, ...args) {
