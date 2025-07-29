@@ -2,6 +2,11 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2025/07/29
+
+### Changed
+- `HomeKitDevice.EVEHOME` replaces `HomeKitDevice.HISTORY` as the standard reference for Eve-compatible history modules.
+
 ## 2025/07/07
 
 ### Changed

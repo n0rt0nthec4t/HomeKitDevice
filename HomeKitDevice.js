@@ -19,7 +19,7 @@
 //   HomeKitDevice.PLATFORM_NAME         // Required (string)
 //   HomeKitDevice.TYPE                  // Optional (device type string)
 //   HomeKitDevice.VERSION               // Optional (device code version)
-//   HomeKitDevice.HISTORY               // Optional (Eve-compatible history module)
+//   HomeKitDevice.EVEHOME               // Optional (EveHome-compatible history module)
 //
 // The following instance methods can be optionally implemented by subclasses:
 //   async onAdd(message, ...args)       // Called when HomeKitDevice.ADD is received
@@ -74,9 +74,9 @@ export default class HomeKitDevice extends EventEmitter {
   // Override this in the class which extends
   static PLUGIN_NAME = undefined; // Homebridge plugin name
   static PLATFORM_NAME = undefined; // Homebridge platform name
-  static HISTORY = undefined; // HomeKit History object
+  static EVEHOME = undefined; // HomeKit History object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2025.07.22'; // Code version
+  static VERSION = '2025.07.29'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
@@ -213,8 +213,8 @@ export default class HomeKitDevice extends EventEmitter {
     }
 
     // Setup our history service if module has been defined and requested to be active for this device
-    if (typeof HomeKitDevice?.HISTORY === 'function' && this.historyService === undefined && enableHistory === true) {
-      this.historyService = new HomeKitDevice.HISTORY(this.accessory, this.hap, this.log, {});
+    if (typeof HomeKitDevice?.EVEHOME === 'function' && this.historyService === undefined && enableHistory === true) {
+      this.historyService = new HomeKitDevice.EVEHOME(this.accessory, this.hap, this.log, {});
     }
 
     this.postSetupDetail('Serial number "%s"', this.deviceData.serialNumber, LOG_LEVELS.DEBUG);
@@ -436,9 +436,9 @@ export default class HomeKitDevice extends EventEmitter {
         // After the accessory is initialized and onAdd has run, link any EveHome services that requested it
         if (this.deviceData?.eveHistory === true && typeof this.historyService?.linkToEveHome === 'function') {
           for (let service of this.accessory?.services || []) {
-            let options = service?.[HomeKitDevice?.HISTORY?.EVE_OPTIONS];
+            let options = service?.[HomeKitDevice?.EVEHOME?.EVE_OPTIONS];
             if (options !== undefined) {
-              delete service[HomeKitDevice?.HISTORY?.EVE_OPTIONS];
+              delete service[HomeKitDevice?.EVEHOME?.EVE_OPTIONS];
               this.historyService.linkToEveHome(service, options);
             }
           }
@@ -591,7 +591,7 @@ export default class HomeKitDevice extends EventEmitter {
         this.deviceData?.eveHistory === true &&
         typeof this.historyService?.linkToEveHome === 'function'
       ) {
-        service[HomeKitDevice?.HISTORY?.EVE_OPTIONS] = eveOptions;
+        service[HomeKitDevice?.EVEHOME?.EVE_OPTIONS] = eveOptions;
       }
     }
 

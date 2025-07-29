@@ -13,7 +13,7 @@ The `HomeKitDevice` module provides:
 - Static and instance `.message()` routing
 - Public wrapper methods (`add()`, `update()`, `remove()`, `get()`, `set()`, `history()`)
 - Safe characteristic binding (`addHKService`, `addHKCharacteristic`)
-- EveHome-compatible history support (`history`, `setupEveHomeLink`)
+- EveHome-compatible history support (`history`), override HomeKitDevice.EVEHOME
 - Internal device registry for UUID-based lookup and messaging
 
 Supports both Homebridge plugins and standalone HAP-NodeJS environments.
@@ -37,8 +37,6 @@ export default class MyDevice extends HomeKitDevice {
       props: { minStep: 1 },
       initialValue: false,
     });
-
-    this.setupEveHomeLink(this.myService);
   }
 
   async onUpdate(deviceData) {
@@ -119,7 +117,7 @@ Supported `options`:
 
 ---
 
-### `addHistory(target, entry, options?)`
+### `history(target, entry, options?)`
 
 Adds a structured entry to Eve-compatible history storage.
 
@@ -129,7 +127,7 @@ Adds a structured entry to Eve-compatible history storage.
 - Calls `.onHistory(type, entry)` if implemented by the subclass
 
 ```js
-this.addHistory(this.myService, {
+this.history(this.myService, {
   status: 1,
   temperature: 22.5,
 }, {
@@ -137,18 +135,6 @@ this.addHistory(this.myService, {
   force: false,
 });
 ```
-
----
-
-### `setupEveHomeLink(service)`
-
-Links a HomeKit service to the Eve app if `deviceData.eveHistory === true`.
-
-```js
-this.setupEveHomeLink(this.myService);
-```
-
----
 
 ## Messaging
 
