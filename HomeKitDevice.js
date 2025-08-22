@@ -76,7 +76,7 @@ export default class HomeKitDevice extends EventEmitter {
   static PLATFORM_NAME = undefined; // Homebridge platform name
   static EVEHOME = undefined; // HomeKit History object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2025.07.29'; // Code version
+  static VERSION = '2025.08.21'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
@@ -423,6 +423,27 @@ export default class HomeKitDevice extends EventEmitter {
       return results.length === 1 ? results[0] : results;
     };
 
+    // Internal helper to snapshot accessory structure relating to services and characteristics
+    const snapshotAccessoryStructure = (accessory) => {
+      return Array.isArray(accessory?.services) === true
+        ? accessory.services
+            .map((service) => ({
+              UUID: service.UUID,
+              subtype: service.subtype ?? '',
+              characteristics:
+                Array.isArray(service.characteristics) === true
+                  ? service.characteristics.map((characteristic) => characteristic.UUID).sort()
+                  : [],
+            }))
+            .sort((a, b) => (a.UUID === b.UUID ? String(a.subtype).localeCompare(String(b.subtype)) : a.UUID.localeCompare(b.UUID)))
+        : [];
+    };
+
+    // First up, we want to take a "snapshot" of services and characteristics on this accessory
+    // This will be used after all message calling to see if any changes have occured on the accessory
+    // And if so, and running under Homebridge, we'll notify it of the changes
+    let originalServices = snapshotAccessoryStructure(this.accessory);
+
     // Handle built-in types with special behavior
     if (type === HomeKitDevice.ADD || type === HomeKitDevice.REMOVE || type === HomeKitDevice.SET) {
       // Call the dynamic on<Type> method (ie. onAdd, onRemove, onSet) and after
@@ -490,7 +511,7 @@ export default class HomeKitDevice extends EventEmitter {
           await callLifecycleHook(['handler for UPDATE', handler], merged, ...args);
         }
 
-        // Finally, update our internally stored data with the new data
+        // Update our internally stored data with the new data
         this.deviceData = structuredClone(merged);
       }
       handled = true;
@@ -551,6 +572,18 @@ export default class HomeKitDevice extends EventEmitter {
     if (handled === false) {
       result.call = await callLifecycleHook('onMessage', type, message, ...args);
       handled = true;
+    }
+
+    // Lets see whats changed (if anything) on the accessory
+    let newServices = snapshotAccessoryStructure(this.accessory);
+    if (
+      JSON.stringify(originalServices) !== JSON.stringify(newServices) &&
+      this.accessory !== undefined &&
+      typeof this.#platform?.updatePlatformAccessories === 'function'
+    ) {
+      // We have changes detected for our accessory (services and/or characteristics)
+      // Notify Homebridge if thats our "backend" system
+      this.#platform.updatePlatformAccessories([this.accessory]);
     }
 
     // No handler at all — not even onMessage()
@@ -649,7 +682,7 @@ export default class HomeKitDevice extends EventEmitter {
     let levelKey = 'INFO';
     let lastArg = args.at(-1);
 
-    if (typeof lastArg === 'string' && Object.hasOwn(LOG_LEVELS, lastArg.toUpperCase())) {
+    if (typeof lastArg === 'string' && Object.hasOwn(LOG_LEVELS, lastArg.toUpperCase()) === true) {
       levelKey = lastArg.toUpperCase();
       args = args.slice(0, -1);
     }
@@ -726,11 +759,7 @@ export default class HomeKitDevice extends EventEmitter {
 
   #updateAccessoryInformation(deviceData) {
     // Always update accessory information if we have changed data
-    if (this.accessory === undefined) {
-      return;
-    }
-
-    let informationService = this.accessory.getService(this.hap.Service.AccessoryInformation);
+    let informationService = this.accessory?.getService?.(this.hap.Service.AccessoryInformation); 
     if (informationService === undefined) {
       this?.log?.error?.('AccessoryInformation service not found on accessory for "%s"', this.deviceData.description);
       return;
