@@ -759,7 +759,7 @@ export default class HomeKitDevice extends EventEmitter {
 
   #updateAccessoryInformation(deviceData) {
     // Always update accessory information if we have changed data
-    let informationService = this.accessory?.getService?.(this.hap.Service.AccessoryInformation); 
+    let informationService = this.accessory?.getService?.(this.hap.Service.AccessoryInformation);
     if (informationService === undefined) {
       this?.log?.error?.('AccessoryInformation service not found on accessory for "%s"', this.deviceData.description);
       return;
