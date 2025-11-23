@@ -2,6 +2,9 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2025/11/24
+- Improved error handling under HomeBridge 2.0 when registering an existing accessory. This appears due to change in HAP-NodeJS 1x vs 2.x library
+
 ## 2025/07/29
 
 ### Changed

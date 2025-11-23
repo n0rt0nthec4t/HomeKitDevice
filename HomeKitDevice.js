@@ -76,7 +76,7 @@ export default class HomeKitDevice extends EventEmitter {
   static PLATFORM_NAME = undefined; // Homebridge platform name
   static EVEHOME = undefined; // HomeKit History object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2025.08.21'; // Code version
+  static VERSION = '2025.11.24'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
@@ -185,7 +185,12 @@ export default class HomeKitDevice extends EventEmitter {
     ) {
       // Create Homebridge platform accessory
       this.accessory = new this.#platform.platformAccessory(this.deviceData.description, this.#uuid);
-      this.#platform.registerPlatformAccessories(HomeKitDevice.PLUGIN_NAME, HomeKitDevice.PLATFORM_NAME, [this.accessory]);
+      try {
+        this.#platform.registerPlatformAccessories(HomeKitDevice.PLUGIN_NAME, HomeKitDevice.PLATFORM_NAME, [this.accessory]);
+        // eslint-disable-next-line no-unused-vars
+      } catch (error) {
+        // Empty
+      }
     }
 
     if (this.accessory === undefined && this.backend === HomeKitDevice.HAP_NODEJS) {
@@ -474,7 +479,12 @@ export default class HomeKitDevice extends EventEmitter {
         delete HomeKitDevice.#listeners[this.#uuid];
 
         if (this.accessory !== undefined && typeof this.#platform?.unregisterPlatformAccessories === 'function') {
-          this.#platform.unregisterPlatformAccessories(HomeKitDevice.PLUGIN_NAME, HomeKitDevice.PLATFORM_NAME, [this.accessory]);
+          try {
+            this.#platform.unregisterPlatformAccessories(HomeKitDevice.PLUGIN_NAME, HomeKitDevice.PLATFORM_NAME, [this.accessory]);
+            // eslint-disable-next-line no-unused-vars
+          } catch (error) {
+            // Empty
+          }
         }
 
         if (this.accessory !== undefined && this.#platform === undefined) {
