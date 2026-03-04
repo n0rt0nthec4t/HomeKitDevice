@@ -55,6 +55,7 @@
 import crypto from 'crypto';
 import EventEmitter from 'node:events';
 import { setInterval, setTimeout, clearInterval, clearTimeout } from 'node:timers';
+import process from 'node:process';
 
 // Define constants
 const LOG_LEVELS = {
@@ -88,13 +89,13 @@ export default class HomeKitDevice extends EventEmitter {
   static PLATFORM_NAME = undefined; // Homebridge platform name
   static EVEHOME = undefined; // HomeKit History object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.03.03'; // Code version
+  static VERSION = '2026.03.04'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
   static HAP_NODEJS = 'hap-nodejs';
 
-  // Internal device and listener registry
+  // Global internal device and listener registry
   static #listeners = {};
   static #deviceRegistry = new Map();
 
@@ -125,12 +126,37 @@ export default class HomeKitDevice extends EventEmitter {
       this.#platform = api;
       this.backend = HomeKitDevice.HOMEBRIDGE;
       this.postSetupDetail('Homebridge backend', LOG_LEVELS.DEBUG);
+
+      // Register platform shutdown listener once (only for Homebridge backend)
+      // Track in #listeners using special namespace key to avoid conflicts with UUID-keyed listeners
+      if (HomeKitDevice.#listeners['__HOMEBRIDGE_SHUTDOWN__'] === undefined) {
+        HomeKitDevice.#listeners['__HOMEBRIDGE_SHUTDOWN__'] = true;
+
+        this.#platform.on('shutdown', async () => {
+          // Notify all of our registered devices of Homebridge shutdown
+          // This allowes them to do any necessary cleanup (like stopping advertising, clearing timers, etc) before the process exits
+          await HomeKitDevice.#shutdownHandler();
+        });
+      }
     }
 
     if (typeof api?.hap === 'undefined' && isNaN(api?.version) === true && typeof api?.HAPLibraryVersion === 'function') {
       this.hap = api;
       this.backend = HomeKitDevice.HAP_NODEJS;
       this.postSetupDetail('HAP-NodeJS library', LOG_LEVELS.DEBUG);
+
+      // Register process exit listener once (only for HAP-NodeJS backend)
+      // Track in #listeners using special namespace key to avoid conflicts with UUID-keyed listeners
+      if (HomeKitDevice.#listeners['__PROCESS_EXIT__'] === undefined) {
+        HomeKitDevice.#listeners['__PROCESS_EXIT__'] = true;
+
+        process.once('SIGTERM', async () => {
+          await HomeKitDevice.#shutdownHandler();
+        });
+        process.once('SIGINT', async () => {
+          await HomeKitDevice.#shutdownHandler();
+        });
+      }
     }
 
     // Generate UUID for this device instance
@@ -174,7 +200,8 @@ export default class HomeKitDevice extends EventEmitter {
       this.deviceData.serialNumber === '' ||
       typeof this.deviceData?.softwareVersion !== 'string' ||
       this.deviceData.softwareVersion === '' ||
-      (typeof this.deviceData?.description !== 'string' && this.deviceData.description === '') ||
+      typeof this.deviceData?.description !== 'string' ||
+      this.deviceData.description === '' ||
       typeof this.deviceData?.model !== 'string' ||
       this.deviceData.model === '' ||
       typeof this.deviceData?.manufacturer !== 'string' ||
@@ -468,8 +495,8 @@ export default class HomeKitDevice extends EventEmitter {
     let originalServices = snapshotAccessoryStructure(this.accessory);
 
     // Handle built-in types with special behavior
-    if (type === HomeKitDevice.ADD || type === HomeKitDevice.REMOVE || type === HomeKitDevice.SET || type === HomeKitDevice.SHUTDOWN) {
-      // Call the dynamic on<Type> method (ie. onAdd, onRemove, onSet,onShutdown) and after
+    if (type === HomeKitDevice.ADD || type === HomeKitDevice.REMOVE || type === HomeKitDevice.SET) {
+      // Call the dynamic on<Type> method (ie. onAdd, onRemove, onSet) and after
       // Any static handler registered via HomeKitDevice.message(uuid, type, handler)
       await callLifecycleHook(methodName, message, ...args);
       await callLifecycleHook(['handler for ' + type, handler], message, ...args);
@@ -491,7 +518,7 @@ export default class HomeKitDevice extends EventEmitter {
 
       // Special teardown for REMOVE
       if (type === HomeKitDevice.REMOVE) {
-        this?.log?.warn?.('Device "%s" has been removed', this.deviceData.description);
+        this?.log?.warn?.('Notified to remove device "%s"', this.deviceData.description);
 
         // Clear any internal timers we have running for this device
         this.#clearTimers();
@@ -533,19 +560,23 @@ export default class HomeKitDevice extends EventEmitter {
           });
         }
       }
+    } else if (type === HomeKitDevice.SHUTDOWN) {
+      if (HomeKitDevice.#deviceRegistry.has(this.#uuid) === true) {
+        // Deregister first so we don't get shutdown twice via global broadcaster
+        HomeKitDevice.#deviceRegistry.delete(this.#uuid);
+        delete HomeKitDevice.#listeners[this.#uuid];
 
-      // Special cleanup for SHUTDOWN
-      if (type === HomeKitDevice.SHUTDOWN) {
-        this?.log?.debug?.('Device "%s" is shutting down', this.deviceData.description);
+        this?.log?.debug?.('Performing cleanup due to shutdown for device "%s"', this.deviceData.description);
+
+        // Now run shutdown hooks + cleanup
+        await callLifecycleHook(methodName, message, ...args);
+        await callLifecycleHook(['handler for ' + type, handler], message, ...args);
 
         // Clear any internal timers we have running for this device
         this.#clearTimers();
-
-        // Cleanup all listeners and references to allow for garbage collection of this instance
         this?.removeAllListeners?.();
-        HomeKitDevice.#deviceRegistry.delete(this.#uuid);
-        delete HomeKitDevice.#listeners[this.#uuid];
       }
+      handled = true;
     } else if (type === HomeKitDevice.UPDATE) {
       if (typeof message === 'object' && message !== null) {
         let { merged, changed } = this.#mergeDeviceData(message);
@@ -1002,6 +1033,18 @@ export default class HomeKitDevice extends EventEmitter {
     // Clear all internal timers for this device
     for (let timerHandle of this.#timers.keys()) {
       this.removeTimer(timerHandle);
+    }
+  }
+
+  static async #shutdownHandler() {
+    // Notify all of our registered devices of process exit
+    for (let device of Array.from(HomeKitDevice.#deviceRegistry.values())) {
+      try {
+        await device.shutdown();
+        // eslint-disable-next-line no-unused-vars
+      } catch (error) {
+        // Empty
+      }
     }
   }
 }

@@ -2,6 +2,17 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2026/03/04
+
+### Added
+- Added automatic shutdown detection within `HomeKitDevice`.
+- When running under **Homebridge**, the module now listens for the platform `shutdown` event.
+- When running under **HAP-NodeJS**, the module now listens for `SIGTERM` and `SIGINT` process signals.
+- Registered devices are notified of shutdown via the `.SHUTDOWN` lifecycle message, allowing them to perform cleanup before the process exits.
+
+### Changed
+- Shutdown propagation is now handled internally by `HomeKitDevice`.
+
 ## 2026/03/03
 
 ### Added
@@ -122,10 +133,10 @@ All notable changes to the `HomeKitDevice` module are documented in this file.
 ### Added
 - Defined static backend constants: `HomeKitDevice.HOMEBRIDGE` and `HomeKitDevice.HAPNODEJS`
 - Added `backend` instance variable to reflect runtime context (`homebridge` or `hap-nodejs`)
-- Introduced standardized async lifecycle hooks: `onAdd()`, `onUpdate(deviceData)`, `onRemove()`, `onMessage(type, message)`
+- Introduced standardised async lifecycle hooks: `onAdd()`, `onUpdate(deviceData)`, `onRemove()`, `onMessage(type, message)`
 - Exposed `message(type, message)` dispatcher with internal handling for `UPDATE` and `REMOVE`
 - Added static constants: `HomeKitDevice.UPDATE`, `REMOVE`, `SET`, `GET`
-- Added utility method `makeValidHKName()` for sanitizing HomeKit display names
+- Added utility method `makeValidHKName()` for sanitising HomeKit display names
 - Added `postSetupDetail()` for structured logging with optional log level and arguments
 - Added helper methods: `addHKService()` and `addHKCharacteristic()` for simplified service/characteristic setup
 
@@ -133,7 +144,7 @@ All notable changes to the `HomeKitDevice` module are documented in this file.
 - Made `uuid` and `platform` private fields (`#uuid`, `#platform`) for encapsulation
 - Refined backend detection and assignment to `backend` variable
 - Replaced legacy methods (`setupDevice()`, `updateDevice()`, etc.) with unified `onX()` lifecycle hooks
-- Standardized logging via `LOG_LEVELS` constants (`INFO`, `DEBUG`, `ERROR`, etc.)
+- Standardised logging via `LOG_LEVELS` constants (`INFO`, `DEBUG`, `ERROR`, etc.)
 - Lifecycle methods are now fully `async`-aware for subclass overrides
 - Clarified runtime environment detection for Homebridge vs HAP-NodeJS
 
