@@ -22,19 +22,29 @@
 //   HomeKitDevice.EVEHOME               // Optional (EveHome-compatible history module)
 //
 // The following instance methods can be optionally implemented by subclasses:
-//   async onAdd(message, ...args)       // Called when HomeKitDevice.ADD is received
-//   async onUpdate(deviceData, ...args) // Called when HomeKitDevice.UPDATE is received
-//   async onRemove(message, ...args)    // Called when HomeKitDevice.REMOVE is received
-//   async onHistory(target, entry)      // Called after a history entry is logged
-//   async onGet(message, ...args)       // Called when HomeKitDevice.GET is received
-//   async onSet(message, ...args)       // Called when HomeKitDevice.SET is received
-//   async onMessage(type, message)      // Called for unhandled or custom message types
+//
+// Lifecycle events
+//   async onAdd(message, ...args)        // Called when HomeKitDevice.ADD is received
+//   async onSet(message, ...args)        // Called when HomeKitDevice.SET is received
+//   async onUpdate(deviceData, ...args)  // Called when HomeKitDevice.UPDATE is received
+//   async onRemove(message, ...args)     // Called when HomeKitDevice.REMOVE is received
+//   async onShutdown(message, ...args)   // Called when HomeKitDevice.SHUTDOWN is received
+//
+// Timer hook
+//   async onTimer(message, ...args)      // Called when HomeKitDevice.TIMER is received
+//
+// Data / history hooks
+//   async onGet(message, ...args)        // Called when HomeKitDevice.GET is received
+//   async onHistory(target, entry)       // Called after a history entry is logged
+//
+// Fallback handler
+//   async onMessage(type, message)       // Called for unhandled or custom message types
 //
 // Messages should be sent via:
 //   await device.message(type, message, ...args);
 //
-// All internal lifecycle events (`add`, `update`, `remove`, `history`, `get`, `set`) and external
-// interactions should use the `message()` dispatch system for consistency.
+// All internal lifecycle events (`add`, `update`, `remove`, `shutdown`, `set`, `get`, `timer`, `history`)
+// and external interactions must use the `message()` dispatch system for consistency.
 //
 // See README.md for usage examples and detailed documentation.
 //
@@ -44,6 +54,7 @@
 // Define nodejs module requirements
 import crypto from 'crypto';
 import EventEmitter from 'node:events';
+import { setInterval, setTimeout, clearInterval, clearTimeout } from 'node:timers';
 
 // Define constants
 const LOG_LEVELS = {
@@ -65,6 +76,7 @@ export default class HomeKitDevice extends EventEmitter {
   static GET = 'HomeKitDevice.onGet';
   static MESSAGE = 'HomeKitDevice.onMessage';
   static SHUTDOWN = 'HomeKitDevice.onShutdown';
+  static TIMER = 'HomeKitDevice.onTimer';
 
   // HomeKit pin format and MAC address regex's
   static HK_PIN_3_2_3 = /^\d{3}-\d{2}-\d{3}$/;
@@ -76,7 +88,7 @@ export default class HomeKitDevice extends EventEmitter {
   static PLATFORM_NAME = undefined; // Homebridge platform name
   static EVEHOME = undefined; // HomeKit History object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2025.11.24'; // Code version
+  static VERSION = '2026.03.03'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
@@ -97,6 +109,7 @@ export default class HomeKitDevice extends EventEmitter {
   #uuid = undefined; // UUID for this instance
   #platform = undefined; // Homebridge platform API
   #postSetupDetails = []; // Use for extra output details once a device has been setup
+  #timers = new Map(); // Internal timers for this device
 
   constructor(accessory = undefined, api = undefined, log = undefined, deviceData = {}) {
     super(); // Setup event emitter for our class ONLY
@@ -267,6 +280,11 @@ export default class HomeKitDevice extends EventEmitter {
   async remove() {
     // Trigger registered handlers (onRemove + listeners)
     await this.message(HomeKitDevice.REMOVE);
+  }
+
+  async shutdown() {
+    // Trigger registered handlers (onShutdown + listeners)
+    await this.message(HomeKitDevice.SHUTDOWN);
   }
 
   async update(deviceData, ...args) {
@@ -450,8 +468,8 @@ export default class HomeKitDevice extends EventEmitter {
     let originalServices = snapshotAccessoryStructure(this.accessory);
 
     // Handle built-in types with special behavior
-    if (type === HomeKitDevice.ADD || type === HomeKitDevice.REMOVE || type === HomeKitDevice.SET) {
-      // Call the dynamic on<Type> method (ie. onAdd, onRemove, onSet) and after
+    if (type === HomeKitDevice.ADD || type === HomeKitDevice.REMOVE || type === HomeKitDevice.SET || type === HomeKitDevice.SHUTDOWN) {
+      // Call the dynamic on<Type> method (ie. onAdd, onRemove, onSet,onShutdown) and after
       // Any static handler registered via HomeKitDevice.message(uuid, type, handler)
       await callLifecycleHook(methodName, message, ...args);
       await callLifecycleHook(['handler for ' + type, handler], message, ...args);
@@ -474,6 +492,11 @@ export default class HomeKitDevice extends EventEmitter {
       // Special teardown for REMOVE
       if (type === HomeKitDevice.REMOVE) {
         this?.log?.warn?.('Device "%s" has been removed', this.deviceData.description);
+
+        // Clear any internal timers we have running for this device
+        this.#clearTimers();
+
+        // Cleanup all listeners and references to allow for garbage collection of this instance
         this?.removeAllListeners?.();
         HomeKitDevice.#deviceRegistry.delete(this.#uuid);
         delete HomeKitDevice.#listeners[this.#uuid];
@@ -509,6 +532,19 @@ export default class HomeKitDevice extends EventEmitter {
             }
           });
         }
+      }
+
+      // Special cleanup for SHUTDOWN
+      if (type === HomeKitDevice.SHUTDOWN) {
+        this?.log?.debug?.('Device "%s" is shutting down', this.deviceData.description);
+
+        // Clear any internal timers we have running for this device
+        this.#clearTimers();
+
+        // Cleanup all listeners and references to allow for garbage collection of this instance
+        this?.removeAllListeners?.();
+        HomeKitDevice.#deviceRegistry.delete(this.#uuid);
+        delete HomeKitDevice.#listeners[this.#uuid];
       }
     } else if (type === HomeKitDevice.UPDATE) {
       if (typeof message === 'object' && message !== null) {
@@ -606,6 +642,138 @@ export default class HomeKitDevice extends EventEmitter {
     }
 
     return result.call !== undefined ? result.call : result.handler;
+  }
+
+  addTimer(timerHandle, options = {}, callback = undefined) {
+    // Register a timer (timeout, interval, or both) that either calls a callback or dispatches via message system
+    // Supports three patterns:
+    //   - delay only: fires once after delay (e.g., motion cooldown)
+    //   - interval only: fires repeatedly (e.g., periodic polling)
+    //   - delay + interval: fires once after delay, then repeats (e.g., initial delay before polling)
+    // Returns true if timer was added, false if invalid parameters or duplicate (use reset:true to replace)
+    if (typeof timerHandle !== 'string' || timerHandle === '') {
+      return false;
+    }
+
+    if (typeof options !== 'object' || options === null) {
+      options = {};
+    }
+
+    let delay = isNaN(options?.delay) === false && Number(options.delay) > 0 ? Number(options.delay) : 0;
+    let interval = isNaN(options?.interval) === false && Number(options.interval) > 0 ? Number(options.interval) : 0;
+    let reset = options?.reset === true;
+    let timerMessage = typeof options?.message === 'object' && options.message !== null ? options.message : {};
+
+    // Nothing to schedule
+    if (delay === 0 && interval === 0) {
+      return false;
+    }
+
+    // Extend/reset existing timer (eg. motion cooldown)
+    if (reset === true) {
+      this.removeTimer(timerHandle);
+    }
+
+    // If we didn't reset and one exists, keep it
+    if (reset === false && this.#timers.has(timerHandle) === true) {
+      return true;
+    }
+
+    let entry = {
+      delay: delay,
+      interval: interval,
+      timeout: undefined,
+      intervalHandle: undefined,
+      started: Date.now(),
+      message: timerMessage,
+      callback: typeof callback === 'function' ? callback : undefined,
+    };
+
+    let fire = () => {
+      // Direct callback takes precedence; message dispatch only if no callback provided
+      // Callback errors are silently trapped to prevent timer chain failures
+      if (typeof entry.callback === 'function') {
+        try {
+          entry.callback(timerHandle, entry.message);
+          // eslint-disable-next-line no-unused-vars
+        } catch (error) {
+          // Empty
+        }
+        return;
+      }
+
+      // Otherwise, dispatch via message system (do not await to prevent blocking intervals if handler takes time)
+      this.message(HomeKitDevice.TIMER, {
+        timer: timerHandle,
+        ...entry.message,
+      });
+    };
+
+    // delay only => fire once
+    if (delay > 0 && interval === 0) {
+      entry.timeout = setTimeout(() => {
+        fire();
+        this.removeTimer(timerHandle);
+      }, delay);
+
+      this.#timers.set(timerHandle, entry);
+      return true;
+    }
+
+    // interval only => repeat
+    if (delay === 0 && interval > 0) {
+      entry.intervalHandle = setInterval(() => {
+        fire();
+      }, interval);
+
+      this.#timers.set(timerHandle, entry);
+      return true;
+    }
+
+    // delay + interval => fire once after delay, then repeat
+    entry.timeout = setTimeout(() => {
+      fire();
+
+      entry.intervalHandle = setInterval(() => {
+        fire();
+      }, interval);
+    }, delay);
+
+    this.#timers.set(timerHandle, entry);
+    return true;
+  }
+
+  removeTimer(timerHandle) {
+    // Clear a timer by handle. Returns true even if timer doesn't exist (idempotent, safe to call multiple times)
+    if (typeof timerHandle !== 'string' || timerHandle === '') {
+      return false;
+    }
+
+    if (this.#timers.has(timerHandle) === false) {
+      return true;
+    }
+
+    let entry = this.#timers.get(timerHandle);
+
+    try {
+      clearTimeout(entry?.timeout);
+      clearInterval(entry?.intervalHandle);
+      // eslint-disable-next-line no-unused-vars
+    } catch (error) {
+      // Empty
+    }
+
+    this.#timers.delete(timerHandle);
+    return true;
+  }
+
+  hasTimer(timerHandle) {
+    // Check if a timer with this handle is currently active/registered
+    if (typeof timerHandle !== 'string' || timerHandle === '') {
+      return false;
+    }
+
+    return this.#timers.has(timerHandle) === true;
   }
 
   addHKService(hkServiceType, name = '', subType = undefined, eveOptions = undefined) {
@@ -827,6 +995,13 @@ export default class HomeKitDevice extends EventEmitter {
       if (deviceData.online === true) {
         this?.log?.success?.('Device "%s" is online', deviceData.description);
       }
+    }
+  }
+
+  #clearTimers() {
+    // Clear all internal timers for this device
+    for (let timerHandle of this.#timers.keys()) {
+      this.removeTimer(timerHandle);
     }
   }
 }

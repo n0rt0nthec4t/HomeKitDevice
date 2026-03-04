@@ -7,13 +7,17 @@ Provides internal device tracking, metadata validation, lifecycle management, me
 
 ## Overview
 
+All lifecycle transitions, internal events, and inter-device communication flow through the unified `message()` dispatch system.  
+This ensures consistent execution ordering, prototype chain hook resolution, and centralized error handling across all device types.
+
 The `HomeKitDevice` module provides:
 
-- Lifecycle hooks (`onAdd`, `onUpdate`, `onRemove`, `onSet`, `onGet`, `onMessage`, `onHistory`)
+- Lifecycle hooks (`onAdd`, `onUpdate`, `onRemove`, `onShutdown`, `onSet`, `onGet`, `onMessage`, `onHistory`, `onTimer`)
 - Static and instance `.message()` routing
-- Public wrapper methods (`add()`, `update()`, `remove()`, `get()`, `set()`, `history()`)
+- Public wrapper methods (`add()`, `update()`, `remove()`, `shutdown()`, `get()`, `set()`, `history()`)
+- Internal named timer system (`addTimer`, `removeTimer`, `hasTimer`)
 - Safe characteristic binding (`addHKService`, `addHKCharacteristic`)
-- EveHome-compatible history support (`history`), override HomeKitDevice.EVEHOME
+- EveHome-compatible history support (`history`)
 - Internal device registry for UUID-based lookup and messaging
 
 Supports both Homebridge plugins and standalone HAP-NodeJS environments.
@@ -136,6 +140,19 @@ this.history(this.myService, {
 });
 ```
 
+### `shutdown()`
+
+Triggers the `.SHUTDOWN` lifecycle message.  
+Used during platform shutdown to allow devices to perform cleanup.
+
+All active timers and internal resources are automatically released during shutdown.
+
+> **Note:**  
+> `.REMOVE` permanently unregisters the accessory from the platform.  
+> `.SHUTDOWN` is used during controlled runtime shutdown and does not imply device removal.
+
+---
+
 ## Messaging
 
 Send a message to any registered device using its UUID:
@@ -148,17 +165,88 @@ This routes to the device’s `onMessage(type, message)` handler.
 
 ---
 
+## Internal Timer System
+
+`HomeKitDevice` provides a structured internal timer system that integrates with the lifecycle and message routing system.
+
+Timers are identified by a string handle and may:
+
+- Fire once after a delay
+- Fire repeatedly at an interval
+- Fire once after a delay and then repeat
+
+Timers may either:
+- Execute a direct callback (if provided)
+- Dispatch a `HomeKitDevice.TIMER` lifecycle message (if no callback is provided)
+
+> **Note:** Timer callbacks execute non-blocking. Even if a callback or message handler takes time to complete, it won't delay the next interval firing.
+
+All timers are automatically cleaned up during `onShutdown()`.
+Timers are device-scoped and are also released during `.REMOVE`.
+
+### `addTimer(timerHandle, options?, callback?)`
+
+Registers a timer.
+
+Supported `options`:
+
+| Option      | Description |
+|------------|------------|
+| `delay`     | Milliseconds before first fire (optional) |
+| `interval`  | Milliseconds between repeated fires (optional) |
+| `reset`     | If `true`, replaces existing timer with same handle |
+| `message`   | Object payload passed to `onTimer()` or callback |
+
+Examples:
+
+```js
+// Fire once after 60 seconds
+this.addTimer('motion', { delay: 60000 });
+
+// Repeat every 30 seconds
+this.addTimer('heartbeat', { interval: 30000 });
+
+// Fire once after 10s, then every 60s
+this.addTimer('poll', { delay: 10000, interval: 60000 });
+
+// Extend an existing cooldown timer
+this.addTimer('motion', { delay: 60000, reset: true });
+```
+
+### `removeTimer(timerHandle)`
+
+Stops and removes a timer by handle.  
+Safe to call multiple times.
+
+```js
+this.removeTimer('motion');
+```
+
+### `hasTimer(timerHandle)`
+
+Returns true if a timer with the given handle is currently registered.
+
+```js
+if (this.hasTimer('motion') === true) {
+  this.log.debug('Motion cooldown active');
+}
+```
+
+---
+
 ## Lifecycle Hooks
 
-| Method                      | Called when...                                                 |
-|-----------------------------|----------------------------------------------------------------|
+| Method                      | Called when... |
+|-----------------------------|----------------|
 | `onAdd(message)`            | A `.ADD` message is received when the accessory is initialized |
-| `onUpdate(deviceData)`      | A `.UPDATE` message updates the device configuration/state     |
-| `onRemove(message)`         | A `.REMOVE` message is received to shut down/unregister device |
-| `onSet(message)`            | A `.SET` message is received with new values to apply          |
-| `onGet(message)`            | A `.GET` message is received to query current values/state     |
-| `onMessage(type, mmessage)` | A message was received that was not handled by known types     |
-| `onHistory(type, entry)`    | After a history entry is successfully logged                   |
+| `onUpdate(deviceData)`      | A `.UPDATE` message updates the device configuration/state |
+| `onRemove(message)`         | A `.REMOVE` message unregisters the device permanently |
+| `onShutdown(message)`       | A `.SHUTDOWN` message is received during platform shutdown |
+| `onSet(message)`            | A `.SET` message applies new values |
+| `onGet(message)`            | A `.GET` message queries current values/state |
+| `onTimer(message)`          | A `.TIMER` message is dispatched by internal timers |
+| `onHistory(type, entry)`    | After a history entry is successfully logged |
+| `onMessage(type, message)`  | A message not handled by known types |
 
 ---
 
@@ -194,6 +282,8 @@ These constants are used internally for structured messaging and lifecycle dispa
 | `HomeKitDevice.HK_PIN_3_2_3` | RegExp for PIN format `xxx-xx-xxx`                            |
 | `HomeKitDevice.HK_PIN_4_4`   | RegExp for PIN format `xxxx-xxxx`                             |
 | `HomeKitDevice.MAC_ADDR`     | RegExp for HomeKit username format `XX:XX:XX:XX:XX:XX`        |
+| `HomeKitDevice.SHUTDOWN`  | Sent during controlled shutdown (`onShutdown`) |
+| `HomeKitDevice.TIMER`     | Sent when an internal timer fires (`onTimer`) |
 
 ---
 

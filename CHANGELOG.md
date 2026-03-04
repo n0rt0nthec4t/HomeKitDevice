@@ -2,6 +2,27 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2026/03/03
+
+### Added
+- Added `HomeKitDevice.SHUTDOWN` lifecycle message type.
+- Introduced `shutdown()` wrapper method to trigger controlled runtime teardown.
+- Added `onShutdown(message)` lifecycle hook for subclass-specific shutdown logic.
+- Implemented internal device-scoped timer system with three firing patterns: delay-only, interval-only, and delay+interval
+  - Timer callbacks support direct callback execution or message-driven dispatch via `options.message` payload
+  - Non-blocking execution model prevents interval stalling if timer handlers take time
+  - `addTimer(timerHandle, options, callback)`
+  - `removeTimer(timerHandle)`
+  - `hasTimer(timerHandle)`
+- Added `HomeKitDevice.TIMER` message type.
+- Added `onTimer(message)` lifecycle hook for message-driven timer handling.
+- Automatic cleanup of all registered timers during `.SHUTDOWN` and `.REMOVE`.
+
+### Changed
+- Refined lifecycle model to clearly distinguish between `.REMOVE` (permanent deregistration) and `.SHUTDOWN` (runtime teardown only).
+- Integrated timer execution with the unified `.message()` dispatch system when no callback is supplied.
+- Updated README documentation to reflect the enhanced lifecycle and scheduling architecture.
+
 ## 2025/11/24
 - Improved error handling under HomeBridge 2.0 when registering an existing accessory. This appears due to change in HAP-NodeJS 1x vs 2.x library
 
@@ -31,7 +52,6 @@ All notable changes to the `HomeKitDevice` module are documented in this file.
 
 ### Changed
 - `HomeKitDevice.HISTORY` replaces `HOMEKITHISTORY` as the standard reference for Eve-compatible history modules.
-
 
 ## 2025/06/27
 
