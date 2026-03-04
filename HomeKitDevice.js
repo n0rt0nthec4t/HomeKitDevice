@@ -566,7 +566,7 @@ export default class HomeKitDevice extends EventEmitter {
         HomeKitDevice.#deviceRegistry.delete(this.#uuid);
         delete HomeKitDevice.#listeners[this.#uuid];
 
-        this?.log?.debug?.('Performing cleanup due to shutdown for device "%s"', this.deviceData.description);
+        this?.log?.debug?.('Notifying device "%s" of shutdown', this.deviceData.description);
 
         // Now run shutdown hooks + cleanup
         await callLifecycleHook(methodName, message, ...args);
