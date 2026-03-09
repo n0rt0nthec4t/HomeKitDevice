@@ -504,7 +504,7 @@ export default class HomeKitDevice extends EventEmitter {
 
       // Special setup for ADD
       if (type === HomeKitDevice.ADD) {
-        // After the accessory is initialized and onAdd has run, link any EveHome services that requested it
+        // After the accessory is initialised and onAdd has run, link any EveHome services that requested it
         if (this.deviceData?.eveHistory === true && typeof this.historyService?.linkToEveHome === 'function') {
           for (let service of this.accessory?.services || []) {
             let options = service?.[HomeKitDevice?.EVEHOME?.EVE_OPTIONS];
