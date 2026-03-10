@@ -89,7 +89,7 @@ export default class HomeKitDevice extends EventEmitter {
   static PLATFORM_NAME = undefined; // Homebridge platform name
   static EVEHOME = undefined; // HomeKit History object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.03.04'; // Code version
+  static VERSION = '2026.03.11'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
@@ -974,47 +974,57 @@ export default class HomeKitDevice extends EventEmitter {
       return;
     }
 
-    // Update details associated with the accessory
-    // ie: Name, Manufacturer, Model, Serial # and firmware version
-    if (typeof deviceData?.description === 'string' && deviceData.description !== this.deviceData.description) {
-      // Update devices description on the HomeKit accessory
-      informationService.updateCharacteristic(this.hap.Characteristic.Name, deviceData.description);
+    // Update details associated with the accessory: Name, Manufacturer, Model, Serial # and firmware version
+    // Check against actual characteristic values to ensure sync regardless of how state got out of sync
+
+    // Description/Name
+    if (typeof deviceData?.description === 'string' && deviceData.description !== '') {
+      let currentName = informationService.getCharacteristic(this.hap.Characteristic.Name)?.value;
+      if (currentName !== deviceData.description) {
+        informationService.updateCharacteristic(this.hap.Characteristic.Name, deviceData.description);
+      }
+      if (this.accessory !== undefined &&
+        typeof this.accessory === 'object' &&
+        this.accessory.displayName !== deviceData.description) {
+        this.accessory.displayName = deviceData.description;
+      }
     }
 
-    if (
-      typeof deviceData?.manufacturer === 'string' &&
-      deviceData.manufacturer !== '' &&
-      deviceData.manufacturer !== this.deviceData.manufacturer
-    ) {
-      // Update manufacturer number on the HomeKit accessory
-      informationService.updateCharacteristic(this.hap.Characteristic.Manufacturer, deviceData.manufacturer);
+    // Manufacturer
+    if (typeof deviceData?.manufacturer === 'string' && deviceData.manufacturer !== '') {
+      let currentManufacturer = informationService.getCharacteristic(this.hap.Characteristic.Manufacturer)?.value;
+      if (currentManufacturer !== deviceData.manufacturer) {
+        informationService.updateCharacteristic(this.hap.Characteristic.Manufacturer, deviceData.manufacturer);
+      }
     }
 
-    if (typeof deviceData?.model === 'string' && deviceData.model !== '' && deviceData.model !== this.deviceData.model) {
-      // Update model on the HomeKit accessory
-      informationService.updateCharacteristic(this.hap.Characteristic.Model, deviceData.model);
+    // Model
+    if (typeof deviceData?.model === 'string' && deviceData.model !== '') {
+      let currentModel = informationService.getCharacteristic(this.hap.Characteristic.Model)?.value;
+      if (currentModel !== deviceData.model) {
+        informationService.updateCharacteristic(this.hap.Characteristic.Model, deviceData.model);
+      }
     }
 
-    if (
-      typeof deviceData?.softwareVersion === 'string' &&
-      deviceData.softwareVersion !== '' &&
-      deviceData.softwareVersion !== this.deviceData.softwareVersion
-    ) {
-      // Update software version on the HomeKit accessory
-      informationService.updateCharacteristic(this.hap.Characteristic.FirmwareRevision, deviceData.softwareVersion);
+    // FirmwareRevision
+    if (typeof deviceData?.softwareVersion === 'string' && deviceData.softwareVersion !== '') {
+      let currentFirmware = informationService.getCharacteristic(this.hap.Characteristic.FirmwareRevision)?.value;
+      if (currentFirmware !== deviceData.softwareVersion) {
+        informationService.updateCharacteristic(this.hap.Characteristic.FirmwareRevision, deviceData.softwareVersion);
+      }
     }
 
-    // Check for devices serial number changing. Really shouldn't occur, but handle case anyway
-    if (
-      typeof deviceData?.serialNumber === 'string' &&
-      deviceData.serialNumber !== '' &&
-      deviceData.serialNumber.toUpperCase() !== this.deviceData.serialNumber?.toUpperCase()
-    ) {
-      this?.log?.warn?.('Serial number on "%s" has changed', deviceData.description);
-      this?.log?.warn?.('This may cause the device to become unresponsive in HomeKit');
-
-      // Update serial number on the HomeKit accessory
-      informationService.updateCharacteristic(this.hap.Characteristic.SerialNumber, deviceData.serialNumber);
+    // SerialNumber
+    if (typeof deviceData?.serialNumber === 'string' && deviceData.serialNumber !== '') {
+      let currentSerial = informationService.getCharacteristic(this.hap.Characteristic.SerialNumber)?.value;
+      if (currentSerial !== deviceData.serialNumber) {
+        // Log warning if serial actually changed from stored data
+        if (deviceData.serialNumber.toUpperCase() !== this.deviceData.serialNumber?.toUpperCase()) {
+          this?.log?.warn?.('Serial number on "%s" has changed', deviceData.description);
+          this?.log?.warn?.('This may cause the device to become unresponsive in HomeKit');
+        }
+        informationService.updateCharacteristic(this.hap.Characteristic.SerialNumber, deviceData.serialNumber);
+      }
     }
 
     if (typeof deviceData?.online === 'boolean' && deviceData.online !== this.deviceData.online) {
