@@ -1006,11 +1006,11 @@ export default class HomeKitDevice extends EventEmitter {
       }
     }
 
-    // FirmwareRevision
+    // SoftwareRevision
     if (typeof deviceData?.softwareVersion === 'string' && deviceData.softwareVersion !== '') {
-      let currentFirmware = informationService.getCharacteristic(this.hap.Characteristic.FirmwareRevision)?.value;
-      if (currentFirmware !== deviceData.softwareVersion) {
-        informationService.updateCharacteristic(this.hap.Characteristic.FirmwareRevision, deviceData.softwareVersion);
+      let currentSoftware = informationService.getCharacteristic(this.hap.Characteristic.SoftwareRevision)?.value;
+      if (currentSoftware !== deviceData.softwareVersion) {
+        informationService.updateCharacteristic(this.hap.Characteristic.SoftwareRevision, deviceData.softwareVersion);
       }
     }
 
