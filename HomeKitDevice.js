@@ -983,9 +983,7 @@ export default class HomeKitDevice extends EventEmitter {
       if (currentName !== deviceData.description) {
         informationService.updateCharacteristic(this.hap.Characteristic.Name, deviceData.description);
       }
-      if (this.accessory !== undefined &&
-        typeof this.accessory === 'object' &&
-        this.accessory.displayName !== deviceData.description) {
+      if (this.accessory !== undefined && typeof this.accessory === 'object' && this.accessory.displayName !== deviceData.description) {
         this.accessory.displayName = deviceData.description;
       }
     }
