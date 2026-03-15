@@ -3,7 +3,7 @@
 // Base class for all HomeKit accessories using Homebridge or HAP-NodeJS.
 //
 // Provides internal device tracking, metadata validation, lifecycle management,
-// centralized message dispatch, and optional EveHome-compatible history logging.
+// centralised message dispatch, and optional EveHome-compatible history logging.
 //
 // The `deviceData` object must include:
 //   serialNumber, softwareVersion, description, manufacturer, model
@@ -14,12 +14,14 @@
 // For HAP-NodeJS standalone mode, also required:
 //   hkUsername, hkPairingCode
 //
-// The following static constants should be defined in subclasses:
-//   HomeKitDevice.PLUGIN_NAME           // Required (string)
-//   HomeKitDevice.PLATFORM_NAME         // Required (string)
-//   HomeKitDevice.TYPE                  // Optional (device type string)
-//   HomeKitDevice.VERSION               // Optional (device code version)
-//   HomeKitDevice.EVEHOME               // Optional (EveHome-compatible history module)
+// Platform bootstrap sets these base-class statics once for the plugin:
+//   HomeKitDevice.PLUGIN_NAME           // Plugin identifier used for UUID generation and registration
+//   HomeKitDevice.PLATFORM_NAME         // Homebridge platform identifier
+//   HomeKitDevice.EVEHOME               // Optional EveHome-compatible history module
+//
+// Subclasses are expected to define:
+//   HomeKitDevice.TYPE                  // Device type string
+//   HomeKitDevice.VERSION               // Device code version
 //
 // The following instance methods can be optionally implemented by subclasses:
 //
@@ -89,7 +91,7 @@ export default class HomeKitDevice extends EventEmitter {
   static PLATFORM_NAME = undefined; // Homebridge platform name
   static EVEHOME = undefined; // HomeKit History object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.03.11'; // Code version
+  static VERSION = '2026.03.15'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
