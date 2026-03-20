@@ -739,6 +739,8 @@ export default class HomeKitDevice extends EventEmitter {
       this.message(HomeKitDevice.TIMER, {
         timer: timerHandle,
         ...entry.message,
+      }).catch(() => {
+        // Empty
       });
     };
 
