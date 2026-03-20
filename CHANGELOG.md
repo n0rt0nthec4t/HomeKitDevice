@@ -2,6 +2,13 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2026/03/20
+
+### Changed
+- Improved handling of EveHome linking during device initialisation.
+- Services are linked when `eveHistory === true` and fully unlinked when disabled.
+- EveHome history service and associated Eve-specific characteristics are now removed automatically when `eveHistory` is disabled.
+
 ## 2026/03/04
 
 ### Added

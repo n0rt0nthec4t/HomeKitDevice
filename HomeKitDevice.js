@@ -91,7 +91,7 @@ export default class HomeKitDevice extends EventEmitter {
   static PLATFORM_NAME = undefined; // Homebridge platform name
   static EVEHOME = undefined; // HomeKit History object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.03.15'; // Code version
+  static VERSION = '2026.03.20'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
@@ -506,13 +506,30 @@ export default class HomeKitDevice extends EventEmitter {
 
       // Special setup for ADD
       if (type === HomeKitDevice.ADD) {
-        // After the accessory is initialised and onAdd has run, link any EveHome services that requested it
-        if (this.deviceData?.eveHistory === true && typeof this.historyService?.linkToEveHome === 'function') {
-          for (let service of this.accessory?.services || []) {
-            let options = service?.[HomeKitDevice?.EVEHOME?.EVE_OPTIONS];
-            if (options !== undefined) {
-              delete service[HomeKitDevice?.EVEHOME?.EVE_OPTIONS];
-              this.historyService.linkToEveHome(service, options);
+        // After the accessory is initialised and onAdd has run, link or unlink any EveHome services
+        for (let service of [...(this.accessory?.services || [])]) {
+          let options = service?.[HomeKitDevice?.EVEHOME?.EVE_OPTIONS];
+          if (options !== undefined) {
+            delete service[HomeKitDevice?.EVEHOME?.EVE_OPTIONS];
+          }
+
+          // Link to EveHome if eveHistory is enabled.
+          if (this.deviceData?.eveHistory === true && options !== undefined) {
+            this?.historyService?.linkToEveHome?.(service, options);
+          }
+
+          // Otherwise unlink in case it was previously enabled and has now been disabled.
+          if (this.deviceData?.eveHistory !== true) {
+            for (let characteristic of [...(service.characteristics || [])]) {
+              // EveHome history characteristics have UUIDs that start with E863F1 as defined in HomeKitHistory.js
+              // If we find any, remove them from the service to unlink from EveHome
+              if (characteristic?.UUID?.startsWith?.('E863F1') === true && typeof service?.removeCharacteristic === 'function') {
+                service.removeCharacteristic(characteristic);
+              }
+            }
+
+            if (service?.UUID === this.hap.Service?.EveHomeHistory?.UUID) {
+              this.accessory.removeService(service);
             }
           }
         }
