@@ -403,294 +403,301 @@ export default class HomeKitDevice extends EventEmitter {
         : HomeKitDevice.#listeners?.[this.#uuid]?.[type] !== undefined
           ? [HomeKitDevice.#listeners[this.#uuid][type]]
           : [];
+    try {
+      // Dynamically extract the handler method name from the type string (e.g., "HomeKitDevice.onAdd" becomes "onAdd")
+      // This allows consistent routing to instance methods like onAdd, onSet, onUpdate, etc.
+      let methodName = typeof type === 'string' ? type.match(/\.?(on[A-Z][a-zA-Z0-9]*)$/)?.[1] : undefined;
 
-    // Dynamically extract the handler method name from the type string (e.g., "HomeKitDevice.onAdd" becomes "onAdd")
-    // This allows consistent routing to instance methods like onAdd, onSet, onUpdate, etc.
-    let methodName = typeof type === 'string' ? type.match(/\.?(on[A-Z][a-zA-Z0-9]*)$/)?.[1] : undefined;
+      // Internal helper to call handlers with error trapping. Will also walk up the prototype chain
+      const callLifecycleHook = async (labelOrFn, ...params) => {
+        let results = [];
+        let called = new Set(); // track calls using context + function identity
 
-    // Internal helper to call handlers with error trapping. Will also walk up the prototype chain
-    const callLifecycleHook = async (labelOrFn, ...params) => {
-      let results = [];
-      let called = new Set(); // track calls using context + function identity
+        const callMethodWithProtoChain = async (obj, method, contextLabel) => {
+          let current = obj;
+          let seen = new Set();
 
-      const callMethodWithProtoChain = async (obj, method, contextLabel) => {
-        let current = obj;
-        let seen = new Set();
+          while (current && typeof current === 'object' && seen.has(current) === false) {
+            seen.add(current);
 
-        while (current && typeof current === 'object' && seen.has(current) === false) {
-          seen.add(current);
-
-          let fn = current?.[method];
-          if (typeof fn === 'function') {
-            let key = fn + '@' + obj;
-            if (called.has(key) === false) {
-              called.add(key);
-              try {
-                results.push(await fn.apply(obj, params));
-              } catch (error) {
-                this?.log?.warn?.('Error in %s.%s(): %s', contextLabel, method, String(error?.stack || error));
+            let fn = current?.[method];
+            if (typeof fn === 'function') {
+              let key = fn + '@' + obj;
+              if (called.has(key) === false) {
+                called.add(key);
+                try {
+                  results.push(await fn.apply(obj, params));
+                } catch (error) {
+                  this?.log?.warn?.('Error in %s.%s(): %s', contextLabel, method, String(error?.stack || error));
+                }
               }
             }
-          }
 
-          current = Object.getPrototypeOf(current);
+            current = Object.getPrototypeOf(current);
+          }
+        };
+
+        if (typeof labelOrFn === 'string') {
+          await callMethodWithProtoChain(this, labelOrFn, this?.constructor?.name ?? 'this');
+        } else if (typeof labelOrFn === 'function') {
+          let key = labelOrFn + '@' + this;
+          if (called.has(key) === false) {
+            called.add(key);
+            try {
+              results.push(await labelOrFn(...params));
+            } catch (error) {
+              this?.log?.warn?.('Error in inline function handler: %s', String(error?.stack || error));
+            }
+          }
+        } else if (Array.isArray(labelOrFn) === true) {
+          let [label, list] = labelOrFn;
+
+          for (let item of list || []) {
+            let fn = item?.handler;
+            let context = item?.context ?? this;
+            let key = fn + '@' + context;
+
+            if (typeof fn === 'function') {
+              if (called.has(key) === false) {
+                called.add(key);
+                try {
+                  results.push(await fn.call(context, ...params));
+                } catch (error) {
+                  this?.log?.warn?.('Error in registered %s(): %s', label, String(error?.stack || error));
+                }
+              }
+            } else if (typeof fn === 'string' && context) {
+              await callMethodWithProtoChain(context, fn, context?.constructor?.name ?? 'handler');
+            }
+          }
         }
+
+        return results.length === 1 ? results[0] : results;
       };
 
-      if (typeof labelOrFn === 'string') {
-        await callMethodWithProtoChain(this, labelOrFn, this?.constructor?.name ?? 'this');
-      } else if (typeof labelOrFn === 'function') {
-        let key = labelOrFn + '@' + this;
-        if (called.has(key) === false) {
-          called.add(key);
-          try {
-            results.push(await labelOrFn(...params));
-          } catch (error) {
-            this?.log?.warn?.('Error in inline function handler: %s', String(error?.stack || error));
-          }
-        }
-      } else if (Array.isArray(labelOrFn) === true) {
-        let [label, list] = labelOrFn;
+      // Internal helper to snapshot accessory structure relating to services and characteristics
+      const snapshotAccessoryStructure = (accessory) => {
+        return Array.isArray(accessory?.services) === true
+          ? accessory.services
+              .map((service) => ({
+                UUID: service.UUID,
+                subtype: service.subtype ?? '',
+                characteristics:
+                  Array.isArray(service.characteristics) === true
+                    ? service.characteristics.map((characteristic) => characteristic.UUID).sort()
+                    : [],
+              }))
+              .sort((a, b) => (a.UUID === b.UUID ? String(a.subtype).localeCompare(String(b.subtype)) : a.UUID.localeCompare(b.UUID)))
+          : [];
+      };
 
-        for (let item of list || []) {
-          let fn = item?.handler;
-          let context = item?.context ?? this;
-          let key = fn + '@' + context;
+      // First up, we want to take a "snapshot" of services and characteristics on this accessory
+      // This will be used after all message calling to see if any changes have occured on the accessory
+      // And if so, and running under Homebridge, we'll notify it of the changes
+      let originalServices = snapshotAccessoryStructure(this.accessory);
 
-          if (typeof fn === 'function') {
-            if (called.has(key) === false) {
-              called.add(key);
-              try {
-                results.push(await fn.call(context, ...params));
-              } catch (error) {
-                this?.log?.warn?.('Error in registered %s(): %s', label, String(error?.stack || error));
-              }
-            }
-          } else if (typeof fn === 'string' && context) {
-            await callMethodWithProtoChain(context, fn, context?.constructor?.name ?? 'handler');
-          }
-        }
-      }
-
-      return results.length === 1 ? results[0] : results;
-    };
-
-    // Internal helper to snapshot accessory structure relating to services and characteristics
-    const snapshotAccessoryStructure = (accessory) => {
-      return Array.isArray(accessory?.services) === true
-        ? accessory.services
-            .map((service) => ({
-              UUID: service.UUID,
-              subtype: service.subtype ?? '',
-              characteristics:
-                Array.isArray(service.characteristics) === true
-                  ? service.characteristics.map((characteristic) => characteristic.UUID).sort()
-                  : [],
-            }))
-            .sort((a, b) => (a.UUID === b.UUID ? String(a.subtype).localeCompare(String(b.subtype)) : a.UUID.localeCompare(b.UUID)))
-        : [];
-    };
-
-    // First up, we want to take a "snapshot" of services and characteristics on this accessory
-    // This will be used after all message calling to see if any changes have occured on the accessory
-    // And if so, and running under Homebridge, we'll notify it of the changes
-    let originalServices = snapshotAccessoryStructure(this.accessory);
-
-    // Handle built-in types with special behavior
-    if (type === HomeKitDevice.ADD || type === HomeKitDevice.REMOVE || type === HomeKitDevice.SET) {
-      // Call the dynamic on<Type> method (ie. onAdd, onRemove, onSet) and after
-      // Any static handler registered via HomeKitDevice.message(uuid, type, handler)
-      await callLifecycleHook(methodName, message, ...args);
-      await callLifecycleHook(['handler for ' + type, handler], message, ...args);
-      handled = true;
-
-      // Special setup for ADD
-      if (type === HomeKitDevice.ADD) {
-        // After the accessory is initialised and onAdd has run, link or unlink any EveHome services
-        for (let service of [...(this.accessory?.services || [])]) {
-          let options = service?.[HomeKitDevice?.EVEHOME?.EVE_OPTIONS];
-          if (options !== undefined) {
-            delete service[HomeKitDevice?.EVEHOME?.EVE_OPTIONS];
-          }
-
-          // Link to EveHome if eveHistory is enabled.
-          if (this.deviceData?.eveHistory === true && options !== undefined) {
-            this?.historyService?.linkToEveHome?.(service, options);
-          }
-
-          // Otherwise unlink in case it was previously enabled and has now been disabled.
-          if (this.deviceData?.eveHistory !== true) {
-            for (let characteristic of [...(service.characteristics || [])]) {
-              // EveHome history characteristics have UUIDs that start with E863F1 as defined in HomeKitHistory.js
-              // If we find any, remove them from the service to unlink from EveHome
-              if (characteristic?.UUID?.startsWith?.('E863F1') === true && typeof service?.removeCharacteristic === 'function') {
-                service.removeCharacteristic(characteristic);
-              }
-            }
-
-            if (service?.UUID === this.hap.Service?.EveHomeHistory?.UUID) {
-              this.accessory.removeService(service);
-            }
-          }
-        }
-      }
-
-      // Special teardown for REMOVE
-      if (type === HomeKitDevice.REMOVE) {
-        this?.log?.warn?.('Notified to remove device "%s"', this.deviceData.description);
-
-        // Clear any internal timers we have running for this device
-        this.#clearTimers();
-
-        // Cleanup all listeners and references to allow for garbage collection of this instance
-        this?.removeAllListeners?.();
-        HomeKitDevice.#deviceRegistry.delete(this.#uuid);
-        delete HomeKitDevice.#listeners[this.#uuid];
-
-        if (this.accessory !== undefined && typeof this.#platform?.unregisterPlatformAccessories === 'function') {
-          try {
-            this.#platform.unregisterPlatformAccessories(HomeKitDevice.PLUGIN_NAME, HomeKitDevice.PLATFORM_NAME, [this.accessory]);
-            // eslint-disable-next-line no-unused-vars
-          } catch (error) {
-            // Empty
-          }
-        }
-
-        if (this.accessory !== undefined && this.#platform === undefined) {
-          this.accessory.unpublish();
-        }
-
-        this.deviceData = {};
-        this.accessory = undefined;
-        this.historyService = undefined;
-        this.hap = undefined;
-        this.log = undefined;
-        this.#uuid = undefined;
-        this.#platform = undefined;
-      }
-
-      // Update the internal data for the set values, as could take some time once we emit the event
-      if (type === HomeKitDevice.SET) {
-        if (typeof message === 'object' && message !== null) {
-          Object.entries(message).forEach(([key, value]) => {
-            if (this.deviceData?.[key] !== undefined) {
-              this.deviceData[key] = value;
-            }
-          });
-        }
-      }
-    } else if (type === HomeKitDevice.SHUTDOWN) {
-      if (HomeKitDevice.#deviceRegistry.has(this.#uuid) === true) {
-        // Deregister first so we don't get shutdown twice via global broadcaster
-        HomeKitDevice.#deviceRegistry.delete(this.#uuid);
-        delete HomeKitDevice.#listeners[this.#uuid];
-
-        this?.log?.debug?.('Notifying device "%s" of shutdown', this.deviceData.description);
-
-        // Now run shutdown hooks + cleanup
+      // Handle built-in types with special behavior
+      if (type === HomeKitDevice.ADD || type === HomeKitDevice.REMOVE || type === HomeKitDevice.SET) {
+        // Call the dynamic on<Type> method (ie. onAdd, onRemove, onSet) and after
+        // Any static handler registered via HomeKitDevice.message(uuid, type, handler)
         await callLifecycleHook(methodName, message, ...args);
         await callLifecycleHook(['handler for ' + type, handler], message, ...args);
+        handled = true;
 
-        // Clear any internal timers we have running for this device
-        this.#clearTimers();
-        this?.removeAllListeners?.();
-      }
-      handled = true;
-    } else if (type === HomeKitDevice.UPDATE) {
-      if (typeof message === 'object' && message !== null) {
-        let { merged, changed } = this.#mergeDeviceData(message);
-        this.#updateAccessoryInformation(merged);
+        // Special setup for ADD
+        if (type === HomeKitDevice.ADD) {
+          // After the accessory is initialised and onAdd has run, link or unlink any EveHome services
+          for (let service of [...(this.accessory?.services || [])]) {
+            let options = service?.[HomeKitDevice?.EVEHOME?.EVE_OPTIONS];
+            if (options !== undefined) {
+              delete service[HomeKitDevice?.EVEHOME?.EVE_OPTIONS];
+            }
 
-        if (changed === true || (typeof args?.[0] === 'object' && args?.[0]?.force === true)) {
-          // Call the onUpdate method and after any static handler registered via HomeKitDevice.message(uuid, type, handler)
-          await callLifecycleHook('onUpdate', merged, ...args);
-          await callLifecycleHook(['handler for UPDATE', handler], merged, ...args);
-        }
+            // Link to EveHome if eveHistory is enabled.
+            if (this.deviceData?.eveHistory === true && options !== undefined) {
+              this?.historyService?.linkToEveHome?.(service, options);
+            }
 
-        // Update our internally stored data with the new data
-        this.deviceData = structuredClone(merged);
-      }
-      handled = true;
-    } else if (type === HomeKitDevice.HISTORY) {
-      let [target, entry, options = {}] = [message, args[0], args[1]];
-      let skipHistory = false;
-
-      if (
-        typeof this.historyService === 'object' &&
-        typeof this.historyService?.addHistory === 'function' &&
-        typeof entry === 'object' &&
-        typeof target === 'object' &&
-        typeof target.UUID === 'string'
-      ) {
-        if (isNaN(entry?.time) === true) {
-          entry.time = Math.floor(Date.now() / 1000);
-        }
-
-        if (options?.force !== true && typeof this.historyService?.lastHistory === 'function') {
-          let last = this.historyService.lastHistory(target);
-          if (typeof last === 'object') {
-            let changed = Object.keys(entry).some((key) => {
-              if (key === 'time') {
-                return false;
+            // Otherwise unlink in case it was previously enabled and has now been disabled.
+            if (this.deviceData?.eveHistory !== true) {
+              for (let characteristic of [...(service.characteristics || [])]) {
+                // EveHome history characteristics have UUIDs that start with E863F1 as defined in HomeKitHistory.js
+                // If we find any, remove them from the service to unlink from EveHome
+                if (characteristic?.UUID?.startsWith?.('E863F1') === true && typeof service?.removeCharacteristic === 'function') {
+                  service.removeCharacteristic(characteristic);
+                }
               }
-              let v = entry[key];
-              let lv = last[key];
-              return typeof v === 'object' ? JSON.stringify(v) !== JSON.stringify(lv) : v !== lv;
-            });
-            if (changed === false) {
-              skipHistory = true;
+
+              if (service?.UUID === this.hap.Service?.EveHomeHistory?.UUID) {
+                this.accessory.removeService(service);
+              }
             }
           }
         }
 
-        if (skipHistory === false) {
-          this.historyService.addHistory(target, entry, isNaN(options?.timegap) === false ? options.timegap : undefined);
+        // Special teardown for REMOVE
+        if (type === HomeKitDevice.REMOVE) {
+          this?.log?.warn?.('Notified to remove device "%s"', this.deviceData.description);
+
+          // Clear any internal timers we have running for this device
+          this.#clearTimers();
+
+          // Cleanup all listeners and references to allow for garbage collection of this instance
+          this?.removeAllListeners?.();
+          HomeKitDevice.#deviceRegistry.delete(this.#uuid);
+          delete HomeKitDevice.#listeners[this.#uuid];
+
+          if (this.accessory !== undefined && typeof this.#platform?.unregisterPlatformAccessories === 'function') {
+            try {
+              this.#platform.unregisterPlatformAccessories(HomeKitDevice.PLUGIN_NAME, HomeKitDevice.PLATFORM_NAME, [this.accessory]);
+              // eslint-disable-next-line no-unused-vars
+            } catch (error) {
+              // Empty
+            }
+          }
+
+          if (this.accessory !== undefined && this.#platform === undefined) {
+            this.accessory.unpublish();
+          }
+
+          this.deviceData = {};
+          this.accessory = undefined;
+          this.historyService = undefined;
+          this.hap = undefined;
+          this.log = undefined;
+          this.#uuid = undefined;
+          this.#platform = undefined;
         }
+
+        // Update the internal data for the set values, as could take some time once we emit the event
+        if (type === HomeKitDevice.SET) {
+          if (typeof message === 'object' && message !== null) {
+            Object.entries(message).forEach(([key, value]) => {
+              if (this.deviceData?.[key] !== undefined) {
+                this.deviceData[key] = value;
+              }
+            });
+          }
+        }
+      } else if (type === HomeKitDevice.SHUTDOWN) {
+        if (HomeKitDevice.#deviceRegistry.has(this.#uuid) === true) {
+          // Deregister first so we don't get shutdown twice via global broadcaster
+          HomeKitDevice.#deviceRegistry.delete(this.#uuid);
+          delete HomeKitDevice.#listeners[this.#uuid];
+
+          this?.log?.debug?.('Notifying device "%s" of shutdown', this.deviceData.description);
+
+          // Now run shutdown hooks + cleanup
+          await callLifecycleHook(methodName, message, ...args);
+          await callLifecycleHook(['handler for ' + type, handler], message, ...args);
+
+          // Clear any internal timers we have running for this device
+          this.#clearTimers();
+          this?.removeAllListeners?.();
+        }
+        handled = true;
+      } else if (type === HomeKitDevice.UPDATE) {
+        if (typeof message === 'object' && message !== null) {
+          let { merged, changed } = this.#mergeDeviceData(message);
+          this.#updateAccessoryInformation(merged);
+
+          if (changed === true || (typeof args?.[0] === 'object' && args?.[0]?.force === true)) {
+            // Call the onUpdate method and after any static handler registered via HomeKitDevice.message(uuid, type, handler)
+            await callLifecycleHook('onUpdate', merged, ...args);
+            await callLifecycleHook(['handler for UPDATE', handler], merged, ...args);
+          }
+
+          // Update our internally stored data with the new data
+          this.deviceData = structuredClone(merged);
+        }
+        handled = true;
+      } else if (type === HomeKitDevice.HISTORY) {
+        let [target, entry, options = {}] = [message, args[0], args[1]];
+        let skipHistory = false;
+
+        if (
+          typeof this.historyService === 'object' &&
+          typeof this.historyService?.addHistory === 'function' &&
+          typeof entry === 'object' &&
+          typeof target === 'object' &&
+          typeof target.UUID === 'string'
+        ) {
+          if (isNaN(entry?.time) === true) {
+            entry.time = Math.floor(Date.now() / 1000);
+          }
+
+          if (options?.force !== true && typeof this.historyService?.lastHistory === 'function') {
+            let last = this.historyService.lastHistory(target);
+            if (typeof last === 'object') {
+              let changed = Object.keys(entry).some((key) => {
+                if (key === 'time') {
+                  return false;
+                }
+                let v = entry[key];
+                let lv = last[key];
+                return typeof v === 'object' ? JSON.stringify(v) !== JSON.stringify(lv) : v !== lv;
+              });
+              if (changed === false) {
+                skipHistory = true;
+              }
+            }
+          }
+
+          if (skipHistory === false) {
+            this.historyService.addHistory(target, entry, isNaN(options?.timegap) === false ? options.timegap : undefined);
+          }
+        }
+
+        // Call the onHistory method and after any static handler registered via HomeKitDevice.message(uuid, type, handler)
+        await callLifecycleHook('onHistory', target, entry, options);
+        await callLifecycleHook(['handler for HISTORY', handler], target, entry, options);
+
+        handled = true;
       }
 
-      // Call the onHistory method and after any static handler registered via HomeKitDevice.message(uuid, type, handler)
-      await callLifecycleHook('onHistory', target, entry, options);
-      await callLifecycleHook(['handler for HISTORY', handler], target, entry, options);
+      // Dynamically handle any remaining on<Type> method (e.g., onGet etc that we haven’t handled yet)
+      // Any static handler registered via HomeKitDevice.message(uuid, type, handler)
+      if (handled === false && (typeof this?.[methodName] === 'function' || (Array.isArray(handler) === true && handler.length > 0))) {
+        // Use string method name so we get inheritance merging;
+        result.call = await callLifecycleHook(methodName, message, ...args);
+        result.handler = await callLifecycleHook(['handler for ' + type, handler], message, ...args);
+        handled = true;
+      }
 
-      handled = true;
+      // Call generic handler if present and we haven't handled the message yet
+      if (handled === false) {
+        result.call = await callLifecycleHook('onMessage', type, message, ...args);
+        handled = true;
+      }
+
+      // Lets see whats changed (if anything) on the accessory
+      let newServices = snapshotAccessoryStructure(this.accessory);
+      if (
+        JSON.stringify(originalServices) !== JSON.stringify(newServices) &&
+        this.accessory !== undefined &&
+        typeof this.#platform?.updatePlatformAccessories === 'function'
+      ) {
+        // We have changes detected for our accessory (services and/or characteristics)
+        // Notify Homebridge if thats our "backend" system
+        this.#platform.updatePlatformAccessories([this.accessory]);
+      }
+
+      // No handler at all — not even onMessage()
+      if (handled === false && (Array.isArray(handler) === false || handler.length === 0) && typeof this?.[methodName] !== 'function') {
+        this?.log?.warn?.('Unhandled message type "%s" for device "%s"', type, this.deviceData.description);
+      }
+
+      if (typeof result.call === 'object' && typeof result.handler === 'object') {
+        return Object.assign({}, result.call, result.handler);
+      }
+    } catch (error) {
+      this?.log?.warn?.(
+        'Unhandled error while processing message "%s" for device "%s": %s',
+        type,
+        this.deviceData?.description,
+        typeof error?.stack === 'string' ? error.stack : String(error),
+      );
     }
-
-    // Dynamically handle any remaining on<Type> method (e.g., onGet etc that we haven’t handled yet)
-    // Any static handler registered via HomeKitDevice.message(uuid, type, handler)
-    if (handled === false && (typeof this?.[methodName] === 'function' || (Array.isArray(handler) === true && handler.length > 0))) {
-      // Use string method name so we get inheritance merging;
-      result.call = await callLifecycleHook(methodName, message, ...args);
-      result.handler = await callLifecycleHook(['handler for ' + type, handler], message, ...args);
-      handled = true;
-    }
-
-    // Call generic handler if present and we haven't handled the message yet
-    if (handled === false) {
-      result.call = await callLifecycleHook('onMessage', type, message, ...args);
-      handled = true;
-    }
-
-    // Lets see whats changed (if anything) on the accessory
-    let newServices = snapshotAccessoryStructure(this.accessory);
-    if (
-      JSON.stringify(originalServices) !== JSON.stringify(newServices) &&
-      this.accessory !== undefined &&
-      typeof this.#platform?.updatePlatformAccessories === 'function'
-    ) {
-      // We have changes detected for our accessory (services and/or characteristics)
-      // Notify Homebridge if thats our "backend" system
-      this.#platform.updatePlatformAccessories([this.accessory]);
-    }
-
-    // No handler at all — not even onMessage()
-    if (handled === false && (Array.isArray(handler) === false || handler.length === 0) && typeof this?.[methodName] !== 'function') {
-      this?.log?.warn?.('Unhandled message type "%s" for device "%s"', type, this.deviceData.description);
-    }
-
-    if (typeof result.call === 'object' && typeof result.handler === 'object') {
-      return Object.assign({}, result.call, result.handler);
-    }
-
     return result.call !== undefined ? result.call : result.handler;
   }
 
@@ -785,6 +792,7 @@ export default class HomeKitDevice extends EventEmitter {
     // delay + interval => fire once after delay, then repeat
     entry.timeout = setTimeout(() => {
       fire();
+      entry.timeout = undefined;
 
       entry.intervalHandle = setInterval(() => {
         fire();
