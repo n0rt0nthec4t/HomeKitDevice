@@ -91,7 +91,7 @@ export default class HomeKitDevice extends EventEmitter {
   static PLATFORM_NAME = undefined; // Homebridge platform name
   static EVEHOME = undefined; // HomeKit History object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.03.20'; // Code version
+  static VERSION = '2026.03.21'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
