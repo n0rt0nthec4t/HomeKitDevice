@@ -91,7 +91,7 @@ export default class HomeKitDevice extends EventEmitter {
   static PLATFORM_NAME = undefined; // Homebridge platform name
   static EVEHOME = undefined; // HomeKit History object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.03.21'; // Code version
+  static VERSION = '2026.03.26'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
@@ -744,28 +744,54 @@ export default class HomeKitDevice extends EventEmitter {
       started: Date.now(),
       message: timerMessage,
       callback: typeof callback === 'function' ? callback : undefined,
+      running: false,
+      cancelled: false,
     };
 
     let fire = () => {
-      // Direct callback takes precedence; message dispatch only if no callback provided
-      // Callback errors are silently trapped to prevent timer chain failures
-      if (typeof entry.callback === 'function') {
-        try {
-          entry.callback(timerHandle, entry.message);
-          // eslint-disable-next-line no-unused-vars
-        } catch (error) {
-          // Empty
-        }
+      // Prevent overlapping timer executions and ignore cancelled timers
+      if (entry.running === true || entry.cancelled === true) {
         return;
       }
 
-      // Otherwise, dispatch via message system (do not await to prevent blocking intervals if handler takes time)
-      this.message(HomeKitDevice.TIMER, {
-        timer: timerHandle,
-        ...entry.message,
-      }).catch(() => {
-        // Empty
-      });
+      entry.running = true;
+
+      // Direct callback takes precedence; message dispatch only if no callback provided
+      // Callback/message errors are silently trapped to prevent timer chain failures
+      if (typeof entry.callback === 'function') {
+        Promise.resolve(entry.callback(timerHandle, entry.message))
+          .catch(() => {
+            // Empty
+          })
+          .finally(() => {
+            if (entry.cancelled === true) {
+              // Don't update state if timer was cancelled while we were executing the callback or message handler
+              return;
+            }
+
+            entry.running = false;
+          });
+        return;
+      }
+
+      // Otherwise, dispatch via message system
+      Promise.resolve(
+        this.message(HomeKitDevice.TIMER, {
+          timer: timerHandle,
+          ...entry.message,
+        }),
+      )
+        .catch(() => {
+          // Empty
+        })
+        .finally(() => {
+          if (entry.cancelled === true) {
+            // Don't update state if timer was cancelled while we were executing the callback or message handler
+            return;
+          }
+
+          entry.running = false;
+        });
     };
 
     // delay only => fire once
@@ -815,6 +841,9 @@ export default class HomeKitDevice extends EventEmitter {
 
     let entry = this.#timers.get(timerHandle);
 
+    // Mark as cancelled so any in-flight async completion knows it's no longer valid
+    entry.cancelled = true;
+
     try {
       clearTimeout(entry?.timeout);
       clearInterval(entry?.intervalHandle);
@@ -822,6 +851,11 @@ export default class HomeKitDevice extends EventEmitter {
     } catch (error) {
       // Empty
     }
+
+    // Defensive cleanup
+    entry.timeout = undefined;
+    entry.intervalHandle = undefined;
+    entry.running = false;
 
     this.#timers.delete(timerHandle);
     return true;
