@@ -1,54 +1,55 @@
-// HomeKitDevice class
+// Base Class: HomeKitDevice
 //
-// Base class for all HomeKit accessories using Homebridge or HAP-NodeJS.
+// Shared base class for HomeKit-enabled devices across multiple projects.
+// Supports both Homebridge and direct HAP-NodeJS backends.
 //
-// Provides internal device tracking, metadata validation, lifecycle management,
-// centralised message dispatch, and optional EveHome-compatible history logging.
+// Provides a unified abstraction layer that standardises accessory creation,
+// lifecycle handling, message routing, timer management, and optional
+// EveHome history support across all device types.
 //
-// The `deviceData` object must include:
-//   serialNumber, softwareVersion, description, manufacturer, model
+// Responsibilities:
+// - Manage HomeKit accessory creation and removal
+// - Provide unified message routing for device lifecycle and custom events
+// - Maintain internal device registry -> cross-device messaging
+// - Standardise HomeKit service and characteristic helper methods
+// - Integrate optional EveHome-compatible history support
+// - Provide internal timer management for device instances
 //
-// For enabling EveHome history support, include in the `deviceData`:
-//   eveHistory
+// Lifecycle Hooks (optional in subclasses):
+// - onAdd(message, ...args)      -> called when HomeKitDevice.ADD is received
+// - onSet(message, ...args)      -> called when HomeKitDevice.SET is received
+// - onUpdate(deviceData, ...args)-> called when HomeKitDevice.UPDATE is received
+// - onRemove(message, ...args)   -> called when HomeKitDevice.REMOVE is received
+// - onShutdown(message, ...args) -> called when HomeKitDevice.SHUTDOWN is received
+// - onTimer(message, ...args)    -> called when HomeKitDevice.TIMER is received
+// - onGet(message, ...args)      -> called when HomeKitDevice.GET is received
+// - onHistory(target, entry, options)
+//                                 -> called after history processing
+// - onMessage(type, message, ...args)
+//                                 -> fallback for unhandled or custom message types
 //
-// For HAP-NodeJS standalone mode, also required:
-//   hkUsername, hkPairingCode
+// Messaging Model:
+// - device.message(type, message, ...args)
+//     -> routes a message to this device instance
+// - HomeKitDevice.message(uuid, type, message, ...args)
+//     -> routes a message to another registered device instance
+// - Internal lifecycle events and custom interactions use the same message system
 //
-// Platform bootstrap sets these base-class statics once for the plugin:
-//   HomeKitDevice.PLUGIN_NAME           // Plugin identifier used for UUID generation and registration
-//   HomeKitDevice.PLATFORM_NAME         // Homebridge platform identifier
-//   HomeKitDevice.EVEHOME               // Optional EveHome-compatible history module
+// Key Features:
+// - addHKService() / addHKCharacteristic()
+//     -> simplified HomeKit setup helpers
+// - addTimer() / removeTimer() / hasTimer()
+//     -> per-device timer management
+// - history()
+//     -> EveHome-compatible history logging and hook dispatch
+// - Static device registry
+//     -> enables global device message routing
 //
-// Subclasses are expected to define:
-//   HomeKitDevice.TYPE                  // Device type string
-//   HomeKitDevice.VERSION               // Device code version
-//
-// The following instance methods can be optionally implemented by subclasses:
-//
-// Lifecycle events
-//   async onAdd(message, ...args)        // Called when HomeKitDevice.ADD is received
-//   async onSet(message, ...args)        // Called when HomeKitDevice.SET is received
-//   async onUpdate(deviceData, ...args)  // Called when HomeKitDevice.UPDATE is received
-//   async onRemove(message, ...args)     // Called when HomeKitDevice.REMOVE is received
-//   async onShutdown(message, ...args)   // Called when HomeKitDevice.SHUTDOWN is received
-//
-// Timer hook
-//   async onTimer(message, ...args)      // Called when HomeKitDevice.TIMER is received
-//
-// Data / history hooks
-//   async onGet(message, ...args)        // Called when HomeKitDevice.GET is received
-//   async onHistory(target, entry)       // Called after a history entry is logged
-//
-// Fallback handler
-//   async onMessage(type, message)       // Called for unhandled or custom message types
-//
-// Messages should be sent via:
-//   await device.message(type, message, ...args);
-//
-// All internal lifecycle events (`add`, `update`, `remove`, `shutdown`, `set`, `get`, `timer`, `history`)
-// and external interactions must use the `message()` dispatch system for consistency.
-//
-// See README.md for usage examples and detailed documentation.
+// Notes:
+// - Designed for subclassing only
+// - Supports both Homebridge and HAP-NodeJS backends
+// - Homebridge platform shutdown and process exit cleanup are handled centrally
+// - Accessory/service structure changes are automatically pushed back to Homebridge
 //
 // Mark Hulskamp
 'use strict';
