@@ -92,7 +92,7 @@ export default class HomeKitDevice extends EventEmitter {
   // Override this in the class which extends
   static PLUGIN_NAME = undefined; // Homebridge plugin name
   static PLATFORM_NAME = undefined; // Homebridge platform name
-  static EVEHOME = undefined; // HomeKit History object
+  static EVEHOME = undefined; // HomeKitHistory object
   static TYPE = 'base'; // String naming type of device
   static VERSION = '2026.04.07'; // Code version
 
