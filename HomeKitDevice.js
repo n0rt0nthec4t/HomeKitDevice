@@ -94,7 +94,7 @@ export default class HomeKitDevice extends EventEmitter {
   static PLATFORM_NAME = undefined; // Homebridge platform name
   static EVEHOME = undefined; // HomeKitHistory object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.04.07'; // Code version
+  static VERSION = '2026.04.10'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
@@ -139,7 +139,7 @@ export default class HomeKitDevice extends EventEmitter {
 
         this.#platform.on('shutdown', async () => {
           // Notify all of our registered devices of Homebridge shutdown
-          // This allowes them to do any necessary cleanup (like stopping advertising, clearing timers, etc) before the process exits
+          // This allows them to do any necessary cleanup (like stopping advertising, clearing timers, etc) before the process exits
           await HomeKitDevice.#shutdownHandler();
         });
       }
@@ -176,7 +176,7 @@ export default class HomeKitDevice extends EventEmitter {
     // Mainly used to restore a Homebridge cached accessory
     if (typeof accessory === 'object' && this.backend === HomeKitDevice.HOMEBRIDGE) {
       if (Array.isArray(accessory) === true) {
-        this.accessory = accessory.find((accessory) => this?.uuid !== undefined && accessory?.UUID === this.#uuid);
+        this.accessory = accessory.find((accessory) => this.#uuid !== undefined && accessory?.UUID === this.#uuid);
       }
       if (Array.isArray(accessory) === false && accessory?.UUID === this.#uuid) {
         this.accessory = accessory;
@@ -254,13 +254,11 @@ export default class HomeKitDevice extends EventEmitter {
       return;
     }
 
-    if (informationService !== undefined) {
-      informationService.updateCharacteristic(this.hap.Characteristic.Manufacturer, this.deviceData.manufacturer);
-      informationService.updateCharacteristic(this.hap.Characteristic.Model, this.deviceData.model);
-      informationService.updateCharacteristic(this.hap.Characteristic.SerialNumber, this.deviceData.serialNumber);
-      informationService.updateCharacteristic(this.hap.Characteristic.FirmwareRevision, this.deviceData.softwareVersion);
-      informationService.updateCharacteristic(this.hap.Characteristic.Name, this.deviceData.description);
-    }
+    informationService.updateCharacteristic(this.hap.Characteristic.Manufacturer, this.deviceData.manufacturer);
+    informationService.updateCharacteristic(this.hap.Characteristic.Model, this.deviceData.model);
+    informationService.updateCharacteristic(this.hap.Characteristic.SerialNumber, this.deviceData.serialNumber);
+    informationService.updateCharacteristic(this.hap.Characteristic.FirmwareRevision, this.deviceData.softwareVersion);
+    informationService.updateCharacteristic(this.hap.Characteristic.Name, this.deviceData.description);
 
     // Setup our history service if module has been defined and requested to be active for this device
     if (typeof HomeKitDevice?.EVEHOME === 'function' && this.historyService === undefined && enableHistory === true) {
@@ -354,7 +352,7 @@ export default class HomeKitDevice extends EventEmitter {
 
   async get(values, ...args) {
     // Trigger registered handlers (onGet + listeners)
-    return await this.message(HomeKitDevice.GET, values, ...args);
+    return this.message(HomeKitDevice.GET, values, ...args);
   }
 
   static async message(uuid, type, message = undefined, ...args) {
@@ -372,7 +370,7 @@ export default class HomeKitDevice extends EventEmitter {
 
       let handler, context;
 
-      if (typeof message === 'function' || typeof message === 'string') {
+      if (typeof message === 'function') {
         handler = message;
         context = undefined;
       } else {
@@ -690,8 +688,8 @@ export default class HomeKitDevice extends EventEmitter {
         this?.log?.warn?.('Unhandled message type "%s" for device "%s"', type, this.deviceData.description);
       }
 
-      if (typeof result.call === 'object' && typeof result.handler === 'object') {
-        return Object.assign({}, result.call, result.handler);
+      if (typeof result.call === 'object' || typeof result.handler === 'object') {
+        return Object.assign({}, result.call ?? {}, result.handler ?? {});
       }
     } catch (error) {
       this?.log?.warn?.(
@@ -1022,12 +1020,11 @@ export default class HomeKitDevice extends EventEmitter {
     });
 
     // Check updated device data with our internally stored data. Flag if changes between the two
-    let changed = false;
-    Object.keys(merged).forEach((key) => {
-      if (JSON.stringify(merged[key]) !== JSON.stringify(this.deviceData[key])) {
-        changed = true;
-      }
-    });
+    // Handle undefined values in JSON.stringify for accurate comparison
+    const replacer = (_, value) => (value === undefined ? 'undefined' : value);
+    let changed = Object.keys(merged).some(
+      (key) => JSON.stringify(merged[key], replacer) !== JSON.stringify(this.deviceData[key], replacer),
+    );
 
     return { merged, changed };
   }
@@ -1107,7 +1104,8 @@ export default class HomeKitDevice extends EventEmitter {
 
   #clearTimers() {
     // Clear all internal timers for this device
-    for (let timerHandle of this.#timers.keys()) {
+    // Snapshot keys first to avoid mutating the Map while iterating
+    for (let timerHandle of [...this.#timers.keys()]) {
       this.removeTimer(timerHandle);
     }
   }
