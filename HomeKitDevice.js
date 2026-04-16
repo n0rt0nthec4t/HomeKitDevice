@@ -94,7 +94,7 @@ export default class HomeKitDevice extends EventEmitter {
   static PLATFORM_NAME = undefined; // Homebridge platform name
   static EVEHOME = undefined; // HomeKitHistory object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.04.10'; // Code version
+  static VERSION = '2026.04.15'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
@@ -1010,20 +1010,36 @@ export default class HomeKitDevice extends EventEmitter {
   #mergeDeviceData(deviceDataUpdates = {}) {
     let merged = { ...deviceDataUpdates };
 
-    // Updated data may only contain selected fields, so we'll handle that here by taking our internally stored data
-    // and merge with the updates to ensure we have a complete data object
+    // Updated data may only contain selected fields, so merge with our internally stored
+    // data to ensure we always end up with a complete deviceData object.
     Object.entries(this.deviceData).forEach(([key, value]) => {
       if (typeof merged[key] === 'undefined') {
-        // Updated data doesn't have this key, so add it to our internally stored data
         merged[key] = value;
       }
     });
 
-    // Check updated device data with our internally stored data. Flag if changes between the two
-    // Handle undefined values in JSON.stringify for accurate comparison
-    const replacer = (_, value) => (value === undefined ? 'undefined' : value);
+    // Normalise values before comparison so JSON.stringify is stable:
+    // - object keys are sorted recursively to avoid false positives from key order
+    // - arrays retain their order
+    // - undefined is converted to a string placeholder so it is not dropped
+    let normaliseForCompare = (value) =>
+      Array.isArray(value) === true
+        ? value.map((entry) => normaliseForCompare(entry))
+        : typeof value === 'object' && value !== null
+          ? Object.keys(value)
+              .sort()
+              .reduce((result, key) => {
+                result[key] = normaliseForCompare(value[key] === undefined ? 'undefined' : value[key]);
+                return result;
+              }, {})
+          : value === undefined
+            ? 'undefined'
+            : value;
+
+    // Check updated device data with our internally stored data and flag if changes exist.
+    // This compares the full merged view rather than only the incoming partial update.
     let changed = Object.keys(merged).some(
-      (key) => JSON.stringify(merged[key], replacer) !== JSON.stringify(this.deviceData[key], replacer),
+      (key) => JSON.stringify(normaliseForCompare(merged[key])) !== JSON.stringify(normaliseForCompare(this.deviceData[key])),
     );
 
     return { merged, changed };
