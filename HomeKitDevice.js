@@ -94,7 +94,7 @@ export default class HomeKitDevice extends EventEmitter {
   static PLATFORM_NAME = undefined; // Homebridge platform name
   static EVEHOME = undefined; // HomeKitHistory object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.04.15'; // Code version
+  static VERSION = '2026.04.21'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
@@ -1058,10 +1058,7 @@ export default class HomeKitDevice extends EventEmitter {
 
     // Description/Name
     if (typeof deviceData?.description === 'string' && deviceData.description !== '') {
-      let currentName = informationService.getCharacteristic(this.hap.Characteristic.Name)?.value;
-      if (currentName !== deviceData.description) {
-        informationService.updateCharacteristic(this.hap.Characteristic.Name, deviceData.description);
-      }
+      informationService.updateCharacteristic(this.hap.Characteristic.Name, deviceData.description);
       if (this.accessory !== undefined && typeof this.accessory === 'object' && this.accessory.displayName !== deviceData.description) {
         this.accessory.displayName = deviceData.description;
       }
@@ -1069,25 +1066,21 @@ export default class HomeKitDevice extends EventEmitter {
 
     // Manufacturer
     if (typeof deviceData?.manufacturer === 'string' && deviceData.manufacturer !== '') {
-      let currentManufacturer = informationService.getCharacteristic(this.hap.Characteristic.Manufacturer)?.value;
-      if (currentManufacturer !== deviceData.manufacturer) {
-        informationService.updateCharacteristic(this.hap.Characteristic.Manufacturer, deviceData.manufacturer);
-      }
+      informationService.updateCharacteristic(this.hap.Characteristic.Manufacturer, deviceData.manufacturer);
     }
 
     // Model
     if (typeof deviceData?.model === 'string' && deviceData.model !== '') {
-      let currentModel = informationService.getCharacteristic(this.hap.Characteristic.Model)?.value;
-      if (currentModel !== deviceData.model) {
-        informationService.updateCharacteristic(this.hap.Characteristic.Model, deviceData.model);
-      }
+      informationService.updateCharacteristic(this.hap.Characteristic.Model, deviceData.model);
     }
 
-    // SoftwareRevision
+    // Firmware Revision
     if (typeof deviceData?.softwareVersion === 'string' && deviceData.softwareVersion !== '') {
-      let currentSoftware = informationService.getCharacteristic(this.hap.Characteristic.SoftwareRevision)?.value;
-      if (currentSoftware !== deviceData.softwareVersion) {
-        informationService.updateCharacteristic(this.hap.Characteristic.SoftwareRevision, deviceData.softwareVersion);
+      informationService.updateCharacteristic(this.hap.Characteristic.FirmwareRevision, deviceData.softwareVersion);
+
+      // Remove SoftwareRevision if it exists
+      if (informationService.testCharacteristic(this.hap.Characteristic.SoftwareRevision) === true) {
+        informationService.removeCharacteristic(this.hap.Characteristic.SoftwareRevision);
       }
     }
 
