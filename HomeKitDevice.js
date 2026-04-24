@@ -94,7 +94,7 @@ export default class HomeKitDevice extends EventEmitter {
   static PLATFORM_NAME = undefined; // Homebridge platform name
   static EVEHOME = undefined; // HomeKitHistory object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.04.21'; // Code version
+  static VERSION = '2026.04.24'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
@@ -394,6 +394,11 @@ export default class HomeKitDevice extends EventEmitter {
   async message(type, message, ...args) {
     if (typeof type !== 'string' || type === '') {
       return;
+    }
+
+    if (message === undefined || message === null) {
+      // Normalise undefined or null message to empty object for easier handling in lifecycle hooks and listeners
+      message = {};
     }
 
     let result = { call: undefined, handler: undefined };
