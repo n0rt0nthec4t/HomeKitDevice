@@ -256,6 +256,7 @@ export default class HomeKitDevice extends EventEmitter {
     }
 
     this.postSetupDetail('Serial number "%s"', this.deviceData.serialNumber, LOG_LEVELS.DEBUG);
+    this.postSetupDetail('Software version "%s"', this.deviceData.softwareVersion, LOG_LEVELS.DEBUG);
 
     // Trigger registered handlers (onAdd + listeners)
     await this.message(HomeKitDevice.ADD);
