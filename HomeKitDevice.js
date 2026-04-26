@@ -94,7 +94,7 @@ export default class HomeKitDevice extends EventEmitter {
   static PLATFORM_NAME = undefined; // Homebridge platform name
   static EVEHOME = undefined; // HomeKitHistory object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.04.24'; // Code version
+  static VERSION = '2026.04.26'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
@@ -164,17 +164,26 @@ export default class HomeKitDevice extends EventEmitter {
       }
     }
 
+    // Validate the data passed in to the constructor to ensure we have the minimum required data to create a HomeKit accessory
+    if (this.#validDeviceData(deviceData, true) === false) {
+      throw new TypeError('Invalid device data supplied to HomeKitDevice');
+    }
+
+    // Make a clone of current data and store in this object
+    // Important that we don't have a 'linked' copy of the object data
+    this.deviceData = structuredClone(deviceData);
+
     // Generate UUID for this device instance
     // Will either be a random generated one or HAP generated one
     // HAP is based upon defined plugin name and devices serial number
-    this.#uuid = HomeKitDevice.generateUUID(HomeKitDevice.PLUGIN_NAME, api, deviceData.serialNumber);
+    this.#uuid = HomeKitDevice.generateUUID(HomeKitDevice.PLUGIN_NAME, api, this.deviceData.serialNumber);
 
     // Register this device instance in the static device registry
     HomeKitDevice.#deviceRegistry.set(this.#uuid, this);
 
     // See if we were passed in an existing accessory object or array of accessory objects
     // Mainly used to restore a Homebridge cached accessory
-    if (typeof accessory === 'object' && this.backend === HomeKitDevice.HOMEBRIDGE) {
+    if (typeof accessory === 'object' && accessory !== null && this.backend === HomeKitDevice.HOMEBRIDGE) {
       if (Array.isArray(accessory) === true) {
         this.accessory = accessory.find((accessory) => this.#uuid !== undefined && accessory?.UUID === this.#uuid);
       }
@@ -182,41 +191,22 @@ export default class HomeKitDevice extends EventEmitter {
         this.accessory = accessory;
       }
     }
-
-    // Make a clone of current data and store in this object
-    // Important that we done have a 'linked' copy of the object data
-    this.deviceData = structuredClone(deviceData);
   }
 
   // Class functions
   async add(hapAccessoryName, hapCategory, enableHistory = false) {
     if (
-      this.hap === undefined ||
-      typeof HomeKitDevice.PLUGIN_NAME !== 'string' ||
+      this.hap === undefined || // HAP API not initialised
+      typeof HomeKitDevice.PLUGIN_NAME !== 'string' || // Plugin name must be defined
       HomeKitDevice.PLUGIN_NAME === '' ||
-      typeof HomeKitDevice.PLATFORM_NAME !== 'string' ||
+      typeof HomeKitDevice.PLATFORM_NAME !== 'string' || // Platform name must be defined
       HomeKitDevice.PLATFORM_NAME === '' ||
-      typeof hapAccessoryName !== 'string' ||
-      hapAccessoryName === '' ||
-      typeof this.hap.Categories[hapCategory] === 'undefined' ||
-      typeof enableHistory !== 'boolean' ||
-      typeof this.deviceData !== 'object' ||
-      typeof this.deviceData?.serialNumber !== 'string' ||
-      this.deviceData.serialNumber === '' ||
-      typeof this.deviceData?.softwareVersion !== 'string' ||
-      this.deviceData.softwareVersion === '' ||
-      typeof this.deviceData?.description !== 'string' ||
-      this.deviceData.description === '' ||
-      typeof this.deviceData?.model !== 'string' ||
-      this.deviceData.model === '' ||
-      typeof this.deviceData?.manufacturer !== 'string' ||
-      this.deviceData.manufacturer === '' ||
-      (this.#platform === undefined &&
-        (typeof this.deviceData?.hkPairingCode !== 'string' ||
-          (HomeKitDevice.HK_PIN_3_2_3.test(this.deviceData.hkPairingCode) === false &&
-            HomeKitDevice.HK_PIN_4_4.test(this.deviceData.hkPairingCode) === false) ||
-          typeof this.deviceData?.hkUsername !== 'string' ||
-          HomeKitDevice.MAC_ADDR.test(this.deviceData.hkUsername) === false))
+      // HAP-NodeJS only: accessory name must be valid
+      (this.backend === HomeKitDevice.HAP_NODEJS && (typeof hapAccessoryName !== 'string' || hapAccessoryName === '')) ||
+      // HAP-NodeJS only: category must be valid
+      (this.backend === HomeKitDevice.HAP_NODEJS && typeof this.hap.Categories[hapCategory] === 'undefined') ||
+      typeof enableHistory !== 'boolean' || // History flag must be boolean
+      this.#validDeviceData(this.deviceData, true) === false // Device data failed validation (core + pairing if required)
     ) {
       return;
     }
@@ -239,7 +229,7 @@ export default class HomeKitDevice extends EventEmitter {
     }
 
     if (this.accessory === undefined && this.backend === HomeKitDevice.HAP_NODEJS) {
-      // Create HAP-NodeJS libray accessory
+      // Create HAP-NodeJS library accessory
       this.accessory = new this.hap.Accessory(hapAccessoryName, this.#uuid);
 
       this.accessory.username = this.deviceData.hkUsername;
@@ -318,7 +308,12 @@ export default class HomeKitDevice extends EventEmitter {
   }
 
   async update(deviceData, ...args) {
-    if (typeof deviceData !== 'object') {
+    if (
+      deviceData === null || // Must not be null
+      typeof deviceData !== 'object' || // Must be an object
+      deviceData.constructor !== Object || // Must be a plain JSON object
+      this.#validDeviceData(deviceData) === false // Partial validation
+    ) {
       return;
     }
 
@@ -329,10 +324,21 @@ export default class HomeKitDevice extends EventEmitter {
   async history(target, entry, options = {}) {
     if (
       typeof this.historyService !== 'object' ||
+      this.historyService === null ||
       typeof this.historyService.addHistory !== 'function' ||
+      // entry must be a plain JSON object
+      entry === null ||
       typeof entry !== 'object' ||
+      entry.constructor !== Object ||
+      // target must be a valid HomeKit service object
       typeof target !== 'object' ||
-      typeof target.UUID !== 'string'
+      target === null ||
+      typeof target.UUID !== 'string' ||
+      target.UUID === '' ||
+      // options must be a plain JSON object
+      options === null ||
+      typeof options !== 'object' ||
+      options.constructor !== Object
     ) {
       return;
     }
@@ -342,7 +348,11 @@ export default class HomeKitDevice extends EventEmitter {
   }
 
   async set(values, ...args) {
-    if (typeof values !== 'object' || values === null) {
+    if (
+      values === null || // Must not be null
+      typeof values !== 'object' || // Must be an object
+      values.constructor !== Object // Must be a plain JSON object
+    ) {
       return;
     }
 
@@ -577,7 +587,7 @@ export default class HomeKitDevice extends EventEmitter {
 
         // Update the internal data for the set values, as could take some time once we emit the event
         if (type === HomeKitDevice.SET) {
-          if (typeof message === 'object' && message !== null) {
+          if (message !== null && typeof message === 'object' && message.constructor === Object) {
             Object.entries(message).forEach(([key, value]) => {
               if (this.deviceData?.[key] !== undefined) {
                 this.deviceData[key] = value;
@@ -603,7 +613,7 @@ export default class HomeKitDevice extends EventEmitter {
         }
         handled = true;
       } else if (type === HomeKitDevice.UPDATE) {
-        if (typeof message === 'object' && message !== null) {
+        if (this.#validDeviceData(message) === true) {
           let { merged, changed } = this.#mergeDeviceData(message);
           this.#updateAccessoryInformation(merged);
 
@@ -622,11 +632,19 @@ export default class HomeKitDevice extends EventEmitter {
         let skipHistory = false;
 
         if (
+          this.historyService !== null &&
           typeof this.historyService === 'object' &&
           typeof this.historyService?.addHistory === 'function' &&
+          entry !== null &&
           typeof entry === 'object' &&
+          entry.constructor === Object &&
+          target !== null &&
           typeof target === 'object' &&
-          typeof target.UUID === 'string'
+          typeof target.UUID === 'string' &&
+          target.UUID !== '' &&
+          options !== null &&
+          typeof options === 'object' &&
+          options.constructor === Object
         ) {
           if (isNaN(entry?.time) === true) {
             entry.time = Math.floor(Date.now() / 1000);
@@ -718,14 +736,15 @@ export default class HomeKitDevice extends EventEmitter {
       return false;
     }
 
-    if (typeof options !== 'object' || options === null) {
+    if (options === null || typeof options !== 'object' || options.constructor !== Object) {
       options = {};
     }
 
     let delay = isNaN(options?.delay) === false && Number(options.delay) > 0 ? Number(options.delay) : 0;
     let interval = isNaN(options?.interval) === false && Number(options.interval) > 0 ? Number(options.interval) : 0;
     let reset = options?.reset === true;
-    let timerMessage = typeof options?.message === 'object' && options.message !== null ? options.message : {};
+    let timerMessage =
+      typeof options?.message === 'object' && options.message !== null && options.message.constructor === Object ? options.message : {};
 
     // Nothing to schedule
     if (delay === 0 && interval === 0) {
@@ -898,7 +917,9 @@ export default class HomeKitDevice extends EventEmitter {
       // Setup for EveHome history if enabled. The actual linkage will be done in .add() after returning from .onAdd()
       if (
         service !== undefined &&
+        eveOptions !== null &&
         typeof eveOptions === 'object' &&
+        eveOptions.constructor === Object &&
         this.deviceData?.eveHistory === true &&
         typeof this.historyService?.linkToEveHome === 'function'
       ) {
@@ -939,7 +960,7 @@ export default class HomeKitDevice extends EventEmitter {
       if (typeof onGet === 'function') {
         characteristic.onGet(onGet);
       }
-      if (typeof props === 'object' && typeof characteristic.setProps === 'function') {
+      if (props !== null && typeof props === 'object' && props.constructor === Object && typeof characteristic.setProps === 'function') {
         characteristic.setProps(props);
       }
 
@@ -1114,6 +1135,74 @@ export default class HomeKitDevice extends EventEmitter {
         this.message(HomeKitDevice.ONLINE);
       }
     }
+  }
+
+  #validDeviceData(deviceData = {}, strict = false) {
+    if (
+      deviceData === null || // Must not be null
+      typeof deviceData !== 'object' || // Must be an object
+      deviceData.constructor !== Object // Must be a plain JSON object
+    ) {
+      return false;
+    }
+
+    let keys = ['serialNumber', 'softwareVersion', 'description', 'model', 'manufacturer'];
+    let isFull = strict === true || keys.every((key) => typeof deviceData[key] !== 'undefined');
+
+    for (let key of keys) {
+      if (isFull === true) {
+        // Full validation: required fields must exist and be valid
+        if (typeof deviceData[key] !== 'string' || deviceData[key] === '') {
+          return false;
+        }
+      }
+
+      if (isFull === false && typeof deviceData[key] !== 'undefined') {
+        // Partial update: only validate fields that are present
+        if (typeof deviceData[key] !== 'string' || deviceData[key] === '') {
+          return false;
+        }
+      }
+    }
+
+    // Pairing validation (HAP-NodeJS only — no Homebridge platform present)
+    if (this.#platform === undefined) {
+      let hasPairing = typeof deviceData?.hkPairingCode !== 'undefined' || typeof deviceData?.hkUsername !== 'undefined';
+
+      if (isFull === true) {
+        // Full validation: pairing details must be present and valid
+        if (
+          typeof deviceData?.hkPairingCode !== 'string' ||
+          (HomeKitDevice.HK_PIN_3_2_3.test(deviceData.hkPairingCode) === false &&
+            HomeKitDevice.HK_PIN_4_4.test(deviceData.hkPairingCode) === false) ||
+          typeof deviceData?.hkUsername !== 'string' ||
+          HomeKitDevice.MAC_ADDR.test(deviceData.hkUsername) === false // Must be valid MAC address format (XX:XX:XX:XX:XX:XX)
+        ) {
+          return false;
+        }
+      }
+
+      if (isFull === false && hasPairing === true) {
+        // Partial update: only validate pairing fields if provided
+        if (
+          typeof deviceData?.hkPairingCode !== 'undefined' &&
+          (typeof deviceData.hkPairingCode !== 'string' ||
+            (HomeKitDevice.HK_PIN_3_2_3.test(deviceData.hkPairingCode) === false &&
+              HomeKitDevice.HK_PIN_4_4.test(deviceData.hkPairingCode) === false))
+        ) {
+          return false;
+        }
+
+        if (
+          typeof deviceData?.hkUsername !== 'undefined' &&
+          (typeof deviceData.hkUsername !== 'string' || HomeKitDevice.MAC_ADDR.test(deviceData.hkUsername) === false) // Validate MAC format if username is supplied
+        ) {
+          return false;
+        }
+      }
+    }
+
+    return true;
   }
 
   #clearTimers() {
