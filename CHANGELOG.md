@@ -2,6 +2,14 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2026/04/28
+
+### Changed
+- Centralised shutdown handling across **Homebridge** and **HAP-NodeJS** backends.
+- Added guarded, idempotent shutdown logic to ensure device cleanup is only executed once.
+- Replaced separate signal/platform handlers with a unified internal shutdown dispatcher.
+- Improved reliability of device teardown (timers, listeners) during process exit.
+
 ## 2026/03/20
 
 ### Changed

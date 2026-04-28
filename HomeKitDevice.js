@@ -16,17 +16,17 @@
 // - Provide internal timer management for device instances
 //
 // Lifecycle Hooks (optional in subclasses):
-// - onAdd(message, ...args)      -> called when HomeKitDevice.ADD is received
-// - onSet(message, ...args)      -> called when HomeKitDevice.SET is received
-// - onUpdate(deviceData, ...args)-> called when HomeKitDevice.UPDATE is received
-// - onRemove(message, ...args)   -> called when HomeKitDevice.REMOVE is received
-// - onShutdown(message, ...args) -> called when HomeKitDevice.SHUTDOWN is received
-// - onTimer(message, ...args)    -> called when HomeKitDevice.TIMER is received
-// - onGet(message, ...args)      -> called when HomeKitDevice.GET is received
+// - onAdd(message, ...args)       -> called when HomeKitDevice.ADD is received
+// - onSet(message, ...args)       -> called when HomeKitDevice.SET is received
+// - onUpdate(deviceData, ...args) -> called when HomeKitDevice.UPDATE is received
+// - onRemove(message, ...args)    -> called when HomeKitDevice.REMOVE is received
+// - onShutdown(message, ...args)  -> called when HomeKitDevice.SHUTDOWN is received
+// - onTimer(message, ...args)     -> called when HomeKitDevice.TIMER is received
+// - onGet(message, ...args)       -> called when HomeKitDevice.GET is received
 // - onHistory(target, entry, options)
-//                                 -> called after history processing
+//                                  -> called after history processing
 // - onMessage(type, message, ...args)
-//                                 -> fallback for unhandled or custom message types
+//                                  -> fallback for unhandled or custom message types
 //
 // Messaging Model:
 // - device.message(type, message, ...args)
@@ -44,6 +44,22 @@
 //     -> EveHome-compatible history logging and hook dispatch
 // - Static device registry
 //     -> enables global device message routing
+//
+// Architecture:
+// - Designed to be extended per device type (e.g. Camera, Thermostat, Valve)
+// - Operates as the abstraction layer between raw device data and HomeKit
+// - Can run under Homebridge or standalone HAP-NodeJS environments
+//
+// Example:
+//
+// class MyDevice extends HomeKitDevice {
+//   async onAdd() {
+//     let service = this.addHKService(this.hap.Service.Switch, this.deviceData.description);
+//   }
+// }
+//
+// let device = new MyDevice(undefined, hap, log, deviceData);
+// await device.add('My Device', hap.Categories.SWITCH);
 //
 // Notes:
 // - Designed for subclassing only
@@ -94,7 +110,7 @@ export default class HomeKitDevice extends EventEmitter {
   static PLATFORM_NAME = undefined; // Homebridge platform name
   static EVEHOME = undefined; // HomeKitHistory object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.04.26'; // Code version
+  static VERSION = '2026.04.28'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
@@ -131,36 +147,41 @@ export default class HomeKitDevice extends EventEmitter {
       this.#platform = api;
       this.backend = HomeKitDevice.HOMEBRIDGE;
       this.postSetupDetail('Homebridge backend', LOG_LEVELS.DEBUG);
-
-      // Register platform shutdown listener once (only for Homebridge backend)
-      // Track in #listeners using special namespace key to avoid conflicts with UUID-keyed listeners
-      if (HomeKitDevice.#listeners['__HOMEBRIDGE_SHUTDOWN__'] === undefined) {
-        HomeKitDevice.#listeners['__HOMEBRIDGE_SHUTDOWN__'] = true;
-
-        this.#platform.on('shutdown', async () => {
-          // Notify all of our registered devices of Homebridge shutdown
-          // This allows them to do any necessary cleanup (like stopping advertising, clearing timers, etc) before the process exits
-          await HomeKitDevice.#shutdownHandler();
-        });
-      }
     }
 
     if (typeof api?.hap === 'undefined' && isNaN(api?.version) === true && typeof api?.HAPLibraryVersion === 'function') {
       this.hap = api;
       this.backend = HomeKitDevice.HAP_NODEJS;
       this.postSetupDetail('HAP-NodeJS library', LOG_LEVELS.DEBUG);
+    }
 
-      // Register process exit listener once (only for HAP-NodeJS backend)
+    if (this.backend === HomeKitDevice.HAP_NODEJS || this.backend === HomeKitDevice.HOMEBRIDGE) {
       // Track in #listeners using special namespace key to avoid conflicts with UUID-keyed listeners
-      if (HomeKitDevice.#listeners['__PROCESS_EXIT__'] === undefined) {
-        HomeKitDevice.#listeners['__PROCESS_EXIT__'] = true;
+      if (HomeKitDevice.#listeners['__SHUTDOWN__'] === undefined) {
+        HomeKitDevice.#listeners['__SHUTDOWN__'] = false;
 
-        process.once('SIGTERM', async () => {
-          await HomeKitDevice.#shutdownHandler();
-        });
-        process.once('SIGINT', async () => {
-          await HomeKitDevice.#shutdownHandler();
-        });
+        let shutdown = async () => {
+          // Notify all registered devices of backend shutdown.
+          // This allows them to do any necessary cleanup (like stopping advertising, clearing timers, etc) before the process exits
+          if (HomeKitDevice.#listeners['__SHUTDOWN__'] === true) {
+            return;
+          }
+
+          HomeKitDevice.#listeners['__SHUTDOWN__'] = true;
+          await HomeKitDevice.shutdown();
+        };
+
+        if (this.backend === HomeKitDevice.HOMEBRIDGE) {
+          // Register platform shutdown listener for Homebridge backend
+          this.#platform.on('shutdown', shutdown);
+        }
+
+        if (this.backend === HomeKitDevice.HAP_NODEJS) {
+          // Register process signal listeners for HAP-NodeJS backend
+          ['SIGINT', 'SIGTERM'].forEach((signal) => {
+            process.on(signal, shutdown);
+          });
+        }
       }
     }
 
@@ -265,7 +286,7 @@ export default class HomeKitDevice extends EventEmitter {
       this.postSetupDetail('EveHome support as "%s"', this.historyService.EveHome.evetype);
     }
 
-    this?.log?.success?.('Setup %s %s as "%s"', this.deviceData.manufacturer, this.deviceData.model, this.deviceData.description);
+    this?.log?.success?.('Setup %s as "%s"', hapAccessoryName, this.deviceData.description);
     this.#postSetupDetails.forEach((entry) => {
       if (typeof entry === 'string') {
         this?.log?.[LOG_LEVELS.INFO]?.('  += %s', entry);
@@ -301,6 +322,18 @@ export default class HomeKitDevice extends EventEmitter {
   async remove() {
     // Trigger registered handlers (onRemove + listeners)
     await this.message(HomeKitDevice.REMOVE);
+  }
+
+  static async shutdown() {
+    // Notify all registered devices of process shutdown
+    for (let device of Array.from(HomeKitDevice.#deviceRegistry.values())) {
+      try {
+        await device.shutdown();
+        // eslint-disable-next-line no-unused-vars
+      } catch (error) {
+        // Empty
+      }
+    }
   }
 
   async shutdown() {
@@ -1211,18 +1244,6 @@ export default class HomeKitDevice extends EventEmitter {
     // Snapshot keys first to avoid mutating the Map while iterating
     for (let timerHandle of [...this.#timers.keys()]) {
       this.removeTimer(timerHandle);
-    }
-  }
-
-  static async #shutdownHandler() {
-    // Notify all of our registered devices of process exit
-    for (let device of Array.from(HomeKitDevice.#deviceRegistry.values())) {
-      try {
-        await device.shutdown();
-        // eslint-disable-next-line no-unused-vars
-      } catch (error) {
-        // Empty
-      }
     }
   }
 }
