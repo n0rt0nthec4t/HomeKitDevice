@@ -2,6 +2,37 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2026/05/05
+
+### Changed
+- Refined shutdown handling:
+  - Added internal guard flags to prevent duplicate shutdown execution
+  - Ensures consistent cleanup across Homebridge and HAP-NodeJS backends
+  - Retains existing `shutdown()` API without introducing additional helper methods
+
+- Improved timer execution safety:
+  - Prevent overlapping timer execution using internal `running` guard
+  - Ensures one-shot timers are only removed after callback/message completion
+  - Prevents race conditions between `removeTimer()` and in-flight executions
+
+- Enhanced history change detection:
+  - Introduced normalisation of object values before comparison
+  - Prevents false-positive history entries due to key ordering differences
+
+- Scoped message payload normalisation:
+  - Only lifecycle messages (`ADD`, `UPDATE`, `REMOVE`, `SET`) auto-normalise to `{}` when undefined/null
+  - Prevents unintended mutation of custom or non-lifecycle message payloads
+
+### Fixed
+- Fixed potential timer race condition where removal could occur before async execution completed
+- Fixed history comparison inconsistencies with nested object values
+- Fixed minor internal message handling edge cases during lifecycle dispatch
+
+### Cleaned
+- Removed dead/unused inline variables and minor structural inconsistencies
+- Standardised inline validation patterns across timer configuration
+- Minor internal refactoring for consistency with project coding style
+
 ## 2026/04/28
 
 ### Changed

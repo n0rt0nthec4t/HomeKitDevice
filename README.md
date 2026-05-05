@@ -151,6 +151,23 @@ All active timers and internal resources are automatically released during shutd
 > `.REMOVE` permanently unregisters the accessory from the platform.  
 > `.SHUTDOWN` is used during controlled runtime shutdown and does not imply device removal.
 
+### `update(deviceData, ...args)`
+
+Applies a partial or full update to the device’s internal state.
+
+- Merges incoming data with existing `deviceData`
+- Performs validation on supplied fields
+- Triggers `.onUpdate(deviceData)` only if changes are detected  
+  (or when `{ force: true }` is passed)
+- Automatically updates HomeKit accessory information characteristics
+
+```js
+await this.update({
+  description: 'New Name',
+  online: true,
+});
+```
+
 ---
 
 ## Messaging
@@ -162,6 +179,27 @@ HomeKitDevice.message(uuid, HomeKitDevice.SET, value);
 ```
 
 This routes to the device’s `onMessage(type, message)` handler.
+
+> **Important:**  
+> The `message` payload is not guaranteed to be an object.
+>
+> - Lifecycle events (`ADD`, `UPDATE`, `SET`, `REMOVE`) will normalise `message` to an object.
+> - Other messages (e.g. `ONLINE`, `OFFLINE`, custom events) may pass `undefined`, primitives, or structured objects.
+>
+> Handlers should not assume `message` is always an object:
+>
+> ```js
+> async onMessage(type, message) {
+>   if (type === HomeKitDevice.ONLINE) {
+>     // message may be undefined
+>     return;
+>   }
+>
+>   if (type === SomeCustomEvent && typeof message === 'object' && message !== null) {
+>     // safe to use message fields
+>   }
+> }
+> ```
 
 ---
 
@@ -279,11 +317,13 @@ These constants are used internally for structured messaging and lifecycle dispa
 | `HomeKitDevice.SET`       | Sent to apply new values (`onSet`)                               |
 | `HomeKitDevice.GET`       | Sent to query device state (`onGet`)                             |
 | `HomeKitDevice.HISTORY`   | Sent when a history entry is logged (`onHistory`)                |
+| `HomeKitDevice.SHUTDOWN`  | Sent during controlled shutdown (`onShutdown`)                   |
+| `HomeKitDevice.TIMER`     | Sent when an internal timer fires (`onTimer`)                    |
+| `HomeKitDevice.ONLINE`    | Sent when device transitions to online state                     |
+| `HomeKitDevice.OFFLINE`   | Sent when device transitions to offline state                    |
 | `HomeKitDevice.HK_PIN_3_2_3` | RegExp for PIN format `xxx-xx-xxx`                            |
 | `HomeKitDevice.HK_PIN_4_4`   | RegExp for PIN format `xxxx-xxxx`                             |
 | `HomeKitDevice.MAC_ADDR`     | RegExp for HomeKit username format `XX:XX:XX:XX:XX:XX`        |
-| `HomeKitDevice.SHUTDOWN`  | Sent during controlled shutdown (`onShutdown`) |
-| `HomeKitDevice.TIMER`     | Sent when an internal timer fires (`onTimer`) |
 
 ---
 
@@ -292,18 +332,5 @@ These constants are used internally for structured messaging and lifecycle dispa
 Each subclass may define a static `VERSION` string for visibility in logs:
 
 ```js
-static VERSION = '2025.06.18';
+static VERSION = '2026.05.05';
 ```
-
----
-
-## License
-
-This project is licensed under the Apache License, Version 2.0.  
-You may obtain a copy of the License at [http://www.apache.org/licenses/LICENSE-2.0](http://www.apache.org/licenses/LICENSE-2.0)
-
-Unless required by applicable law or agreed to in writing, software  
-distributed under the License is distributed on an "AS IS" BASIS,  
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  
-See the License for the specific language governing permissions and  
-limitations under the License.

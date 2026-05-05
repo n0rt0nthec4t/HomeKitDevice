@@ -100,7 +100,7 @@ export default class HomeKitDevice extends EventEmitter {
   static ONLINE = 'HomeKitDevice._online';
   static OFFLINE = 'HomeKitDevice._offline';
 
-  // HomeKit pin format and MAC address regex's
+  // HomeKit pin format and MAC address regex patterns
   static HK_PIN_3_2_3 = /^\d{3}-\d{2}-\d{3}$/;
   static HK_PIN_4_4 = /^\d{4}-\d{4}$/;
   static MAC_ADDR = /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/;
@@ -110,7 +110,7 @@ export default class HomeKitDevice extends EventEmitter {
   static PLATFORM_NAME = undefined; // Homebridge platform name
   static EVEHOME = undefined; // HomeKitHistory object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.04.28'; // Code version
+  static VERSION = '2026.05.05'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
@@ -119,6 +119,8 @@ export default class HomeKitDevice extends EventEmitter {
   // Global internal device and listener registry
   static #listeners = {};
   static #deviceRegistry = new Map();
+  static #shutdownRegistered = false;
+  static #shutdownFired = false;
 
   deviceData = {}; // The devices data we store
   historyService = undefined; // HomeKit history service
@@ -156,28 +158,25 @@ export default class HomeKitDevice extends EventEmitter {
     }
 
     if (this.backend === HomeKitDevice.HAP_NODEJS || this.backend === HomeKitDevice.HOMEBRIDGE) {
-      // Track in #listeners using special namespace key to avoid conflicts with UUID-keyed listeners
-      if (HomeKitDevice.#listeners['__SHUTDOWN__'] === undefined) {
-        HomeKitDevice.#listeners['__SHUTDOWN__'] = false;
+      if (HomeKitDevice.#shutdownRegistered === false) {
+        HomeKitDevice.#shutdownRegistered = true;
 
         let shutdown = async () => {
           // Notify all registered devices of backend shutdown.
-          // This allows them to do any necessary cleanup (like stopping advertising, clearing timers, etc) before the process exits
-          if (HomeKitDevice.#listeners['__SHUTDOWN__'] === true) {
+          // This allows them to do any necessary cleanup before the process exits
+          if (HomeKitDevice.#shutdownFired === true) {
             return;
           }
 
-          HomeKitDevice.#listeners['__SHUTDOWN__'] = true;
+          HomeKitDevice.#shutdownFired = true;
           await HomeKitDevice.shutdown();
         };
 
         if (this.backend === HomeKitDevice.HOMEBRIDGE) {
-          // Register platform shutdown listener for Homebridge backend
           this.#platform.on('shutdown', shutdown);
         }
 
         if (this.backend === HomeKitDevice.HAP_NODEJS) {
-          // Register process signal listeners for HAP-NodeJS backend
           ['SIGINT', 'SIGTERM'].forEach((signal) => {
             process.on(signal, shutdown);
           });
@@ -206,7 +205,7 @@ export default class HomeKitDevice extends EventEmitter {
     // Mainly used to restore a Homebridge cached accessory
     if (typeof accessory === 'object' && accessory !== null && this.backend === HomeKitDevice.HOMEBRIDGE) {
       if (Array.isArray(accessory) === true) {
-        this.accessory = accessory.find((accessory) => this.#uuid !== undefined && accessory?.UUID === this.#uuid);
+        this.accessory = accessory.find((accessory) => accessory?.UUID === this.#uuid);
       }
       if (Array.isArray(accessory) === false && accessory?.UUID === this.#uuid) {
         this.accessory = accessory;
@@ -325,7 +324,8 @@ export default class HomeKitDevice extends EventEmitter {
   }
 
   static async shutdown() {
-    // Notify all registered devices of process shutdown
+    // Notify all registered devices of process shutdown.
+    // Calls the instance shutdown() method on each registered device.
     for (let device of Array.from(HomeKitDevice.#deviceRegistry.values())) {
       try {
         await device.shutdown();
@@ -432,7 +432,7 @@ export default class HomeKitDevice extends EventEmitter {
     }
 
     // Handle message delivery
-    return await this.#deviceRegistry.get(uuid)?.message?.(type, message, ...args);
+    return this.#deviceRegistry.get(uuid)?.message?.(type, message, ...args);
   }
 
   async message(type, message, ...args) {
@@ -440,8 +440,11 @@ export default class HomeKitDevice extends EventEmitter {
       return;
     }
 
-    if (message === undefined || message === null) {
-      // Normalise undefined or null message to empty object for easier handling in lifecycle hooks and listeners
+    if (
+      (message === undefined || message === null) &&
+      (type === HomeKitDevice.ADD || type === HomeKitDevice.UPDATE || type === HomeKitDevice.REMOVE || type === HomeKitDevice.SET)
+    ) {
+      // Normalise undefined or null message to empty object only for lifecycle types that expect object payloads
       message = {};
     }
 
@@ -542,7 +545,7 @@ export default class HomeKitDevice extends EventEmitter {
       };
 
       // First up, we want to take a "snapshot" of services and characteristics on this accessory
-      // This will be used after all message calling to see if any changes have occured on the accessory
+      // This will be used after all message calling to see if any changes have occurred on the accessory
       // And if so, and running under Homebridge, we'll notify it of the changes
       let originalServices = snapshotAccessoryStructure(this.accessory);
 
@@ -680,7 +683,7 @@ export default class HomeKitDevice extends EventEmitter {
           typeof options === 'object' &&
           options.constructor === Object
         ) {
-          if (isNaN(entry?.time) === true) {
+          if (Number.isFinite(Number(entry?.time)) === false) {
             entry.time = Math.floor(Date.now() / 1000);
           }
 
@@ -691,9 +694,12 @@ export default class HomeKitDevice extends EventEmitter {
                 if (key === 'time') {
                   return false;
                 }
-                let v = entry[key];
-                let lv = last[key];
-                return typeof v === 'object' ? JSON.stringify(v) !== JSON.stringify(lv) : v !== lv;
+                let value = entry[key];
+                let lastValue = last[key];
+                return value !== null && typeof value === 'object'
+                  ? JSON.stringify(HomeKitDevice.#normaliseForCompare(value)) !==
+                      JSON.stringify(HomeKitDevice.#normaliseForCompare(lastValue))
+                  : value !== lastValue;
               });
               if (changed === false) {
                 skipHistory = true;
@@ -702,7 +708,11 @@ export default class HomeKitDevice extends EventEmitter {
           }
 
           if (skipHistory === false) {
-            this.historyService.addHistory(target, entry, isNaN(options?.timegap) === false ? options.timegap : undefined);
+            this.historyService.addHistory(
+              target,
+              entry,
+              Number.isFinite(Number(options?.timegap)) === true ? Number(options.timegap) : undefined,
+            );
           }
         }
 
@@ -723,12 +733,12 @@ export default class HomeKitDevice extends EventEmitter {
       }
 
       // Call generic handler if present and we haven't handled the message yet
-      if (handled === false) {
+      if (handled === false && typeof this?.onMessage === 'function') {
         result.call = await callLifecycleHook('onMessage', type, message, ...args);
         handled = true;
       }
 
-      // Lets see whats changed (if anything) on the accessory
+      // Let's see what's changed (if anything) on the accessory
       let newServices = snapshotAccessoryStructure(this.accessory);
       if (
         JSON.stringify(originalServices) !== JSON.stringify(newServices) &&
@@ -736,7 +746,7 @@ export default class HomeKitDevice extends EventEmitter {
         typeof this.#platform?.updatePlatformAccessories === 'function'
       ) {
         // We have changes detected for our accessory (services and/or characteristics)
-        // Notify Homebridge if thats our "backend" system
+        // Notify Homebridge if that's our "backend" system
         this.#platform.updatePlatformAccessories([this.accessory]);
       }
 
@@ -774,8 +784,8 @@ export default class HomeKitDevice extends EventEmitter {
       options = {};
     }
 
-    let delay = isNaN(options?.delay) === false && Number(options.delay) > 0 ? Number(options.delay) : 0;
-    let interval = isNaN(options?.interval) === false && Number(options.interval) > 0 ? Number(options.interval) : 0;
+    let delay = Number.isFinite(Number(options?.delay)) && Number(options.delay) > 0 ? Number(options.delay) : 0;
+    let interval = Number.isFinite(Number(options?.interval)) && Number(options.interval) > 0 ? Number(options.interval) : 0;
     let reset = options?.reset === true;
     let timerMessage =
       typeof options?.message === 'object' && options.message !== null && options.message.constructor === Object ? options.message : {};
@@ -807,7 +817,7 @@ export default class HomeKitDevice extends EventEmitter {
       cancelled: false,
     };
 
-    let fire = () => {
+    let fire = (removeAfterRun = false) => {
       // Prevent overlapping timer executions and ignore cancelled timers
       if (entry.running === true || entry.cancelled === true) {
         return;
@@ -815,49 +825,35 @@ export default class HomeKitDevice extends EventEmitter {
 
       entry.running = true;
 
-      // Direct callback takes precedence; message dispatch only if no callback provided
-      // Callback/message errors are silently trapped to prevent timer chain failures
-      if (typeof entry.callback === 'function') {
-        Promise.resolve(entry.callback(timerHandle, entry.message))
-          .catch(() => {
-            // Empty
-          })
-          .finally(() => {
-            if (entry.cancelled === true) {
-              // Don't update state if timer was cancelled while we were executing the callback or message handler
-              return;
-            }
-
-            entry.running = false;
-          });
-        return;
-      }
-
-      // Otherwise, dispatch via message system
       Promise.resolve(
-        this.message(HomeKitDevice.TIMER, {
-          timer: timerHandle,
-          ...entry.message,
-        }),
+        typeof entry.callback === 'function'
+          ? entry.callback(timerHandle, entry.message)
+          : this.message(HomeKitDevice.TIMER, {
+              timer: timerHandle,
+              ...entry.message,
+            }),
       )
         .catch(() => {
           // Empty
         })
         .finally(() => {
           if (entry.cancelled === true) {
-            // Don't update state if timer was cancelled while we were executing the callback or message handler
             return;
           }
 
           entry.running = false;
+
+          if (removeAfterRun === true) {
+            this.removeTimer(timerHandle);
+          }
         });
     };
 
     // delay only => fire once
     if (delay > 0 && interval === 0) {
       entry.timeout = setTimeout(() => {
-        fire();
-        this.removeTimer(timerHandle);
+        entry.timeout = undefined;
+        fire(true);
       }, delay);
 
       this.#timers.set(timerHandle, entry);
@@ -953,9 +949,7 @@ export default class HomeKitDevice extends EventEmitter {
         service !== undefined &&
         eveOptions !== null &&
         typeof eveOptions === 'object' &&
-        eveOptions.constructor === Object &&
-        this.deviceData?.eveHistory === true &&
-        typeof this.historyService?.linkToEveHome === 'function'
+        eveOptions.constructor === Object
       ) {
         service[HomeKitDevice?.EVEHOME?.EVE_OPTIONS] = eveOptions;
       }
@@ -1067,6 +1061,25 @@ export default class HomeKitDevice extends EventEmitter {
     return this.#uuid;
   }
 
+  static #normaliseForCompare(value) {
+    // Normalise values before comparison so JSON.stringify is stable:
+    // - object keys are sorted recursively to avoid false positives from key order
+    // - arrays retain their order
+    // - undefined is converted to a string placeholder so it is not dropped
+    return Array.isArray(value) === true
+      ? value.map((entry) => HomeKitDevice.#normaliseForCompare(entry))
+      : typeof value === 'object' && value !== null
+        ? Object.keys(value)
+            .sort()
+            .reduce((result, key) => {
+              result[key] = HomeKitDevice.#normaliseForCompare(value[key] === undefined ? 'undefined' : value[key]);
+              return result;
+            }, {})
+        : value === undefined
+          ? 'undefined'
+          : value;
+  }
+
   #mergeDeviceData(deviceDataUpdates = {}) {
     let merged = { ...deviceDataUpdates };
 
@@ -1078,28 +1091,12 @@ export default class HomeKitDevice extends EventEmitter {
       }
     });
 
-    // Normalise values before comparison so JSON.stringify is stable:
-    // - object keys are sorted recursively to avoid false positives from key order
-    // - arrays retain their order
-    // - undefined is converted to a string placeholder so it is not dropped
-    let normaliseForCompare = (value) =>
-      Array.isArray(value) === true
-        ? value.map((entry) => normaliseForCompare(entry))
-        : typeof value === 'object' && value !== null
-          ? Object.keys(value)
-              .sort()
-              .reduce((result, key) => {
-                result[key] = normaliseForCompare(value[key] === undefined ? 'undefined' : value[key]);
-                return result;
-              }, {})
-          : value === undefined
-            ? 'undefined'
-            : value;
-
     // Check updated device data with our internally stored data and flag if changes exist.
     // This compares the full merged view rather than only the incoming partial update.
     let changed = Object.keys(merged).some(
-      (key) => JSON.stringify(normaliseForCompare(merged[key])) !== JSON.stringify(normaliseForCompare(this.deviceData[key])),
+      (key) =>
+        JSON.stringify(HomeKitDevice.#normaliseForCompare(merged[key])) !==
+        JSON.stringify(HomeKitDevice.#normaliseForCompare(this.deviceData[key])),
     );
 
     return { merged, changed };
