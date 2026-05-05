@@ -945,12 +945,7 @@ export default class HomeKitDevice extends EventEmitter {
       }
 
       // Setup for EveHome history if enabled. The actual linkage will be done in .add() after returning from .onAdd()
-      if (
-        service !== undefined &&
-        eveOptions !== null &&
-        typeof eveOptions === 'object' &&
-        eveOptions.constructor === Object
-      ) {
+      if (service !== undefined && eveOptions !== null && typeof eveOptions === 'object' && eveOptions.constructor === Object) {
         service[HomeKitDevice?.EVEHOME?.EVE_OPTIONS] = eveOptions;
       }
     }
