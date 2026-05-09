@@ -2,6 +2,12 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2026/05/09
+
+### Changed
+- Changed unhandled internal message logging from warning to debug to reduce noise for optional message notifications
+- Awaited online/offline message dispatch during device update processing so handlers complete in a deterministic order
+
 ## 2026/05/05
 
 ### Changed

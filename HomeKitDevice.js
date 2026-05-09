@@ -110,7 +110,7 @@ export default class HomeKitDevice extends EventEmitter {
   static PLATFORM_NAME = undefined; // Homebridge platform name
   static EVEHOME = undefined; // HomeKitHistory object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.05.05'; // Code version
+  static VERSION = '2026.05.09'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
@@ -652,7 +652,7 @@ export default class HomeKitDevice extends EventEmitter {
       } else if (type === HomeKitDevice.UPDATE) {
         if (this.#validDeviceData(message) === true) {
           let { merged, changed } = this.#mergeDeviceData(message);
-          this.#updateAccessoryInformation(merged);
+          await this.#updateAccessoryInformation(merged);
 
           if (changed === true || (typeof args?.[0] === 'object' && args?.[0]?.force === true)) {
             // Call the onUpdate method and after any static handler registered via HomeKitDevice.message(uuid, type, handler)
@@ -752,7 +752,7 @@ export default class HomeKitDevice extends EventEmitter {
 
       // No handler at all — not even onMessage()
       if (handled === false && (Array.isArray(handler) === false || handler.length === 0) && typeof this?.[methodName] !== 'function') {
-        this?.log?.warn?.('Unhandled message type "%s" for device "%s"', type, this.deviceData.description);
+        this?.log?.debug?.('Unhandled message type "%s" for device "%s"', type, this.deviceData.description);
       }
 
       if (typeof result.call === 'object' || typeof result.handler === 'object') {
@@ -1097,7 +1097,7 @@ export default class HomeKitDevice extends EventEmitter {
     return { merged, changed };
   }
 
-  #updateAccessoryInformation(deviceData) {
+  async #updateAccessoryInformation(deviceData) {
     // Always update accessory information if we have changed data
     let informationService = this.accessory?.getService?.(this.hap.Service.AccessoryInformation);
     if (informationService === undefined) {
@@ -1153,12 +1153,12 @@ export default class HomeKitDevice extends EventEmitter {
       // Device online status has changed. Log and send message to trigger any handlers for this change
       if (deviceData.online === false) {
         this?.log?.warn?.('Device "%s" is offline', deviceData.description);
-        this.message(HomeKitDevice.OFFLINE);
+        await this.message(HomeKitDevice.OFFLINE);
       }
 
       if (deviceData.online === true) {
         this?.log?.success?.('Device "%s" is online', deviceData.description);
-        this.message(HomeKitDevice.ONLINE);
+        await this.message(HomeKitDevice.ONLINE);
       }
     }
   }
