@@ -663,8 +663,14 @@ export default class HomeKitDevice extends EventEmitter {
         }
         handled = true;
       } else if (type === HomeKitDevice.UPDATE) {
-        if (this.#validDeviceData(message) === true) {
+        if (message !== null && typeof message === 'object' && message.constructor === Object) {
           let { merged, changed } = this.#mergeDeviceData(message);
+
+          if (this.#validDeviceData(merged, true) !== true) {
+            handled = true;
+            return;
+          }
+
           await this.#updateAccessoryInformation(merged);
 
           if (changed === true || (typeof args?.[0] === 'object' && args?.[0]?.force === true)) {
