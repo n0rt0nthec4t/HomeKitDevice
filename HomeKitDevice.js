@@ -36,7 +36,7 @@
 // - Internal lifecycle events and custom interactions use the same message system
 //
 // Key Features:
-// - addHKService() / addHKCharacteristic()
+// - addService() / addCharacteristic()
 //     -> simplified HomeKit setup helpers
 // - addTimer() / removeTimer() / hasTimer()
 //     -> per-device timer management
@@ -54,11 +54,12 @@
 //
 // class MyDevice extends HomeKitDevice {
 //   async onAdd() {
-//     let service = this.addHKService(this.hap.Service.Switch, this.deviceData.description);
+//     let service = this.addService(this.hap.Service.Switch, this.deviceData.description);
 //   }
 // }
 //
-// let device = new MyDevice(undefined, hap, log, deviceData);
+// HomeKitDevice.LOGGER = log;
+// let device = new MyDevice(undefined, hap, deviceData);
 // await device.add('My Device', hap.Categories.SWITCH);
 //
 // Notes:
@@ -109,8 +110,9 @@ export default class HomeKitDevice extends EventEmitter {
   static PLUGIN_NAME = undefined; // Homebridge plugin name
   static PLATFORM_NAME = undefined; // Homebridge platform name
   static EVEHOME = undefined; // HomeKitHistory object
+  static LOGGER = undefined; // Logging object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.05.09'; // Code version
+  static VERSION = '2026.05.10'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
@@ -135,12 +137,18 @@ export default class HomeKitDevice extends EventEmitter {
   #postSetupDetails = []; // Use for extra output details once a device has been setup
   #timers = new Map(); // Internal timers for this device
 
-  constructor(accessory = undefined, api = undefined, log = undefined, deviceData = {}) {
+  constructor(accessory = undefined, api = undefined, deviceData = {}) {
     super(); // Setup event emitter for our class ONLY
 
-    // Validate the passed in logging object. We are expecting certain functions to be present
-    if (Object.values(LOG_LEVELS).every((fn) => typeof log?.[fn] === 'function')) {
-      this.log = log;
+    // Build logger from configured backend using only functions that exist.
+    let logger = {};
+    Object.values(LOG_LEVELS).forEach((level) => {
+      if (typeof HomeKitDevice.LOGGER?.[level] === 'function') {
+        logger[level] = HomeKitDevice.LOGGER[level].bind(HomeKitDevice.LOGGER);
+      }
+    });
+    if (Object.keys(logger).length !== 0) {
+      this.log = logger;
     }
 
     // Determine runtime environment (Homebridge vs HAP-NodeJS)
@@ -158,7 +166,7 @@ export default class HomeKitDevice extends EventEmitter {
     }
 
     if (this.backend === HomeKitDevice.HAP_NODEJS || this.backend === HomeKitDevice.HOMEBRIDGE) {
-      if (HomeKitDevice.#shutdownRegistered === false) {
+      if (HomeKitDevice.#shutdownRegistered !== true) {
         HomeKitDevice.#shutdownRegistered = true;
 
         let shutdown = async () => {
@@ -547,7 +555,12 @@ export default class HomeKitDevice extends EventEmitter {
       // First up, we want to take a "snapshot" of services and characteristics on this accessory
       // This will be used after all message calling to see if any changes have occurred on the accessory
       // And if so, and running under Homebridge, we'll notify it of the changes
-      let originalServices = snapshotAccessoryStructure(this.accessory);
+      let originalServices =
+        this.backend === HomeKitDevice.HOMEBRIDGE &&
+        this.accessory !== undefined &&
+        typeof this.#platform?.updatePlatformAccessories === 'function'
+          ? snapshotAccessoryStructure(this.accessory)
+          : [];
 
       // Handle built-in types with special behavior
       if (type === HomeKitDevice.ADD || type === HomeKitDevice.REMOVE || type === HomeKitDevice.SET) {
@@ -738,16 +751,18 @@ export default class HomeKitDevice extends EventEmitter {
         handled = true;
       }
 
-      // Let's see what's changed (if anything) on the accessory
-      let newServices = snapshotAccessoryStructure(this.accessory);
       if (
-        JSON.stringify(originalServices) !== JSON.stringify(newServices) &&
+        this.backend === HomeKitDevice.HOMEBRIDGE &&
         this.accessory !== undefined &&
         typeof this.#platform?.updatePlatformAccessories === 'function'
       ) {
-        // We have changes detected for our accessory (services and/or characteristics)
-        // Notify Homebridge if that's our "backend" system
-        this.#platform.updatePlatformAccessories([this.accessory]);
+        // Let's see what's changed (if anything) on the accessory
+        let newServices = snapshotAccessoryStructure(this.accessory);
+        if (JSON.stringify(originalServices) !== JSON.stringify(newServices)) {
+          // We have changes detected for our accessory (services and/or characteristics)
+          // Notify Homebridge if that's our "backend" system
+          this.#platform.updatePlatformAccessories([this.accessory]);
+        }
       }
 
       // No handler at all — not even onMessage()
@@ -925,23 +940,23 @@ export default class HomeKitDevice extends EventEmitter {
     return this.#timers.has(timerHandle) === true;
   }
 
-  addHKService(hkServiceType, name = '', subType = undefined, eveOptions = undefined) {
+  addService(serviceType, name = '', subType = undefined, eveOptions = undefined) {
     let service = undefined;
 
     if (
-      hkServiceType !== undefined &&
+      serviceType !== undefined &&
       typeof this?.accessory?.getService === 'function' &&
       typeof this?.accessory?.getServiceById === 'function' &&
       typeof this?.accessory?.addService === 'function'
     ) {
       if (subType !== undefined) {
-        service = this.accessory.getServiceById(hkServiceType, subType);
+        service = this.accessory.getServiceById(serviceType, subType);
       } else {
-        service = this.accessory.getService(hkServiceType);
+        service = this.accessory.getService(serviceType);
       }
 
       if (service === undefined) {
-        service = this.accessory.addService(hkServiceType, name, subType);
+        service = this.accessory.addService(serviceType, name, subType);
       }
 
       // Setup for EveHome history if enabled. The actual linkage will be done in .add() after returning from .onAdd()
@@ -953,28 +968,62 @@ export default class HomeKitDevice extends EventEmitter {
     return service;
   }
 
-  addHKCharacteristic(hkService, hkCharacteristicType, { props, onSet, onGet, initialValue } = {}) {
+  removeService(serviceOrType, subType = undefined) {
+    let service = undefined;
+    let isServiceInstance = typeof this?.hap?.Service === 'function' && serviceOrType instanceof this.hap.Service;
+
+    // Accessory must support service removal.
+    if (typeof this?.accessory?.removeService !== 'function') {
+      return false;
+    }
+
+    // Accept an existing service instance directly.
+    if (isServiceInstance === true) {
+      service = serviceOrType;
+    } else if (
+      serviceOrType !== undefined &&
+      typeof this?.accessory?.getService === 'function' &&
+      typeof this?.accessory?.getServiceById === 'function'
+    ) {
+      // Or resolve the service by type, optionally with a subtype.
+      if (subType !== undefined) {
+        service = this.accessory.getServiceById(serviceOrType, subType);
+      } else {
+        service = this.accessory.getService(serviceOrType);
+      }
+    }
+
+    // Nothing to remove.
+    if (service === undefined) {
+      return false;
+    }
+
+    this.accessory.removeService(service);
+    return true;
+  }
+
+  addCharacteristic(service, characteristicType, { props, onSet, onGet, initialValue } = {}) {
     let characteristic = undefined;
 
     if (
-      hkCharacteristicType !== undefined &&
-      typeof hkService?.getCharacteristic === 'function' &&
-      typeof hkService?.testCharacteristic === 'function' &&
-      typeof hkService?.addCharacteristic === 'function' &&
-      typeof hkService?.addOptionalCharacteristic === 'function'
+      characteristicType !== undefined &&
+      typeof service?.getCharacteristic === 'function' &&
+      typeof service?.testCharacteristic === 'function' &&
+      typeof service?.addCharacteristic === 'function' &&
+      typeof service?.addOptionalCharacteristic === 'function'
     ) {
-      if (hkService.testCharacteristic(hkCharacteristicType) === false) {
+      if (service.testCharacteristic(characteristicType) === false) {
         if (
-          Array.isArray(hkService?.optionalCharacteristics) === true &&
-          hkService.optionalCharacteristics.includes(hkCharacteristicType) === true
+          Array.isArray(service?.optionalCharacteristics) === true &&
+          service.optionalCharacteristics.includes(characteristicType) === true
         ) {
-          hkService.addOptionalCharacteristic(hkCharacteristicType);
+          service.addOptionalCharacteristic(characteristicType);
         } else {
-          hkService.addCharacteristic(hkCharacteristicType);
+          service.addCharacteristic(characteristicType);
         }
       }
 
-      characteristic = hkService.getCharacteristic(hkCharacteristicType);
+      characteristic = service.getCharacteristic(characteristicType);
 
       // Apply optional config
       if (typeof onSet === 'function') {
@@ -988,12 +1037,38 @@ export default class HomeKitDevice extends EventEmitter {
       }
 
       // Set initial value if provided
-      if (typeof initialValue !== 'undefined' && typeof hkService?.updateCharacteristic === 'function') {
-        hkService.updateCharacteristic(hkCharacteristicType, initialValue);
+      if (typeof initialValue !== 'undefined' && typeof service?.updateCharacteristic === 'function') {
+        service.updateCharacteristic(characteristicType, initialValue);
       }
     }
 
     return characteristic;
+  }
+
+  removeCharacteristic(service, characteristicOrType) {
+    let characteristic = undefined;
+    let isCharacteristicInstance =
+      typeof this?.hap?.Characteristic === 'function' && characteristicOrType instanceof this.hap.Characteristic;
+
+    if (typeof service?.removeCharacteristic !== 'function' || Array.isArray(service?.characteristics) !== true) {
+      return false;
+    }
+
+    // Accept an existing characteristic instance directly.
+    if (isCharacteristicInstance === true) {
+      characteristic = characteristicOrType;
+    } else if (characteristicOrType !== undefined) {
+      // Or resolve by type without calling getCharacteristic(), which can add optional characteristics.
+      characteristic = service.characteristics.find((entry) => entry?.UUID === characteristicOrType?.UUID);
+    }
+
+    // Nothing to remove.
+    if (characteristic === undefined) {
+      return false;
+    }
+
+    service.removeCharacteristic(characteristic);
+    return true;
   }
 
   postSetupDetail(message, ...args) {
@@ -1132,7 +1207,7 @@ export default class HomeKitDevice extends EventEmitter {
 
       // Remove SoftwareRevision if it exists
       if (informationService.testCharacteristic(this.hap.Characteristic.SoftwareRevision) === true) {
-        informationService.removeCharacteristic(this.hap.Characteristic.SoftwareRevision);
+        this.removeCharacteristic(informationService, this.hap.Characteristic.SoftwareRevision);
       }
     }
 

@@ -16,11 +16,26 @@ The `HomeKitDevice` module provides:
 - Static and instance `.message()` routing
 - Public wrapper methods (`add()`, `update()`, `remove()`, `shutdown()`, `get()`, `set()`, `history()`)
 - Internal named timer system (`addTimer`, `removeTimer`, `hasTimer`)
-- Safe characteristic binding (`addHKService`, `addHKCharacteristic`)
+- Safe service and characteristic helpers (`addService`, `removeService`, `addCharacteristic`, `removeCharacteristic`)
 - EveHome-compatible history support (`history`)
 - Internal device registry for UUID-based lookup and messaging
 
 Supports both Homebridge plugins and standalone HAP-NodeJS environments.
+
+---
+
+## Construction
+
+Device subclasses use the base constructor signature:
+
+```js
+HomeKitDevice.LOGGER = log;
+let device = new MyDevice(accessory, api, deviceData);
+```
+
+The optional `accessory` argument may be a Homebridge cached accessory or an array of cached accessories. The `api` argument is the Homebridge platform API or a HAP-NodeJS API object. The `deviceData` object must contain the required fields listed below.
+
+Set `HomeKitDevice.LOGGER` before creating devices to make `this.log` available inside subclasses. The logger is shared rather than passed through each subclass constructor. Any supported logging functions it provides are attached to `this.log`; missing functions are left undefined, so subclasses should call them with optional chaining.
 
 ---
 
@@ -34,8 +49,8 @@ export default class MyDevice extends HomeKitDevice {
   static VERSION = '2025.06.18';
 
   async onAdd() {
-    this.myService = this.addHKService(this.hap.Service.Switch);
-    this.addHKCharacteristic(this.myService, this.hap.Characteristic.On, {
+    this.myService = this.addService(this.hap.Service.Switch);
+    this.addCharacteristic(this.myService, this.hap.Characteristic.On, {
       onSet: (value) => this.setSwitch(value),
       onGet: () => this.getSwitch(),
       props: { minStep: 1 },
@@ -101,14 +116,21 @@ Required in addition to the above:
 
 ## Public Methods
 
-### `addHKService(service)`
+### `addService(service, name?, subtype?, eveOptions?)`
 
 Adds the specified HAP service to the accessory if not already present.  
 Returns the existing or newly created service instance.
 
 ---
 
-### `addHKCharacteristic(service, characteristic, options)`
+### `removeService(service, subtype?)`
+
+Removes the specified HAP service from the accessory if present.  
+Accepts either an existing service instance or a HAP service type with an optional subtype. Returns `true` when a service was removed.
+
+---
+
+### `addCharacteristic(service, characteristic, options)`
 
 Binds a characteristic to the given service with handler and property options.
 
@@ -118,6 +140,13 @@ Supported `options`:
 - `onGet()` – Called when HomeKit reads the characteristic value
 - `props` – Defines characteristic metadata (`minStep`, `unit`, `minValue`, `maxValue`, `validValues`, etc.)
 - `initialValue` – Value to initialize immediately
+
+---
+
+### `removeCharacteristic(service, characteristic)`
+
+Removes the specified characteristic from a HAP service if present.  
+Accepts either an existing characteristic instance or a HAP characteristic type. Returns `true` when a characteristic was removed.
 
 ---
 
@@ -150,6 +179,7 @@ All active timers and internal resources are automatically released during shutd
 > **Note:**  
 > `.REMOVE` permanently unregisters the accessory from the platform.  
 > `.SHUTDOWN` is used during controlled runtime shutdown and does not imply device removal.
+> Standalone HAP-NodeJS applications should still handle their own process exit policy after shutdown has completed, such as calling `process.exit()` from their signal handler when appropriate.
 
 ### `update(deviceData, ...args)`
 

@@ -5,6 +5,10 @@ All notable changes to the `HomeKitDevice` module are documented in this file.
 ## 2026/05/09
 
 ### Changed
+- Renamed HomeKit helper methods to `addService()`, `removeService()`, and `addCharacteristic()`
+- Added `removeService()` helper for removing HomeKit services by instance or service type
+- Added `removeCharacteristic()` helper for removing HomeKit characteristics by instance or characteristic type
+- Added static `HomeKitDevice.LOGGER` support so subclasses can use a shared logger without receiving it through the constructor
 - Changed unhandled internal message logging from warning to debug to reduce noise for optional message notifications
 - Awaited online/offline message dispatch during device update processing so handlers complete in a deterministic order
 
@@ -111,7 +115,7 @@ All notable changes to the `HomeKitDevice` module are documented in this file.
 ### Added
 - EveHome command handling is now routed via `.message()` using `HomeKitDevice.HISTORY.GET` and `.SET` message types.
 - Devices can now respond to Eve-specific requests by implementing `onMessage(type, message)` instead of defining `getcommand`/`setcommand` callbacks.
-- `addHKService()` accepts `eveOptions` object to defer Eve linkage until `.add()` completes.
+- `addService()` accepts `eveOptions` object to defer Eve linkage until `.add()` completes.
 
 ### Changed
 - `HomeKitDevice.HISTORY` replaces `HOMEKITHISTORY` as the standard reference for Eve-compatible history modules.
@@ -190,7 +194,7 @@ All notable changes to the `HomeKitDevice` module are documented in this file.
 - Added static constants: `HomeKitDevice.UPDATE`, `REMOVE`, `SET`, `GET`
 - Added utility method `makeValidHKName()` for sanitising HomeKit display names
 - Added `postSetupDetail()` for structured logging with optional log level and arguments
-- Added helper methods: `addHKService()` and `addHKCharacteristic()` for simplified service/characteristic setup
+- Added helper methods: `addService()` and `addCharacteristic()` for simplified service/characteristic setup
 
 ### Changed
 - Made `uuid` and `platform` private fields (`#uuid`, `#platform`) for encapsulation
