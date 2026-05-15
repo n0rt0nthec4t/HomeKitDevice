@@ -112,7 +112,7 @@ export default class HomeKitDevice extends EventEmitter {
   static EVEHOME = undefined; // HomeKitHistory object
   static LOGGER = undefined; // Logging object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.05.10'; // Code version
+  static VERSION = '2026.05.15'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
@@ -1123,11 +1123,11 @@ export default class HomeKitDevice extends EventEmitter {
 
   static makeValidHKName(name) {
     // Strip invalid characters to meet HomeKit naming requirements
-    // Ensure only letters or numbers are at the beginning AND/OR end of string
-    // Matches against uni-code characters
+    // Ensure only letters or numbers are at the beginning and end of the string
+    // Matches against Unicode characters
     return typeof name === 'string'
       ? name
-          .replace(/[^\p{L}\p{N}\p{Z}\u2019.,-]/gu, '')
+          .replace(/[^\p{L}\p{N}\p{Z}\u2019'&!._:;()\/,-]/gu, '')
           .replace(/^[^\p{L}\p{N}]*/gu, '')
           .replace(/[^\p{L}\p{N}]+$/gu, '')
       : name;
