@@ -2,6 +2,18 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2026/08/18
+
+### Changed
+
+- Updated `makeValidHKName()` to return `Unknown Device` when sanitisation leaves no valid HomeKit name
+
+### Fixed
+
+- Awaited standalone HAP-NodeJS accessory publication and unpublication so lifecycle completion and failures are handled deterministically
+- Prevented a cancelled or replaced delayed repeating timer from creating an orphaned interval after its first callback
+- Prevented history hooks from firing when a duplicate or invalid history entry was not submitted to storage
+
 ## 2026/05/09
 
 ### Changed

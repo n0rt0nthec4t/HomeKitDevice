@@ -112,7 +112,7 @@ export default class HomeKitDevice extends EventEmitter {
   static EVEHOME = undefined; // HomeKitHistory object
   static LOGGER = undefined; // Logging object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.05.26'; // Code version
+  static VERSION = '2026.08.18'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
@@ -313,7 +313,7 @@ export default class HomeKitDevice extends EventEmitter {
 
     // If using HAP-NodeJS library, publish accessory on local network
     if (this.accessory !== undefined && this.backend === HomeKitDevice.HAP_NODEJS) {
-      this.accessory.publish({
+      await this.accessory.publish({
         username: this.accessory.username,
         pincode: this.accessory.pincode,
         category: this.accessory.category,
@@ -623,7 +623,15 @@ export default class HomeKitDevice extends EventEmitter {
           }
 
           if (this.accessory !== undefined && this.#platform === undefined) {
-            this.accessory.unpublish();
+            try {
+              await this.accessory.unpublish();
+            } catch (error) {
+              this?.log?.warn?.(
+                'Failed to unpublish standalone accessory "%s": %s',
+                this.deviceData.description,
+                String(error?.stack || error),
+              );
+            }
           }
 
           this.deviceData = {};
@@ -727,17 +735,19 @@ export default class HomeKitDevice extends EventEmitter {
           }
 
           if (skipHistory === false) {
-            this.historyService.addHistory(
+            let historyResult = await this.historyService.addHistory(
               target,
               entry,
               Number.isFinite(Number(options?.timegap)) === true ? Number(options.timegap) : undefined,
             );
+
+            if (historyResult !== false) {
+              // Notify hooks only after the entry was accepted by the history service.
+              await callLifecycleHook('onHistory', target, entry, options);
+              await callLifecycleHook(['handler for HISTORY', handler], target, entry, options);
+            }
           }
         }
-
-        // Call the onHistory method and after any static handler registered via HomeKitDevice.message(uuid, type, handler)
-        await callLifecycleHook('onHistory', target, entry, options);
-        await callLifecycleHook(['handler for HISTORY', handler], target, entry, options);
 
         handled = true;
       }
@@ -893,8 +903,14 @@ export default class HomeKitDevice extends EventEmitter {
 
     // delay + interval => fire once after delay, then repeat
     entry.timeout = setTimeout(() => {
-      fire();
       entry.timeout = undefined;
+      fire();
+
+      // A synchronous first callback may remove or replace this timer. Do not
+      // create an interval that is no longer owned by the timer registry.
+      if (entry.cancelled === true || this.#timers.get(timerHandle) !== entry) {
+        return;
+      }
 
       entry.intervalHandle = setInterval(() => {
         fire();
@@ -1131,11 +1147,10 @@ export default class HomeKitDevice extends EventEmitter {
     // including U+2019 (curly apostrophe).
 
     return typeof name === 'string'
-      ? name
+      ? (name
           .replace(/[^\p{L}\p{N}\p{Zs}\u2019'&!._:;()\/,-]/gu, '')
-          .replace(/^[^\p{L}\p{N}]+/gu, '')
-          .replace(/[^\p{L}\p{N}]+$/gu, '')
-          .trim()
+          .replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '')
+          .trim() || 'Unknown Device')
       : name;
   }
 
