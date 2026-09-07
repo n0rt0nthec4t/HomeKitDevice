@@ -1,6 +1,6 @@
 # HomeKitDevice
 
-Base class for all HomeKit accessories using HAP-NodeJS or Homebridge.  
+Base class for accessories using standalone HAP-NodeJS or Homebridge with HAP and optional Matter.
 Provides internal device tracking, metadata validation, lifecycle management, message routing, and optional EveHome-compatible history logging.
 
 ---
@@ -20,7 +20,7 @@ The `HomeKitDevice` module provides:
 - EveHome-compatible history support (`history`)
 - Internal device registry for UUID-based lookup and messaging
 
-Supports both Homebridge plugins and standalone HAP-NodeJS environments.
+Supports Homebridge plugins using `api.hap`, optional Homebridge 2.x `api.matter`, and standalone HAP-NodeJS environments.
 
 ---
 
@@ -33,7 +33,9 @@ HomeKitDevice.LOGGER = log;
 let device = new MyDevice(accessory, api, deviceData);
 ```
 
-The optional `accessory` argument may be a Homebridge cached accessory or an array of cached accessories. The `api` argument is the Homebridge platform API or a HAP-NodeJS API object. The `deviceData` object must contain the required fields listed below.
+The optional `accessory` argument may be a Homebridge cached HAP accessory, a cached Matter accessory, or an array containing both. The `api` argument is the Homebridge platform API or a HAP-NodeJS API object. The `deviceData` object must contain the required fields listed below.
+
+Under Homebridge, `this.hap` always references `api.hap`. When Matter is enabled for the bridge, `this.matter` references `api.matter`; otherwise it is `undefined`. Standalone HAP-NodeJS instances never expose Matter.
 
 Set `HomeKitDevice.LOGGER` before creating devices to make `this.log` available inside subclasses. The logger is shared rather than passed through each subclass constructor. Any supported logging functions it provides are attached to `this.log`; missing functions are left undefined, so subclasses should call them with optional chaining.
 
@@ -111,6 +113,28 @@ Required in addition to the above:
 |----------------|-----------------------------------------------------|
 | `hkUsername`   | HomeKit MAC-style address (e.g. `11:22:33:44:55:66`) |
 | `hkPairingCode`| HomeKit setup code (e.g. `123-45-678`)               |
+
+---
+
+## Homebridge Matter
+
+Matter uses the existing lifecycle and message routing API; it does not add protocol-specific lifecycle hooks. A subclass can assign a valid Homebridge `MatterAccessory` object to `this.matterAccessory` during `onAdd()`. After `onAdd()` completes, `add()` registers that object through `api.matter.registerPlatformAccessories()`.
+
+Homebridge retains HAP as the default, including existing calls that omit all `add()` arguments. Pass `null` explicitly as the HAP accessory name to request a Matter-only device:
+
+```js
+await device.add(null); // Matter-only: onAdd() assigns this.matterAccessory
+```
+
+HAP `AccessoryInformation` and EveHome history setup run whenever `this.accessory` exists, covering both Homebridge HAP and standalone HAP-NodeJS. They are skipped only for Matter-only devices because a Matter accessory does not contain HAP services. During the normal `UPDATE` route, shared device information is synchronized to both representations: `description` becomes the Matter `displayName`, and manufacturer, model, serial number, and software version are mapped to their corresponding Matter metadata fields. Changed Matter metadata is persisted with one `this.matter.updatePlatformAccessories()` call.
+
+Matter command handlers should route device writes through the existing `set()` or `message(HomeKitDevice.SET, ...)` flow. Operational device state continues through `update()` and `onUpdate()`, where a subclass can call `this.matter.updateAccessoryState()` directly. Standalone HAP-NodeJS continues to require the HAP name and category.
+
+When `remove()` is called, whichever of `this.accessory` and `this.matterAccessory` exist are unregistered through their respective Homebridge APIs. Existing HAP-only subclasses require no changes.
+
+For combined exposure, a Matter registration failure is logged and the registered HAP representation remains available. A Matter-only call returns `undefined` when no valid Matter representation can be registered; it does not report a successful setup.
+
+The host Homebridge platform should pass objects restored by `configureAccessory()` and `configureMatterAccessory()` through the existing constructor `accessory` argument, either individually or in one combined array.
 
 ---
 

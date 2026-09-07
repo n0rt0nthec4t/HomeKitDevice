@@ -2,6 +2,32 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2026/09/08
+
+### Added
+
+- Added initial Homebridge 2.x Matter boundary through `this.matter` and `this.matterAccessory`
+- Added restoration of cached HAP and Matter representations through the existing constructor accessory argument
+- Added Matter registration and unregistration to the existing `ADD` and `REMOVE` lifecycle flow
+- Added tests covering combined Homebridge HAP/Matter operation and standalone HAP-NodeJS operation
+
+### Changed
+
+- Clarified that `backend` identifies the runtime: standalone HAP-NodeJS or Homebridge, with Homebridge optionally providing both HAP and Matter
+- Restructured `add()` into standalone HAP-NodeJS, Homebridge HAP, shared HAP metadata/history, and Homebridge Matter phases
+- Allowed Homebridge Matter-only devices to omit the HAP name/category without creating a HAP accessory or requiring `AccessoryInformation`
+- Synchronized shared name, manufacturer, model, serial number, and firmware metadata to Matter during the existing `UPDATE` route
+- Coalesced changed Matter metadata into one `updatePlatformAccessories()` call and retained retryable local values when that call fails
+- Preserved HAP as the default for existing Homebridge `add()` calls and made `add(null)` the explicit Matter-only form
+- Validated HAP information before registration, reported failed setup truthfully, and retained HAP when optional Matter registration fails
+- Included HAP information and display-name changes in Homebridge cache update detection
+- Registered shutdown handling once per runtime API source rather than only for the first backend encountered
+- Made accessory UUID generation deterministic across the Homebridge HAP/Matter aliases and direct HAP-NodeJS, failing closed when generation is invalid
+- Kept Matter registration state local to `add()` and cleared descriptors that fail registration
+- Derived HAP and Matter readiness from their representation objects instead of parallel setup flags
+- Simplified setup logging so the backend and registered HAP/Matter representations are each reported once
+- Kept the existing lifecycle hooks, message types, and helper method names unchanged
+
 ## 2026/08/18
 
 ### Changed
