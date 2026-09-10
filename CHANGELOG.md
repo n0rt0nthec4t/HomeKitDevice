@@ -2,6 +2,14 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2026/09/09
+
+### Changed
+
+- Required Homebridge's `api.isMatterEnabled()` to return true before exposing Matter or restoring cached Matter accessories
+- Replaced positional `add()` arguments with an options object containing `hapAccessoryName`, `hapCategory`, and `enableHistory`
+- Passed `hapCategory` to newly created Homebridge platform accessories
+
 ## 2026/09/08
 
 ### Added

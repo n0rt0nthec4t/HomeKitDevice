@@ -4,7 +4,7 @@
 
 `HomeKitDevice` is a shared base class for accessory implementations. It sits between application-owned device data and either the standalone HAP-NodeJS runtime or the Homebridge runtime, giving each device type a common lifecycle, message bus, accessory helper layer, timer system, and optional EveHome history integration. Homebridge may expose HAP, Matter, or both.
 
-**Version:** 2026.09.08
+**Version:** 2026.09.09
 **Primary module:** `HomeKitDevice.js`  
 **Consumers:** subclasses and host applications
 
@@ -76,7 +76,7 @@ It detects the runtime backend from the supplied API object:
   - `api.version` is numeric
   - `api.HAPLibraryVersion` is absent
   - exposes HAP through `this.hap`
-  - exposes Matter through `this.matter` when `api.matter` is available
+  - exposes Matter through `this.matter` when `api.isMatterEnabled()` is true and `api.matter` is available
   - creates/restores Homebridge HAP platform accessories when HAP is requested
   - restores and registers Matter accessories assigned to `this.matterAccessory`
   - registers shutdown through `platform.on('shutdown')`
@@ -149,12 +149,12 @@ The registry is intentionally private. Other modules communicate with devices th
 host application creates subclass instance
         │
         ▼
-device.add(name, category, enableHistory)
+device.add({ hapAccessoryName, hapCategory, enableHistory })
         │
         ├─ standalone HAP-NodeJS
         │    ├─ create the HAP accessory
         │    └─ configure pairing and publication data
-        ├─ Homebridge HAP (default unless add(null) is used)
+        ├─ Homebridge HAP (default unless hapAccessoryName is null)
         │    └─ create/register or restore the HAP platform accessory
         ├─ HAP representation exists (Homebridge HAP or standalone HAP-NodeJS)
         │    ├─ update AccessoryInformation
@@ -168,7 +168,7 @@ device.add(name, category, enableHistory)
         └─ publish standalone HAP-NodeJS accessory
 ```
 
-Subclasses build their representation during `onAdd()`. HAP subclasses use the existing service/characteristic methods. Matter subclasses assign `this.matterAccessory`. Homebridge defaults to HAP for compatibility; passing `null` as the HAP name explicitly requests Matter-only operation. Combined devices retain HAP if optional Matter registration fails, while setup fails when no requested representation can be registered.
+Subclasses build their representation during `onAdd()`. HAP subclasses use the existing service/characteristic methods. Matter subclasses assign `this.matterAccessory`. Homebridge defaults to HAP for compatibility; passing `{ hapAccessoryName: null }` explicitly requests Matter-only operation. Combined devices retain HAP if optional Matter registration fails, while setup fails when no requested representation can be registered.
 
 ### Update
 
@@ -400,7 +400,7 @@ All timers are cleared on `REMOVE` and `SHUTDOWN`.
 `HomeKitDevice` optionally creates a history service when:
 
 - `HomeKitDevice.EVEHOME` is configured
-- `enableHistory === true` is passed to `add()`
+- `enableHistory: true` is passed in the `add()` options
 - a HAP representation exists, either under Homebridge or standalone HAP-NodeJS
 
 EveHome history is therefore available to both HAP backends. It is not created for a Matter-only representation because EveHome history is implemented with HAP services and characteristics.
