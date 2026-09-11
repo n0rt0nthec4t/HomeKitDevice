@@ -112,7 +112,7 @@ export default class HomeKitDevice extends EventEmitter {
   static EVEHOME = undefined; // HomeKitHistory object
   static LOGGER = undefined; // Logging object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.09.09'; // Code version
+  static VERSION = '2026.09.11'; // Code version
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
@@ -155,8 +155,10 @@ export default class HomeKitDevice extends EventEmitter {
 
     // Determine runtime environment (Homebridge vs HAP-NodeJS)
     if (typeof api?.hap === 'object' && isNaN(api?.version) === false && typeof api?.HAPLibraryVersion === 'undefined') {
-      this.hap = api.hap;
-      // Homebridge exposes the Matter API only for bridges configured to use it.
+      // HAP is enabled by default on Homebridge versions without the explicit
+      // enablement API. Once available, a false result suppresses this bridge's
+      // HAP representation in the same way Matter is suppressed below.
+      this.hap = api?.isHapEnabled?.() !== false ? api.hap : undefined;
       this.matter =
         api?.isMatterEnabled?.() === true && typeof api?.matter === 'object' && api.matter !== null
           ? api.matter
@@ -219,9 +221,11 @@ export default class HomeKitDevice extends EventEmitter {
 
       // HAP and Matter cache objects have no shared base type, so identify them
       // by the capabilities Homebridge exposes on each representation.
-      this.accessory = cachedAccessories.find(
-        (cachedAccessory) => cachedAccessory?.UUID === this.#uuid && typeof cachedAccessory?.getService === 'function',
-      );
+      if (this.hap !== undefined) {
+        this.accessory = cachedAccessories.find(
+          (cachedAccessory) => cachedAccessory?.UUID === this.#uuid && typeof cachedAccessory?.getService === 'function',
+        );
+      }
       if (this.matter !== undefined) {
         this.matterAccessory = cachedAccessories.find(
           (cachedAccessory) =>
@@ -240,32 +244,67 @@ export default class HomeKitDevice extends EventEmitter {
     }
 
     if (
-      (this.hap === undefined && this.matter === undefined) || // No protocol API initialised
+      this.backend === undefined ||
       typeof HomeKitDevice.PLUGIN_NAME !== 'string' || // Plugin name must be defined
       HomeKitDevice.PLUGIN_NAME === '' ||
       typeof HomeKitDevice.PLATFORM_NAME !== 'string' || // Platform name must be defined
       HomeKitDevice.PLATFORM_NAME === '' ||
-      // HAP-NodeJS only: accessory name must be valid
-      (this.backend === HomeKitDevice.HAP_NODEJS &&
-        (typeof options?.hapAccessoryName !== 'string' || options?.hapAccessoryName === '')) ||
-      // HAP-NodeJS only: category must be valid
-      (this.backend === HomeKitDevice.HAP_NODEJS && typeof this.hap.Categories[options?.hapCategory] === 'undefined') ||
       (options?.enableHistory !== undefined && typeof options?.enableHistory !== 'boolean') || // History flag must be boolean
       this.#validDeviceData(this.deviceData, true) === false // Device data failed validation (core + pairing if required)
     ) {
       return;
     }
 
-    // HAP remains the Homebridge default for compatibility. Passing null
-    // explicitly selects Matter-only operation.
-    if (this.accessory === undefined && (this.backend === HomeKitDevice.HAP_NODEJS || options?.hapAccessoryName !== null)) {
-      if (this.backend === HomeKitDevice.HAP_NODEJS) {
-        this.accessory = new this.hap.Accessory(options?.hapAccessoryName, this.#uuid);
-        this.accessory.username = this.deviceData.hkUsername;
-        this.accessory.pincode = this.deviceData.hkPairingCode;
-        this.accessory.category = options?.hapCategory;
-      } else if (typeof this.#platform?.platformAccessory === 'function') {
-        this.accessory = new this.#platform.platformAccessory(this.deviceData.description, this.#uuid, options?.hapCategory);
+    if (
+      this.backend === HomeKitDevice.HAP_NODEJS &&
+      (typeof options?.hapAccessoryName !== 'string' ||
+        options.hapAccessoryName === '' ||
+        typeof this.hap.Categories[options?.hapCategory] === 'undefined')
+    ) {
+      return;
+    }
+
+    // Homebridge needs at least one restored or creatable representation.
+    if (
+      this.backend === HomeKitDevice.HOMEBRIDGE &&
+      this.accessory === undefined &&
+      (this.hap === undefined ||
+        options?.hapAccessoryName === null ||
+        typeof this.#platform?.platformAccessory !== 'function' ||
+        typeof this.#platform?.registerPlatformAccessories !== 'function') &&
+      this.matterAccessory === undefined &&
+      (this.matter === undefined ||
+        typeof this.matter?.registerPlatformAccessories !== 'function' ||
+        typeof options?.matterDeviceType !== 'object' ||
+        options.matterDeviceType === null)
+    ) {
+      return;
+    }
+
+    if (this.accessory === undefined && this.backend === HomeKitDevice.HAP_NODEJS) {
+      // Standalone HAP-NodeJS publishes its own Accessory instance.
+      this.accessory = new this.hap.Accessory(options.hapAccessoryName, this.#uuid);
+      this.accessory.username = this.deviceData.hkUsername;
+      this.accessory.pincode = this.deviceData.hkPairingCode;
+      this.accessory.category = options.hapCategory;
+    }
+
+    if (
+      this.accessory === undefined &&
+      this.backend === HomeKitDevice.HOMEBRIDGE &&
+      this.hap !== undefined &&
+      options?.hapAccessoryName !== null &&
+      typeof this.#platform?.platformAccessory === 'function' &&
+      typeof this.#platform?.registerPlatformAccessories === 'function'
+    ) {
+      // Create and register only when Homebridge did not supply a cached HAP
+      // accessory through the constructor.
+      this.accessory = new this.#platform.platformAccessory(this.deviceData.description, this.#uuid, options?.hapCategory);
+      try {
+        this.#platform.registerPlatformAccessories(HomeKitDevice.PLUGIN_NAME, HomeKitDevice.PLATFORM_NAME, [this.accessory]);
+      } catch (error) {
+        this.accessory = undefined;
+        this?.log?.warn?.('Failed to register HAP accessory "%s": %s', this.deviceData.description, String(error?.stack || error));
       }
     }
 
@@ -275,13 +314,6 @@ export default class HomeKitDevice extends EventEmitter {
       let informationService = this.accessory.getService?.(this.hap.Service.AccessoryInformation);
       if (informationService === undefined) {
         this?.log?.error?.('AccessoryInformation service not found on accessory for "%s"', this.deviceData.description);
-        if (typeof this.#platform?.unregisterPlatformAccessories === 'function') {
-          try {
-            this.#platform.unregisterPlatformAccessories(HomeKitDevice.PLUGIN_NAME, HomeKitDevice.PLATFORM_NAME, [this.accessory]);
-          } catch (error) {
-            this?.log?.warn?.('Failed to unregister invalid HAP accessory "%s": %s', this.deviceData.description, String(error?.stack || error));
-          }
-        }
         this.accessory = undefined;
         this.historyService = undefined;
       } else {
@@ -297,47 +329,50 @@ export default class HomeKitDevice extends EventEmitter {
       }
     }
 
-    // Register a new Homebridge HAP accessory only after its required metadata exists.
-    if (this.accessory !== undefined && this.backend === HomeKitDevice.HOMEBRIDGE && this.accessory?.UUID === this.#uuid) {
-      if (typeof this.#platform?.registerPlatformAccessories === 'function') {
-        try {
-          this.#platform.registerPlatformAccessories(HomeKitDevice.PLUGIN_NAME, HomeKitDevice.PLATFORM_NAME, [this.accessory]);
-        } catch (error) {
-          this.accessory = undefined;
-          this?.log?.warn?.('Failed to register HAP accessory "%s": %s', this.deviceData.description, String(error?.stack || error));
-        }
-      } else {
-        this.accessory = undefined;
-      }
+    if (
+      this.matterAccessory === undefined &&
+      this.backend === HomeKitDevice.HOMEBRIDGE &&
+      this.matter !== undefined &&
+      typeof options?.matterDeviceType === 'object' &&
+      options.matterDeviceType !== null
+    ) {
+      // Create the minimum Matter representation before onAdd(), matching the
+      // HAP lifecycle. The subclass adds clusters, handlers, parts, and state.
+      this.matterAccessory = {
+        UUID: this.#uuid,
+        displayName: this.deviceData.description,
+        deviceType: options.matterDeviceType,
+        manufacturer: this.deviceData.manufacturer,
+        model: this.deviceData.model,
+        serialNumber: this.deviceData.serialNumber,
+        firmwareRevision: this.deviceData.softwareVersion,
+        context: {},
+      };
+    }
 
-      if (this.accessory === undefined) {
-        this.historyService = undefined;
-      }
+    // Lifecycle setup requires at least one usable protocol representation.
+    // Do not call onAdd() when creation, restoration, or HAP validation left
+    // the device without either representation.
+    if (this.accessory === undefined && this.matterAccessory === undefined) {
+      this.#postSetupDetails = [];
+      this?.log?.error?.('No accessory is available for setup for "%s"', this.deviceData.description);
+      return false;
     }
 
     this.postSetupDetail('Serial number "%s"', this.deviceData.serialNumber, LOG_LEVELS.DEBUG);
     this.postSetupDetail('Software version "%s"', this.deviceData.softwareVersion, LOG_LEVELS.DEBUG);
 
-    // message() reports trapped handler failures so partial setup can be rolled back.
+    // message() reports trapped handler failures so setup can stop cleanly.
     if ((await this.message(HomeKitDevice.ADD)) === false) {
-      if (this.accessory !== undefined && typeof this.#platform?.unregisterPlatformAccessories === 'function') {
-        try {
-          this.#platform.unregisterPlatformAccessories(HomeKitDevice.PLUGIN_NAME, HomeKitDevice.PLATFORM_NAME, [this.accessory]);
-        } catch (error) {
-          this?.log?.warn?.('Failed to roll back HAP accessory "%s": %s', this.deviceData.description, String(error?.stack || error));
-        }
-      }
-      this.accessory = undefined;
-      this.historyService = undefined;
-      this.matterAccessory = undefined;
+      // These may be cached accessories supplied by Homebridge. Do not
+      // unregister them as setup rollback; permanent removal belongs to remove().
       this.#postSetupDetails = [];
       this?.log?.error?.('Accessory setup failed for "%s"', this.deviceData.description);
       return;
     }
 
-    // Homebridge Matter is independent of the HAP path above. A subclass defines
-    // its descriptor through the existing onAdd() lifecycle. Register both new
-    // and restored descriptors so command handlers are attached on every launch.
+    // Register Matter only after onAdd() has completed the descriptor with its
+    // clusters, handlers, parts, and initial state.
     if (typeof this.matterAccessory === 'object' && this.matterAccessory !== null) {
       if (
         this.backend === HomeKitDevice.HOMEBRIDGE &&
@@ -357,7 +392,7 @@ export default class HomeKitDevice extends EventEmitter {
     }
 
     if (this.accessory === undefined && this.matterAccessory === undefined) {
-      this?.log?.error?.('No accessory representation was registered for "%s"', this.deviceData.description);
+      this?.log?.error?.('No accessory was registered for "%s"', this.deviceData.description);
       this.#postSetupDetails = [];
       return false;
     }

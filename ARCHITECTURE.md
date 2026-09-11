@@ -4,7 +4,7 @@
 
 `HomeKitDevice` is a shared base class for accessory implementations. It sits between application-owned device data and either the standalone HAP-NodeJS runtime or the Homebridge runtime, giving each device type a common lifecycle, message bus, accessory helper layer, timer system, and optional EveHome history integration. Homebridge may expose HAP, Matter, or both.
 
-**Version:** 2026.09.09
+**Version:** 2026.09.11
 **Primary module:** `HomeKitDevice.js`  
 **Consumers:** subclasses and host applications
 
@@ -50,7 +50,7 @@
 - optional Homebridge Matter API exposure without changing the lifecycle API
 - deterministic HomeKit UUID generation from a configured namespace and serial number
 - HAP accessory creation, restoration, publishing, unregistering, and unpublishing
-- Homebridge Matter accessory restoration, registration, and unregistration
+- Homebridge Matter accessory creation, restoration, registration, and unregistration
 - a static device registry for cross-device message delivery
 - static listener registration for external handlers
 - lifecycle dispatch for add, update, remove, set, get, history, timer, shutdown, online, offline, and custom messages
@@ -75,17 +75,18 @@ It detects the runtime backend from the supplied API object:
   - `api.hap` exists
   - `api.version` is numeric
   - `api.HAPLibraryVersion` is absent
-  - exposes HAP through `this.hap`
+  - exposes HAP through `this.hap` when `api.isHapEnabled()` is not `false` (including older Homebridge versions without that method)
   - exposes Matter through `this.matter` when `api.isMatterEnabled()` is true and `api.matter` is available
-  - creates/restores Homebridge HAP platform accessories when HAP is requested
-  - restores and registers Matter accessories assigned to `this.matterAccessory`
+  - restores a cached HAP platform accessory into `this.accessory` during construction, or creates and registers a new one before `onAdd()` when HAP is requested; restored HAP accessories are not registered again
+  - restores a cached Matter descriptor into `this.matterAccessory` during construction, or creates a minimum descriptor there before `onAdd()` when `matterDeviceType` is supplied
+  - registers the completed Matter descriptor after `onAdd()`
   - registers shutdown through `platform.on('shutdown')`
 
 - **HAP-NodeJS backend**
   - `api.HAPLibraryVersion()` exists
   - `api.hap` is absent
   - exposes HAP through `this.hap` and never exposes Matter
-  - creates and publishes standalone HAP accessories
+  - creates the standalone HAP accessory in `this.accessory` and publishes it after setup
   - registers shutdown through process signals
 
 Matter is not a third backend. It is an optional protocol provided by the Homebridge runtime. Both protocols use the existing `ADD`, `UPDATE`, `SET`, `GET`, `REMOVE`, and `SHUTDOWN` message routes.
@@ -149,7 +150,7 @@ The registry is intentionally private. Other modules communicate with devices th
 host application creates subclass instance
         │
         ▼
-device.add({ hapAccessoryName, hapCategory, enableHistory })
+device.add({ hapAccessoryName, hapCategory, matterDeviceType, enableHistory })
         │
         ├─ standalone HAP-NodeJS
         │    ├─ create the HAP accessory
@@ -159,16 +160,22 @@ device.add({ hapAccessoryName, hapCategory, enableHistory })
         ├─ HAP representation exists (Homebridge HAP or standalone HAP-NodeJS)
         │    ├─ update AccessoryInformation
         │    └─ create EveHome history service if requested
+        ├─ Homebridge Matter requested or restored
+        │    └─ create/restore the minimum Matter descriptor
         ├─ dispatch HomeKitDevice.ADD
-        ├─ Homebridge Matter representation exists
-        │    └─ register the Matter accessory descriptor
+        │    └─ subclass completes HAP services and Matter clusters/handlers
+        ├─ register the completed Matter accessory descriptor
         ├─ link/unlink EveHome characteristics
         ├─ log setup details
         ├─ dispatch forced HomeKitDevice.UPDATE
         └─ publish standalone HAP-NodeJS accessory
 ```
 
-Subclasses build their representation during `onAdd()`. HAP subclasses use the existing service/characteristic methods. Matter subclasses assign `this.matterAccessory`. Homebridge defaults to HAP for compatibility; passing `{ hapAccessoryName: null }` explicitly requests Matter-only operation. Combined devices retain HAP if optional Matter registration fails, while setup fails when no requested representation can be registered.
+When `matterDeviceType` is supplied, the base class creates the minimum Matter descriptor before `onAdd()`. Matter subclasses complete that existing `this.matterAccessory` with clusters, handlers, parts, and state during the shared hook; registration follows only after the descriptor is complete. Homebridge defaults to HAP for compatibility; passing `{ hapAccessoryName: null }` explicitly suppresses HAP creation. Combined devices retain HAP if optional Matter registration fails, while setup fails when no requested representation can be registered.
+
+Lifecycle hooks are shared across protocols and are not called once per representation. A subclass must therefore check `this.accessory !== undefined` before HAP-specific work and `this.matterAccessory !== undefined` before Matter-specific work in `onAdd()`, `onUpdate()`, and other hooks. Either property may be absent on HAP-only, Matter-only, or partially available Homebridge runtimes.
+
+`onAdd()` is dispatched only when at least one of those representations is available after creation, restoration, and HAP information validation. A failed HAP registration cannot therefore invoke subclass setup with both properties undefined.
 
 ### Update
 
@@ -271,7 +278,7 @@ For lifecycle hook methods, `HomeKitDevice` walks the prototype chain. This allo
 
 | Message | Purpose |
 |---|---|
-| `ADD` | accessory was created/restored and should build services |
+| `ADD` | protocol representations exist; build HAP services and complete Matter clusters, handlers, parts, and state |
 | `UPDATE` | device data changed or initial forced update |
 | `REMOVE` | permanent accessory removal |
 | `SET` | HomeKit write from a characteristic |
@@ -428,14 +435,15 @@ EveHome service linking is deferred until after `onAdd()` so subclasses can decl
 When adding or refining subclasses:
 
 1. Extend `HomeKitDevice` directly unless the device is intentionally built on another application-specific base subclass.
-2. Build services and characteristics in `onAdd()`.
-3. Apply state changes in `onUpdate(deviceData)`.
-4. Use `this.set()` / registered `HomeKitDevice.SET` handlers for HomeKit writes.
-5. Use `addTimer()` for device-scoped timing rather than unmanaged `setTimeout()` or `setInterval()`.
-6. Use `history()` for EveHome-compatible history writes.
-7. Keep lifecycle hooks focused on HomeKit state and service/characteristic behaviour.
-8. Treat `message` payloads defensively because custom events are not guaranteed to be objects.
-9. Avoid manually unregistering accessories from subclasses; use `HomeKitDevice.REMOVE`.
+2. In every lifecycle hook, guard HAP-specific work with `this.accessory !== undefined` and Matter-specific work with `this.matterAccessory !== undefined`; never assume both representations exist.
+3. Build HAP services and characteristics, and complete Matter clusters, handlers, parts, and initial state, in `onAdd()`.
+4. Apply state changes in `onUpdate(deviceData)` to each representation that exists.
+5. Use `this.set()` / registered `HomeKitDevice.SET` handlers for HomeKit writes.
+6. Use `addTimer()` for device-scoped timing rather than unmanaged `setTimeout()` or `setInterval()`.
+7. Use `history()` for EveHome-compatible history writes.
+8. Keep lifecycle hooks focused on protocol state and representation behaviour.
+9. Treat `message` payloads defensively because custom events are not guaranteed to be objects.
+10. Avoid manually unregistering accessories from subclasses; use `HomeKitDevice.REMOVE`.
 
 ---
 

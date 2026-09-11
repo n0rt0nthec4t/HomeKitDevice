@@ -118,12 +118,15 @@ Required in addition to the above:
 
 ## Homebridge Matter
 
-Matter uses the existing lifecycle and message routing API; it does not add protocol-specific lifecycle hooks. A subclass can assign a valid Homebridge `MatterAccessory` object to `this.matterAccessory` during `onAdd()`. After `onAdd()` completes, `add()` registers that object through `api.matter.registerPlatformAccessories()`.
+Matter uses the existing lifecycle and message routing API; it does not add protocol-specific lifecycle hooks. Pass `matterDeviceType` to `add()` to request a new Matter representation. Before `onAdd()` runs, the base class creates `this.matterAccessory` with its device type, deterministic identity, common metadata, and context. The subclass then adds clusters, handlers, parts, and initial state during `onAdd()`. The completed descriptor is registered afterward through `api.matter.registerPlatformAccessories()`.
 
 Homebridge retains HAP as the default, including existing calls that omit all `add()` options. Set `hapAccessoryName` to `null` explicitly to request a Matter-only device:
 
 ```js
-await device.add({ hapAccessoryName: null }); // Matter-only: onAdd() assigns this.matterAccessory
+await device.add({
+  hapAccessoryName: null,
+  matterDeviceType: this.matter.deviceTypes.OnOffSwitch,
+});
 ```
 
 HAP `AccessoryInformation` and EveHome history setup run whenever `this.accessory` exists, covering both Homebridge HAP and standalone HAP-NodeJS. They are skipped only for Matter-only devices because a Matter accessory does not contain HAP services. During the normal `UPDATE` route, shared device information is synchronized to both representations: `description` becomes the Matter `displayName`, and manufacturer, model, serial number, and software version are mapped to their corresponding Matter metadata fields. Changed Matter metadata is persisted with one `this.matter.updatePlatformAccessories()` call.
@@ -146,12 +149,14 @@ Creates and registers the representations requested by the device, then returns 
 
 - `hapAccessoryName` – HAP accessory name. Set this to `null` for Matter-only operation.
 - `hapCategory` – HAP accessory category, passed to Homebridge and required by standalone HAP-NodeJS.
+- `matterDeviceType` – Homebridge Matter endpoint type. When supplied, the minimum Matter descriptor is created before `onAdd()` and registered after the hook completes it.
 - `enableHistory` – Whether to create EveHome history for a HAP representation. Defaults to `false`.
 
 ```js
 await device.add({
   hapAccessoryName: 'Switch',
   hapCategory: this.hap.Categories.SWITCH,
+  matterDeviceType: this.matter?.deviceTypes.OnOffSwitch,
   enableHistory: true,
 });
 ```

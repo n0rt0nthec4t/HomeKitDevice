@@ -175,14 +175,59 @@ test('Homebridge honours the explicit Matter enablement check', () => {
   assert.equal(device.matterAccessory, cachedMatterAccessory);
 });
 
+test('Homebridge honours the explicit HAP enablement check and legacy default', async () => {
+  let hapEnabledChecks = 0;
+  let hapRegistrations = 0;
+  let cachedHapAccessory = new MockAccessory('Cached HAP accessory', 'uuid:homebridge-example_HAP-DISABLED');
+  let api = {
+    version: 2.7,
+    hap,
+    platformAccessory: MockAccessory,
+    isHapEnabled() {
+      hapEnabledChecks += 1;
+      return false;
+    },
+    registerPlatformAccessories() {
+      hapRegistrations += 1;
+    },
+    on() {},
+  };
+
+  let device = new HomeKitDevice(cachedHapAccessory, api, deviceData('HAP-DISABLED'));
+
+  assert.equal(device.backend, HomeKitDevice.HOMEBRIDGE);
+  assert.equal(hapEnabledChecks, 1);
+  assert.equal(device.hap, undefined);
+  assert.equal(device.accessory, undefined);
+  assert.equal(await device.add({ hapAccessoryName: 'Switch' }), undefined);
+  assert.equal(hapRegistrations, 0);
+
+  delete api.isHapEnabled;
+  device = new HomeKitDevice(cachedHapAccessory, api, deviceData('HAP-DISABLED'));
+
+  assert.equal(hapEnabledChecks, 1);
+  assert.equal(device.hap, api.hap);
+  assert.equal(device.accessory, cachedHapAccessory);
+  assert.equal(await device.add({ hapAccessoryName: 'Switch' }), true);
+  assert.equal(device.accessory, cachedHapAccessory);
+  assert.equal(hapRegistrations, 0);
+});
+
 test('add requires at least one protocol API', async () => {
+  let matterRegistrations = 0;
+  let onAddCalls = 0;
   let matter = {
-    async registerPlatformAccessories() {},
+    async registerPlatformAccessories() {
+      matterRegistrations += 1;
+    },
   };
   let api = {
     version: 2.7,
     hap,
     matter,
+    isHapEnabled() {
+      return false;
+    },
     isMatterEnabled() {
       return true;
     },
@@ -191,23 +236,57 @@ test('add requires at least one protocol API', async () => {
 
   class MatterOnlySwitch extends HomeKitDevice {
     async onAdd() {
-      this.matterAccessory = {
-        UUID: this.uuid,
-        deviceType: {},
-      };
+      onAddCalls += 1;
+      assert.equal(this.hap, undefined);
+      assert.equal(this.accessory, undefined);
+      assert.equal(this.matterAccessory.UUID, this.uuid);
+      assert.equal(matterRegistrations, 0);
+      this.matterAccessory.clusters = { onOff: { onOff: false } };
     }
   }
 
   let device = new MatterOnlySwitch(undefined, api, deviceData('MATTER-API'));
-  device.hap = undefined;
 
-  assert.equal(await device.add({ hapAccessoryName: null }), true);
+  assert.equal(await device.add({ hapAccessoryName: null, matterDeviceType: {} }), true);
+  assert.equal(matterRegistrations, 1);
+  assert.equal(onAddCalls, 1);
 
+  device = new MatterOnlySwitch(undefined, api, deviceData('MATTER-NOT-REQUESTED'));
+  assert.equal(await device.add({ hapAccessoryName: null }), undefined);
+  assert.equal(onAddCalls, 1);
+
+  api.isMatterEnabled = () => false;
   device = new HomeKitDevice(undefined, api, deviceData('NO-PROTOCOL-API'));
-  device.hap = undefined;
-  device.matter = undefined;
 
   assert.equal(await device.add({ hapAccessoryName: null }), undefined);
+});
+
+test('Matter device type is required only when Matter is the sole Homebridge representation', async () => {
+  let registrations = 0;
+  let api = {
+    version: 2.7,
+    hap,
+    platformAccessory: MockAccessory,
+    registerPlatformAccessories() {
+      registrations += 1;
+    },
+    on() {},
+  };
+
+  let device = new HomeKitDevice(undefined, api, deviceData('HAP-WITHOUT-MATTER'));
+  assert.equal(await device.add({ hapAccessoryName: 'Switch', matterDeviceType: 'ignored' }), true);
+  assert.equal(registrations, 1);
+
+  api.matter = { registerPlatformAccessories() {} };
+  api.isMatterEnabled = () => true;
+  device = new HomeKitDevice(undefined, api, deviceData('HAP-WITH-MATTER'));
+  assert.equal(await device.add({ hapAccessoryName: 'Switch', matterDeviceType: 'invalid' }), true);
+  assert.equal(registrations, 2);
+
+  api.isHapEnabled = () => false;
+  device = new HomeKitDevice(undefined, api, deviceData('MATTER-ONLY-INVALID'));
+  assert.equal(await device.add({ hapAccessoryName: null, matterDeviceType: 'invalid' }), undefined);
+  assert.equal(registrations, 2);
 });
 
 test('Homebridge exposes HAP and Matter through the existing lifecycle', async () => {
@@ -254,15 +333,11 @@ test('Homebridge exposes HAP and Matter through the existing lifecycle', async (
 
   class MatterSwitch extends HomeKitDevice {
     async onAdd() {
-      this.matterAccessory = {
-        UUID: this.uuid,
-        displayName: this.deviceData.description,
-        deviceType: this.matter.deviceTypes.OnOffSwitch,
-        serialNumber: this.deviceData.serialNumber,
-        manufacturer: this.deviceData.manufacturer,
-        model: this.deviceData.model,
-        firmwareRevision: this.deviceData.softwareVersion,
-        context: {},
+      assert.equal(calls.hapRegistered.length, 1);
+      assert.equal(calls.matterRegistered.length, 0);
+      assert.equal(this.matterAccessory.UUID, this.uuid);
+      assert.equal(this.matterAccessory.deviceType, this.matter.deviceTypes.OnOffSwitch);
+      Object.assign(this.matterAccessory, {
         clusters: { onOff: { onOff: false } },
         handlers: {
           onOff: {
@@ -270,7 +345,7 @@ test('Homebridge exposes HAP and Matter through the existing lifecycle', async (
             off: () => this.set({ on: false }),
           },
         },
-      };
+      });
     }
 
     async onUpdate(data) {
@@ -279,7 +354,11 @@ test('Homebridge exposes HAP and Matter through the existing lifecycle', async (
   }
 
   let device = new MatterSwitch(undefined, api, { ...deviceData('HB-MATTER'), on: false });
-  let added = await device.add({ hapAccessoryName: 'Switch', hapCategory: hap.Categories.SWITCH });
+  let added = await device.add({
+    hapAccessoryName: 'Switch',
+    hapCategory: hap.Categories.SWITCH,
+    matterDeviceType: api.matter.deviceTypes.OnOffSwitch,
+  });
 
   assert.equal(device.backend, HomeKitDevice.HOMEBRIDGE);
   assert.equal(device.hap, hap);
@@ -333,17 +412,10 @@ test('Homebridge supports Matter without creating a HAP accessory or AccessoryIn
     onlineMessages = [];
 
     async onAdd() {
-      this.matterAccessory = {
-        UUID: this.uuid,
-        displayName: this.deviceData.description,
-        deviceType: this.matter.deviceTypes.OnOffSwitch,
-        serialNumber: this.deviceData.serialNumber,
-        manufacturer: this.deviceData.manufacturer,
-        model: this.deviceData.model,
-        firmwareRevision: this.deviceData.softwareVersion,
-        context: {},
-        clusters: { onOff: { onOff: false } },
-      };
+      assert.equal(calls.matterRegistered.length, 0);
+      assert.equal(this.matterAccessory.UUID, this.uuid);
+      assert.equal(this.matterAccessory.deviceType, this.matter.deviceTypes.OnOffSwitch);
+      this.matterAccessory.clusters = { onOff: { onOff: false } };
     }
 
     async onMessage(type) {
@@ -354,7 +426,10 @@ test('Homebridge supports Matter without creating a HAP accessory or AccessoryIn
   }
 
   let device = new MatterOnlySwitch(undefined, api, { ...deviceData('MATTER-ONLY'), on: false });
-  let added = await device.add({ hapAccessoryName: null });
+  let added = await device.add({
+    hapAccessoryName: null,
+    matterDeviceType: api.matter.deviceTypes.OnOffSwitch,
+  });
 
   assert.equal(device.accessory, undefined);
   assert.equal(added, true);
@@ -424,6 +499,34 @@ test('Homebridge add without arguments preserves the default HAP representation 
   assert.equal(calls.unregistered.length, 1);
 });
 
+test('Homebridge does not call onAdd when HAP registration leaves no usable representation', async () => {
+  let onAddCalls = 0;
+  let api = {
+    version: 2.7,
+    hap,
+    platformAccessory: MockAccessory,
+    registerPlatformAccessories() {
+      throw new Error('HAP unavailable');
+    },
+    on() {},
+  };
+
+  class UnregisteredHapSwitch extends HomeKitDevice {
+    async onAdd() {
+      onAddCalls += 1;
+    }
+  }
+
+  let device = new UnregisteredHapSwitch(undefined, api, deviceData('HAP-REGISTRATION-FAILED'));
+
+  assert.equal(await device.add({ hapAccessoryName: 'Switch' }), false);
+  assert.equal(device.accessory, undefined);
+  assert.equal(device.matterAccessory, undefined);
+  assert.equal(onAddCalls, 0);
+
+  await device.remove();
+});
+
 test('setup logging uses the requested HAP accessory name when present', async () => {
   let successCalls = [];
   let originalLogger = HomeKitDevice.LOGGER;
@@ -485,21 +588,16 @@ test('Homebridge degrades to HAP when optional Matter registration fails', async
 
   class OptionalMatterSwitch extends HomeKitDevice {
     async onAdd() {
-      this.matterAccessory = {
-        UUID: this.uuid,
-        displayName: this.deviceData.description,
-        deviceType: this.matter.deviceTypes.OnOffSwitch,
-        serialNumber: this.deviceData.serialNumber,
-        manufacturer: this.deviceData.manufacturer,
-        model: this.deviceData.model,
-        context: {},
-        clusters: { onOff: { onOff: false } },
-      };
+      assert.equal(this.matterAccessory.deviceType, this.matter.deviceTypes.OnOffSwitch);
+      this.matterAccessory.clusters = { onOff: { onOff: false } };
     }
   }
 
   let device = new OptionalMatterSwitch(undefined, api, deviceData('HAP-FALLBACK'));
-  let added = await device.add({ hapAccessoryName: 'Switch' });
+  let added = await device.add({
+    hapAccessoryName: 'Switch',
+    matterDeviceType: api.matter.deviceTypes.OnOffSwitch,
+  });
 
   assert.equal(added, true);
   assert.equal(device.matterAccessory, undefined);
@@ -521,31 +619,18 @@ test('Matter-only add fails cleanly when Matter cannot be registered', async () 
     on() {},
   };
 
-  class UnavailableMatterSwitch extends HomeKitDevice {
-    async onAdd() {
-      this.matterAccessory = {
-        UUID: this.uuid,
-        displayName: this.deviceData.description,
-        deviceType: {},
-        serialNumber: this.deviceData.serialNumber,
-        manufacturer: this.deviceData.manufacturer,
-        model: this.deviceData.model,
-        context: {},
-      };
-    }
-  }
+  let device = new HomeKitDevice(undefined, api, deviceData('MATTER-UNAVAILABLE'));
 
-  let device = new UnavailableMatterSwitch(undefined, api, deviceData('MATTER-UNAVAILABLE'));
-
-  assert.equal(await device.add({ hapAccessoryName: null }), false);
+  assert.equal(await device.add({ hapAccessoryName: null, matterDeviceType: {} }), undefined);
   assert.equal(device.accessory, undefined);
   assert.equal(device.matterAccessory, undefined);
 
   await device.remove();
 });
 
-test('Homebridge rolls back a newly registered HAP accessory when setup fails', async () => {
+test('Homebridge does not register or remove a cached HAP accessory when setup fails', async () => {
   let calls = { registered: 0, unregistered: 0 };
+  let cachedHapAccessory = new MockAccessory('Cached HAP accessory', 'uuid:homebridge-example_HAP-ROLLBACK');
   let api = {
     version: 2.7,
     hap,
@@ -566,14 +651,15 @@ test('Homebridge rolls back a newly registered HAP accessory when setup fails', 
     }
   }
 
-  let device = new BrokenHapSwitch(undefined, api, deviceData('HAP-ROLLBACK'));
+  let device = new BrokenHapSwitch(cachedHapAccessory, api, deviceData('HAP-ROLLBACK'));
 
   assert.equal(await device.add(), undefined);
-  assert.equal(device.accessory, undefined);
-  assert.equal(calls.registered, 1);
-  assert.equal(calls.unregistered, 1);
+  assert.equal(device.accessory, cachedHapAccessory);
+  assert.equal(calls.registered, 0);
+  assert.equal(calls.unregistered, 0);
 
   await device.remove();
+  assert.equal(calls.unregistered, 1);
 });
 
 test('standalone HAP-NodeJS remains HAP-only', async () => {

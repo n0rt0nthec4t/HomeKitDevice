@@ -2,6 +2,17 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2026/09/11
+
+### Changed
+
+- Honoured Homebridge's optional `api.isHapEnabled()` result before exposing HAP, restoring cached HAP accessories, or creating new HAP platform accessories, while retaining HAP-by-default compatibility with older Homebridge versions
+- Separated standalone HAP-NodeJS and Homebridge platform accessory creation into explicit backend paths
+- Restored the Homebridge HAP registration boundary so cached accessories are reconfigured without being registered or rolled back as new accessories
+- Added `matterDeviceType` so the base class creates the minimum Matter descriptor before `onAdd()`, allowing subclasses to complete it before registration
+- Prevented `onAdd()` from running when HAP and Matter setup leave no usable accessory representation
+- Restored setup logging to use `hapAccessoryName` when supplied and the device description when it is omitted
+
 ## 2026/09/09
 
 ### Changed
