@@ -4,7 +4,7 @@
 
 `HomeKitDevice` is a shared base class for accessory implementations. It sits between application-owned device data and either the standalone HAP-NodeJS runtime or the Homebridge runtime, giving each device type a common lifecycle, message bus, accessory helper layer, timer system, and optional EveHome history integration. Homebridge may expose HAP, Matter, or both.
 
-**Version:** 2026.09.11
+**Version:** 2026.09.12
 **Primary module:** `HomeKitDevice.js`  
 **Consumers:** subclasses and host applications
 
@@ -47,7 +47,7 @@
 `HomeKitDevice` owns:
 
 - Homebridge and standalone HAP-NodeJS runtime detection
-- optional Homebridge Matter API exposure without changing the lifecycle API
+- optional Homebridge HAP and Matter API exposure through the shared lifecycle API
 - deterministic HomeKit UUID generation from a configured namespace and serial number
 - HAP accessory creation, restoration, publishing, unregistering, and unpublishing
 - Homebridge Matter accessory creation, restoration, registration, and unregistration
@@ -55,18 +55,19 @@
 - static listener registration for external handlers
 - lifecycle dispatch for add, update, remove, set, get, history, timer, shutdown, online, offline, and custom messages
 - partial device-data merging and validation
+- selected device-data restoration and Homebridge context persistence
 - AccessoryInformation characteristic maintenance
 - service and characteristic helper methods
 - device-scoped timers with teardown cleanup
 - optional EveHome history service integration
-- accessory structure change detection and Homebridge `updatePlatformAccessories()` notification
+- bridged HAP cache change detection and Homebridge `updatePlatformAccessories()` notification
 
 ## Runtime Backend Model
 
 The constructor receives:
 
 ```js
-new DeviceSubclass(accessory, api, deviceData)
+new DeviceSubclass(accessory, api, deviceData, persistedFields)
 ```
 
 It detects the runtime backend from the supplied API object:
@@ -77,7 +78,8 @@ It detects the runtime backend from the supplied API object:
   - `api.HAPLibraryVersion` is absent
   - exposes HAP through `this.hap` when `api.isHapEnabled()` is not `false` (including older Homebridge versions without that method)
   - exposes Matter through `this.matter` when `api.isMatterEnabled()` is true and `api.matter` is available
-  - restores a cached HAP platform accessory into `this.accessory` during construction, or creates and registers a new one before `onAdd()` when HAP is requested; restored HAP accessories are not registered again
+  - restores a cached bridged HAP platform accessory into `this.accessory` during construction, or creates and registers a new bridged accessory before `onAdd()`; restored HAP accessories are not registered again
+  - creates an external HAP platform accessory before `onAdd()` and publishes it only after the hook has completed its services and controllers
   - restores a cached Matter descriptor into `this.matterAccessory` during construction, or creates a minimum descriptor there before `onAdd()` when `matterDeviceType` is supplied
   - registers the completed Matter descriptor after `onAdd()`
   - registers shutdown through `platform.on('shutdown')`
@@ -88,6 +90,8 @@ It detects the runtime backend from the supplied API object:
   - exposes HAP through `this.hap` and never exposes Matter
   - creates the standalone HAP accessory in `this.accessory` and publishes it after setup
   - registers shutdown through process signals
+
+The optional `persistedFields` array declares selected `deviceData` fields stored under `context[this.constructor.PERSISTENCE_NAMESPACE]`, which defaults to `context.HomeKitDevice`. Initial constructor `deviceData` remains authoritative; the constructor fills only absent declared fields, preferring HAP when both cached representations contain a value. New Homebridge HAP and Matter representations receive independent copies before registration or publication. During `UPDATE`, changed declared values are written to each available context, with bridged HAP persistence handled by the existing accessory cache snapshot and Matter persistence batched with metadata updates. Subclasses may override `PERSISTENCE_NAMESPACE`, but must keep it stable to retain access to existing cache data. Standalone and externally published HAP accessories do not provide durable context persistence.
 
 Matter is not a third backend. It is an optional protocol provided by the Homebridge runtime. Both protocols use the existing `ADD`, `UPDATE`, `SET`, `GET`, `REMOVE`, and `SHUTDOWN` message routes.
 
@@ -100,14 +104,15 @@ HomeKitDevice.LOGGER = log;
 HomeKitDevice.EVEHOME = HomeKitHistory;
 ```
 
-Subclasses may also expose static metadata:
+Subclasses may also configure device-specific static fields:
 
 ```js
 static TYPE = 'switch';
 static VERSION = '2026.05.15';
+static PERSISTENCE_NAMESPACE = 'SwitchDevice';
 ```
 
-`TYPE` identifies the device/accessory family for logs, diagnostics, and host-side grouping. `VERSION` identifies the subclass implementation version and is useful when setup logs or support output need to show which device module code is active.
+`TYPE` identifies the device/accessory family for logs, diagnostics, and host-side grouping. `VERSION` identifies the subclass implementation version and is useful when setup logs or support output need to show which device module code is active. `PERSISTENCE_NAMESPACE` selects the stable Homebridge context key used by that subclass.
 
 ---
 
@@ -150,28 +155,38 @@ The registry is intentionally private. Other modules communicate with devices th
 host application creates subclass instance
         │
         ▼
-device.add({ hapAccessoryName, hapCategory, matterDeviceType, enableHistory })
+device.add({ hapAccessoryName, hapCategory, externalPublish, matterDeviceType, enableHistory })
         │
         ├─ standalone HAP-NodeJS
         │    ├─ create the HAP accessory
         │    └─ configure pairing and publication data
-        ├─ Homebridge HAP (default unless hapAccessoryName is null)
-        │    └─ create/register or restore the HAP platform accessory
+        ├─ Homebridge HAP (restored, or newly created unless hapAccessoryName is null)
+        │    ├─ create or restore the HAP platform accessory
+        │    ├─ seed declared context fields on a new representation
+        │    ├─ register a new bridged accessory before onAdd()
+        │    └─ create an external HAP platform accessory without publishing it yet
         ├─ HAP representation exists (Homebridge HAP or standalone HAP-NodeJS)
         │    ├─ update AccessoryInformation
         │    └─ create EveHome history service if requested
         ├─ Homebridge Matter requested or restored
-        │    └─ create/restore the minimum Matter descriptor
+        │    ├─ create/restore the minimum Matter descriptor
+        │    └─ seed declared context fields on a new descriptor
         ├─ dispatch HomeKitDevice.ADD
-        │    └─ subclass completes HAP services and Matter clusters/handlers
+        │    ├─ subclass completes HAP services and Matter clusters/handlers
+        │    └─ link/unlink EveHome characteristics
         ├─ register the completed Matter accessory descriptor
-        ├─ link/unlink EveHome characteristics
-        ├─ log setup details
         ├─ dispatch forced HomeKitDevice.UPDATE
-        └─ publish standalone HAP-NodeJS accessory
+        ├─ publish external Homebridge or standalone HAP-NodeJS accessory
+        └─ log setup details
 ```
 
 When `matterDeviceType` is supplied, the base class creates the minimum Matter descriptor before `onAdd()`. Matter subclasses complete that existing `this.matterAccessory` with clusters, handlers, parts, and state during the shared hook; registration follows only after the descriptor is complete. Homebridge defaults to HAP for compatibility; passing `{ hapAccessoryName: null }` explicitly suppresses HAP creation. Combined devices retain HAP if optional Matter registration fails, while setup fails when no requested representation can be registered.
+
+`hapAccessoryName: null` does not discard a HAP accessory already restored through the constructor. The option suppresses only new HAP creation; the host must omit a cached HAP representation when intentionally migrating a device to Matter-only exposure.
+
+When Matter is requested, the host platform must call `add()` from or after Homebridge's `didFinishLaunching` event. Homebridge rejects registration before its Matter manager is ready. The rejection is logged and clears `this.matterAccessory`, leaving a dual-protocol device as HAP-only and causing Matter-only setup to fail.
+
+Passing `{ externalPublish: true }` changes only the Homebridge HAP publication boundary. The HAP platform accessory still exists in `this.accessory` before `onAdd()`, but it is published independently after the hook and forced initial update instead of being registered with the bridge beforehand. Standalone HAP-NodeJS already publishes independently and ignores this option.
 
 Lifecycle hooks are shared across protocols and are not called once per representation. A subclass must therefore check `this.accessory !== undefined` before HAP-specific work and `this.matterAccessory !== undefined` before Matter-specific work in `onAdd()`, `onUpdate()`, and other hooks. Either property may be absent on HAP-only, Matter-only, or partially available Homebridge runtimes.
 
@@ -188,6 +203,7 @@ merge incoming partial data with stored deviceData
         ├─ validate merged data
         ├─ update AccessoryInformation when a HAP representation exists
         ├─ update changed Matter metadata when a Matter representation exists
+        ├─ update and persist declared context fields
         ├─ emit ONLINE/OFFLINE if online state changed
         ├─ call onUpdate() only if changed or force=true
         └─ clone merged data into this.deviceData
@@ -204,7 +220,9 @@ HomeKitDevice.REMOVE
         ├─ clear device timers
         ├─ remove EventEmitter listeners
         ├─ remove static registry/listeners
-        ├─ unregister or unpublish accessory
+        ├─ unregister bridged HAP and Matter representations
+        ├─ unpublish standalone HAP-NodeJS
+        ├─ leave external Homebridge HAP published until shutdown
         └─ clear instance references
 ```
 
@@ -290,23 +308,23 @@ For lifecycle hook methods, `HomeKitDevice` walks the prototype chain. This allo
 | `OFFLINE` | device online state changed to false |
 | custom | routed to matching `on<Type>()` or `onMessage()` |
 
-Payload shape is not universal. `ADD`, `UPDATE`, `REMOVE`, and `SET` normalize missing payloads to `{}`. Other events may pass `undefined`, primitives, or structured objects.
+Payload shape is not universal. `ADD`, `UPDATE`, `REMOVE`, and `SET` normalise missing payloads to `{}`. Other events may pass `undefined`, primitives, or structured objects.
 
 ---
 
-## Accessory Structure Handling
+## HAP Accessory Cache Handling
 
-Before message dispatch, HomeKitDevice snapshots the accessory service/characteristic structure when running under Homebridge. After dispatch it snapshots again.
+Before message dispatch, HomeKitDevice snapshots the bridged HAP accessory data that it manages in the Homebridge cache. After dispatch it snapshots again.
 
-If the structure changed, it calls:
+If the snapshot changed, it calls:
 
 ```js
 platform.updatePlatformAccessories([accessory])
 ```
 
-This allows subclasses to add or remove optional services and characteristics during lifecycle handling without manually notifying Homebridge.
+This allows subclasses to add or remove optional services and characteristics during lifecycle handling without manually notifying Homebridge, and persists changes to declared `context` fields.
 
-Characteristic value updates are still owned by subclass code. The structure snapshot only tracks service UUIDs, service subtypes, and characteristic UUIDs.
+The snapshot tracks the display name, AccessoryInformation values, service UUIDs and subtypes, characteristic UUIDs, and the namespace selected by `PERSISTENCE_NAMESPACE`. Operational characteristic values remain owned by subclass code and are not part of this cache comparison.
 
 ---
 
@@ -362,6 +380,8 @@ merged = {
 ```
 
 Change detection normalises nested objects before comparison so object key order does not cause false updates. Undefined values are converted to a placeholder before JSON comparison.
+
+Declared persisted fields are copied into the namespace selected by `PERSISTENCE_NAMESPACE`. Constructor values override cached values; HAP is the first restore source for a missing field and Matter is the fallback. `UPDATE` keeps available HAP and Matter contexts synchronised without sharing object references. A failed Matter cache update restores its previous descriptor context so a later update can retry.
 
 ---
 
@@ -451,7 +471,7 @@ When adding or refining subclasses:
 
 - Device instances are registry-owned until removed or shutdown.
 - Static listeners are removed when the target device is removed or shut down.
-- Accessory structure changes during message handling are automatically pushed to Homebridge.
+- Bridged HAP structure, metadata, and declared context changes during message handling are automatically pushed to Homebridge.
 - `SET` optimistically updates matching keys in `deviceData` after handlers run.
 - `UPDATE` only invokes `onUpdate()` when data changed or `{ force: true }` is supplied.
 - `ONLINE` and `OFFLINE` are derived from `deviceData.online` transitions during AccessoryInformation updates.

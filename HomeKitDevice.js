@@ -1,7 +1,7 @@
 // Base Class: HomeKitDevice
 //
 // Shared base class for HomeKit-enabled devices across multiple projects.
-// Supports the Homebridge runtime (HAP and optional Matter) and the direct
+// Supports the Homebridge runtime (optional HAP and Matter) and the direct
 // HAP-NodeJS runtime.
 //
 // Provides a unified abstraction layer that standardises accessory creation,
@@ -9,7 +9,7 @@
 // EveHome history support across all device types.
 //
 // Responsibilities:
-// - Manage HomeKit accessory creation and removal
+// - Manage HAP and Matter representation creation and removal
 // - Provide unified message routing for device lifecycle and custom events
 // - Maintain internal device registry -> cross-device messaging
 // - Standardise HomeKit service and characteristic helper methods
@@ -65,9 +65,9 @@
 //
 // Notes:
 // - Designed for subclassing only
-// - Supports both Homebridge and HAP-NodeJS backends
+// - Supports optional HAP and Matter representations under Homebridge, and HAP under HAP-NodeJS
 // - Homebridge platform shutdown and process exit cleanup are handled centrally
-// - Accessory/service structure changes are automatically pushed back to Homebridge
+// - Bridged HAP cache changes and Matter metadata/context changes are persisted through their respective APIs
 //
 // Mark Hulskamp
 'use strict';
@@ -112,7 +112,10 @@ export default class HomeKitDevice extends EventEmitter {
   static EVEHOME = undefined; // HomeKitHistory object
   static LOGGER = undefined; // Logging object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.09.11'; // Code version
+  static VERSION = '2026.09.12'; // Code version
+
+  // Persistent context namespace for this class. Subclasses may override to isolate their own context.
+  static PERSISTENCE_NAMESPACE = 'HomeKitDevice';
 
   // Backend types
   static HOMEBRIDGE = 'homebridge';
@@ -126,7 +129,7 @@ export default class HomeKitDevice extends EventEmitter {
 
   deviceData = {}; // The devices data we store
   historyService = undefined; // HomeKit history service
-  accessory = undefined; // HAP accessory for this device
+  accessory = undefined; // Standalone or Homebridge HAP accessory for this device
   matterAccessory = undefined; // Homebridge Matter accessory for this device
   hap = undefined; // HomeKit Accessory Protocol (HAP) API stub
   matter = undefined; // Homebridge Matter API stub when enabled for this bridge
@@ -136,10 +139,11 @@ export default class HomeKitDevice extends EventEmitter {
   // Internal data only for this class
   #uuid = undefined; // UUID for this instance
   #platform = undefined; // Homebridge platform API
+  #persistedFields = []; // deviceData fields restored from accessory context
   #postSetupDetails = []; // Use for extra output details once a device has been setup
   #timers = new Map(); // Internal timers for this device
 
-  constructor(accessory = undefined, api = undefined, deviceData = {}) {
+  constructor(accessory = undefined, api = undefined, deviceData = {}, persistedFields = []) {
     super(); // Setup event emitter for our class ONLY
 
     // Build logger from configured backend using only functions that exist.
@@ -174,37 +178,48 @@ export default class HomeKitDevice extends EventEmitter {
       this.postSetupDetail('HAP-NodeJS library', LOG_LEVELS.DEBUG);
     }
 
-    // Listener ownership belongs to the runtime API, not an individual device.
-    // A WeakSet prevents duplicates without retaining discarded Homebridge APIs.
-    let shutdownSource =
-      this.backend === HomeKitDevice.HOMEBRIDGE ? this.#platform : this.backend === HomeKitDevice.HAP_NODEJS ? process : undefined;
-    if (typeof shutdownSource?.on === 'function' && HomeKitDevice.#shutdownRegistered.has(shutdownSource) === false) {
-      HomeKitDevice.#shutdownRegistered.add(shutdownSource);
-
-      let shutdown = async () => {
-        if (HomeKitDevice.#shutdownFired === true) {
-          return;
-        }
-
+    // Register shutdown once per runtime emitter. The WeakSet avoids retaining
+    // discarded Homebridge APIs, while the callback prevents overlapping events.
+    const shutdown = async () => {
+      if (HomeKitDevice.#shutdownFired === false) {
         HomeKitDevice.#shutdownFired = true;
         await HomeKitDevice.shutdown();
-      };
-
-      if (this.backend === HomeKitDevice.HOMEBRIDGE) {
-        shutdownSource.on('shutdown', shutdown);
-      } else {
-        ['SIGINT', 'SIGTERM'].forEach((signal) => shutdownSource.on(signal, shutdown));
       }
+    };
+
+    if (
+      this.backend === HomeKitDevice.HOMEBRIDGE &&
+      typeof this.#platform?.on === 'function' &&
+      HomeKitDevice.#shutdownRegistered.has(this.#platform) === false
+    ) {
+      HomeKitDevice.#shutdownRegistered.add(this.#platform);
+      this.#platform.on('shutdown', shutdown);
+    }
+
+    if (
+      this.backend === HomeKitDevice.HAP_NODEJS &&
+      HomeKitDevice.#shutdownRegistered.has(process) === false
+    ) {
+      HomeKitDevice.#shutdownRegistered.add(process);
+      ['SIGINT', 'SIGTERM'].forEach((signal) => process.on(signal, shutdown));
     }
 
     // Validate the data passed in to the constructor to ensure we have the minimum required data to create a HomeKit accessory
     if (this.#validDeviceData(deviceData, true) === false) {
       throw new TypeError('Invalid device data supplied to HomeKitDevice');
     }
+    if (
+      Array.isArray(persistedFields) === false ||
+      persistedFields.some((field) => typeof field !== 'string' || field === '') ||
+      new Set(persistedFields).size !== persistedFields.length
+    ) {
+      throw new TypeError('Invalid persisted device data fields supplied to HomeKitDevice');
+    }
 
-    // Make a clone of current data and store in this object
-    // Important that we don't have a 'linked' copy of the object data
+    // Store independent copies of the initial device data and persisted field list
+    // so later caller mutations cannot change this instance's data or persistence rules.
     this.deviceData = structuredClone(deviceData);
+    this.#persistedFields = [...persistedFields];
 
     // This UUID is the persistent internal identity shared by the device's HAP
     // and Matter representations, so generation must succeed before registration.
@@ -217,23 +232,43 @@ export default class HomeKitDevice extends EventEmitter {
     // Homebridge restores HAP and Matter accessories through separate callbacks, but
     // callers can combine those cached objects in the existing constructor argument.
     if (typeof accessory === 'object' && accessory !== null && this.backend === HomeKitDevice.HOMEBRIDGE) {
-      let cachedAccessories = Array.isArray(accessory) === true ? accessory : [accessory];
-
       // HAP and Matter cache objects have no shared base type, so identify them
       // by the capabilities Homebridge exposes on each representation.
-      if (this.hap !== undefined) {
-        this.accessory = cachedAccessories.find(
-          (cachedAccessory) => cachedAccessory?.UUID === this.#uuid && typeof cachedAccessory?.getService === 'function',
-        );
-      }
-      if (this.matter !== undefined) {
-        this.matterAccessory = cachedAccessories.find(
-          (cachedAccessory) =>
-            cachedAccessory?.UUID === this.#uuid &&
+      (Array.isArray(accessory) === true ? accessory : [accessory]).forEach((cachedAccessory) => {
+        if (cachedAccessory?.UUID === this.#uuid) {
+          if (this.hap !== undefined && typeof cachedAccessory?.getService === 'function') {
+            this.accessory ??= cachedAccessory;
+          } else if (
+            this.matter !== undefined &&
             typeof cachedAccessory?.getService !== 'function' &&
-            cachedAccessory?.deviceType !== undefined,
-        );
-      }
+            cachedAccessory?.deviceType !== undefined
+          ) {
+            this.matterAccessory ??= cachedAccessory;
+          }
+        }
+      });
+
+      // Initial deviceData is authoritative. Fill only absent declared fields,
+      // preferring the established HAP cache before the Matter cache.
+      let cachedDeviceData = [
+        this.accessory?.context?.[this.constructor.PERSISTENCE_NAMESPACE],
+        this.matterAccessory?.context?.[this.constructor.PERSISTENCE_NAMESPACE],
+      ];
+      this.#persistedFields.forEach((field) => {
+        if (Object.hasOwn(this.deviceData, field) === false) {
+          let source = cachedDeviceData.find(
+            (data) =>
+              typeof data === 'object' &&
+              data !== null &&
+              Array.isArray(data) === false &&
+              Object.hasOwn(data, field) &&
+              typeof data[field] !== 'undefined',
+          );
+          if (source !== undefined) {
+            this.deviceData[field] = structuredClone(source[field]);
+          }
+        }
+      });
     }
   }
 
@@ -250,6 +285,7 @@ export default class HomeKitDevice extends EventEmitter {
       typeof HomeKitDevice.PLATFORM_NAME !== 'string' || // Platform name must be defined
       HomeKitDevice.PLATFORM_NAME === '' ||
       (options?.enableHistory !== undefined && typeof options?.enableHistory !== 'boolean') || // History flag must be boolean
+      (options?.externalPublish !== undefined && typeof options?.externalPublish !== 'boolean') ||
       this.#validDeviceData(this.deviceData, true) === false // Device data failed validation (core + pairing if required)
     ) {
       return;
@@ -264,6 +300,14 @@ export default class HomeKitDevice extends EventEmitter {
       return;
     }
 
+    // Copy only declared fields into the library-owned context namespace.
+    // Each representation receives its own data so neither shares mutable state.
+    const persistedData = Object.fromEntries(
+      this.#persistedFields
+        .filter((field) => Object.hasOwn(this.deviceData, field))
+        .map((field) => [field, this.deviceData[field]]),
+    );
+
     // Homebridge needs at least one restored or creatable representation.
     if (
       this.backend === HomeKitDevice.HOMEBRIDGE &&
@@ -271,7 +315,9 @@ export default class HomeKitDevice extends EventEmitter {
       (this.hap === undefined ||
         options?.hapAccessoryName === null ||
         typeof this.#platform?.platformAccessory !== 'function' ||
-        typeof this.#platform?.registerPlatformAccessories !== 'function') &&
+        (options?.externalPublish === true
+          ? typeof this.#platform?.publishExternalAccessories !== 'function'
+          : typeof this.#platform?.registerPlatformAccessories !== 'function')) &&
       this.matterAccessory === undefined &&
       (this.matter === undefined ||
         typeof this.matter?.registerPlatformAccessories !== 'function' ||
@@ -295,16 +341,24 @@ export default class HomeKitDevice extends EventEmitter {
       this.hap !== undefined &&
       options?.hapAccessoryName !== null &&
       typeof this.#platform?.platformAccessory === 'function' &&
-      typeof this.#platform?.registerPlatformAccessories === 'function'
+      (options?.externalPublish === true
+        ? typeof this.#platform?.publishExternalAccessories === 'function'
+        : typeof this.#platform?.registerPlatformAccessories === 'function')
     ) {
-      // Create and register only when Homebridge did not supply a cached HAP
-      // accessory through the constructor.
+      // External accessories are configured by onAdd() before publication.
+      // Bridged accessories retain the existing registration before onAdd flow.
       this.accessory = new this.#platform.platformAccessory(this.deviceData.description, this.#uuid, options?.hapCategory);
-      try {
-        this.#platform.registerPlatformAccessories(HomeKitDevice.PLUGIN_NAME, HomeKitDevice.PLATFORM_NAME, [this.accessory]);
-      } catch (error) {
-        this.accessory = undefined;
-        this?.log?.warn?.('Failed to register HAP accessory "%s": %s', this.deviceData.description, String(error?.stack || error));
+      if (Object.keys(persistedData).length !== 0) {
+        this.accessory.context ??= {};
+        this.accessory.context[this.constructor.PERSISTENCE_NAMESPACE] = structuredClone(persistedData);
+      }
+      if (options?.externalPublish !== true) {
+        try {
+          this.#platform.registerPlatformAccessories(HomeKitDevice.PLUGIN_NAME, HomeKitDevice.PLATFORM_NAME, [this.accessory]);
+        } catch (error) {
+          this.accessory = undefined;
+          this?.log?.warn?.('Failed to register HAP accessory "%s": %s', this.deviceData.description, String(error?.stack || error));
+        }
       }
     }
 
@@ -346,7 +400,10 @@ export default class HomeKitDevice extends EventEmitter {
         model: this.deviceData.model,
         serialNumber: this.deviceData.serialNumber,
         firmwareRevision: this.deviceData.softwareVersion,
-        context: {},
+        context:
+          Object.keys(persistedData).length === 0
+            ? {}
+            : { [this.constructor.PERSISTENCE_NAMESPACE]: structuredClone(persistedData) },
       };
     }
 
@@ -404,16 +461,39 @@ export default class HomeKitDevice extends EventEmitter {
     // Trigger registered handlers (onUpdate + listeners) for initial device data updates
     await this.message(HomeKitDevice.UPDATE, this.deviceData, { force: true });
 
-    // If using HAP-NodeJS library, publish accessory on local network
-    if (this.accessory !== undefined && this.backend === HomeKitDevice.HAP_NODEJS) {
-      await this.accessory.publish({
-        username: this.accessory.username,
-        pincode: this.accessory.pincode,
-        category: this.accessory.category,
-      });
+    // Publish HAP accessories that advertise independently, now that onAdd()
+    // and the forced initial update have configured their services and state.
+    // Homebridge publishes requested external accessories through its platform
+    // API, while standalone HAP-NodeJS accessories publish themselves directly.
+    if (
+      this.accessory !== undefined &&
+      ((options?.externalPublish === true &&
+        this.backend === HomeKitDevice.HOMEBRIDGE &&
+        this.accessory?._associatedPlatform === undefined) ||
+        this.backend === HomeKitDevice.HAP_NODEJS)
+    ) {
+      try {
+        if (this.backend === HomeKitDevice.HOMEBRIDGE) {
+          this.#platform.publishExternalAccessories(HomeKitDevice.PLUGIN_NAME, [this.accessory]);
+        } else {
+          await this.accessory.publish({
+            username: this.accessory.username,
+            pincode: this.accessory.pincode,
+            category: this.accessory.category,
+          });
 
-      this?.log?.info?.('  += Advertising as "%s"', this.accessory.displayName);
-      this?.log?.info?.('  += Pairing code is "%s"', this.accessory.pincode);
+          this.postSetupDetail('Advertising as "%s"', this.accessory.displayName);
+          this.postSetupDetail('Pairing code is "%s"', this.accessory.pincode);
+        }
+      } catch (error) {
+        this.accessory = undefined;
+        this.historyService = undefined;
+        this?.log?.warn?.('Failed to publish HAP accessory "%s": %s', this.deviceData.description, String(error?.stack || error));
+        if (this.matterAccessory === undefined) {
+          this.#postSetupDetails = [];
+          return false;
+        }
+      }
     }
 
     this?.log?.success?.(...(typeof options?.hapAccessoryName === 'string' && options.hapAccessoryName !== '' ? ['Setup %s as "%s"', options.hapAccessoryName, this.deviceData.description] : ['Setup "%s"', this.deviceData.description]));
@@ -515,11 +595,18 @@ export default class HomeKitDevice extends EventEmitter {
   }
 
   static async message(uuid, type, message = undefined, ...args) {
+    // This static entry point either registers a listener for a device UUID or
+    // forwards a message to the matching live HomeKitDevice instance.
     if (typeof uuid !== 'string' || uuid === '' || typeof type !== 'string' || type === '') {
       return;
     }
 
+    // A function registers directly as a listener. A non plain object registers
+    // its matching on<Type>() method with that object retained as the context.
+    // Plain objects and primitive values remain message payloads for delivery.
     if (typeof message === 'function' || (typeof message === 'object' && message !== null && message?.constructor !== Object)) {
+      // Listener storage is created lazily because most UUID/type pairs have no
+      // externally registered handlers.
       if (this.#listeners?.[uuid] === undefined) {
         this.#listeners[uuid] = {};
       }
@@ -537,6 +624,8 @@ export default class HomeKitDevice extends EventEmitter {
         handler = typeof type === 'string' ? type.match(/\.?(on[A-Z][a-zA-Z0-9]*)$/)?.[1] : undefined;
       }
 
+      // Avoid invoking the same handler/context pair more than once when a
+      // host application discovers or registers the same device repeatedly.
       if (handler !== undefined) {
         if (this.#listeners?.[uuid]?.[type]?.find?.((h) => h.handler === handler && h.context === context) === undefined) {
           this.#listeners[uuid][type].push({ handler, context });
@@ -546,7 +635,7 @@ export default class HomeKitDevice extends EventEmitter {
       return;
     }
 
-    // Handle message delivery
+    // Delivery is a no op when the UUID has no currently registered instance.
     return this.#deviceRegistry.get(uuid)?.message?.(type, message, ...args);
   }
 
@@ -647,12 +736,15 @@ export default class HomeKitDevice extends EventEmitter {
         return results.length === 1 ? results[0] : results;
       };
 
-      // Snapshot both structure and shared metadata because Homebridge persists
-      // either kind of change through updatePlatformAccessories().
-      const snapshotAccessoryStructure = (accessory) => {
+      // Snapshot the bridged HAP structure, metadata, and owned context that Homebridge persists
+      // through its HAP updatePlatformAccessories() API. Matter is handled separately.
+      const snapshotAccessoryCache = (accessory) => {
         let information = accessory?.getService?.(this.hap.Service.AccessoryInformation);
         return {
           displayName: accessory?.displayName,
+          context: HomeKitDevice.#normaliseForCompare(
+            accessory?.context?.[this.constructor.PERSISTENCE_NAMESPACE],
+          ),
           information: Array.isArray(information?.characteristics)
             ? information.characteristics
                 .map((characteristic) => ({
@@ -678,14 +770,14 @@ export default class HomeKitDevice extends EventEmitter {
         };
       };
 
-      // First up, we want to take a "snapshot" of services and characteristics on this accessory
-      // This will be used after all message calling to see if any changes have occurred on the accessory
-      // And if so, and running under Homebridge, we'll notify it of the changes
-      let originalServices =
+      // Snapshot the cached, bridged HAP accessory before invoking message handlers.
+      // External HAP and Matter accessories do not use this Homebridge cache update path.
+      let originalAccessory =
         this.backend === HomeKitDevice.HOMEBRIDGE &&
         this.accessory !== undefined &&
+        this.accessory?._associatedPlatform !== undefined &&
         typeof this.#platform?.updatePlatformAccessories === 'function'
-          ? snapshotAccessoryStructure(this.accessory)
+          ? snapshotAccessoryCache(this.accessory)
           : [];
 
       // Handle built-in types with special behavior
@@ -739,33 +831,35 @@ export default class HomeKitDevice extends EventEmitter {
           HomeKitDevice.#deviceRegistry.delete(this.#uuid);
           delete HomeKitDevice.#listeners[this.#uuid];
 
-          if (this.accessory !== undefined && typeof this.#platform?.unregisterPlatformAccessories === 'function') {
+          try {
             try {
-              this.#platform.unregisterPlatformAccessories(HomeKitDevice.PLUGIN_NAME, HomeKitDevice.PLATFORM_NAME, [this.accessory]);
-            } catch (error) {
-              this?.log?.warn?.(
-                'Failed to unregister Homebridge accessory "%s": %s',
-                this.deviceData.description,
-                String(error?.stack || error),
-              );
+              if (
+                this.accessory !== undefined &&
+                typeof this.#platform?.unregisterPlatformAccessories === 'function' &&
+                (this.accessory?._associatedPlugin !== HomeKitDevice.PLUGIN_NAME ||
+                  this.accessory?._associatedPlatform !== undefined)
+              ) {
+                await this.#platform.unregisterPlatformAccessories(HomeKitDevice.PLUGIN_NAME, HomeKitDevice.PLATFORM_NAME, [
+                  this.accessory,
+                ]);
+              }
+            } finally {
+              // Matter teardown must still run when HAP teardown fails.
+              if (
+                this.matterAccessory !== undefined &&
+                typeof this.matter?.unregisterPlatformAccessories === 'function'
+              ) {
+                await this.matter.unregisterPlatformAccessories(HomeKitDevice.PLUGIN_NAME, HomeKitDevice.PLATFORM_NAME, [
+                  this.matterAccessory,
+                ]);
+              }
             }
-          }
-
-          if (
-            this.matterAccessory !== undefined &&
-            typeof this.matter?.unregisterPlatformAccessories === 'function'
-          ) {
-            try {
-              await this.matter.unregisterPlatformAccessories(HomeKitDevice.PLUGIN_NAME, HomeKitDevice.PLATFORM_NAME, [
-                this.matterAccessory,
-              ]);
-            } catch (error) {
-              this?.log?.warn?.(
-                'Failed to unregister Matter accessory "%s": %s',
-                this.deviceData.description,
-                String(error?.stack || error),
-              );
-            }
+          } catch (error) {
+            this?.log?.warn?.(
+              'Failed to unregister accessory "%s": %s',
+              this.deviceData.description,
+              String(error?.stack || error),
+            );
           }
 
           if (this.accessory !== undefined && this.#platform === undefined) {
@@ -827,7 +921,7 @@ export default class HomeKitDevice extends EventEmitter {
             return;
           }
 
-          await this.#updateAccessoryInformation(merged);
+          await this.#updateAccessoryMetadata(merged);
 
           if (changed === true || (typeof args?.[0] === 'object' && args?.[0]?.force === true)) {
             // Call the onUpdate method and after any static handler registered via HomeKitDevice.message(uuid, type, handler)
@@ -918,13 +1012,13 @@ export default class HomeKitDevice extends EventEmitter {
       if (
         this.backend === HomeKitDevice.HOMEBRIDGE &&
         this.accessory !== undefined &&
+        this.accessory?._associatedPlatform !== undefined &&
         typeof this.#platform?.updatePlatformAccessories === 'function'
       ) {
-        // Let's see what's changed (if anything) on the accessory
-        let newServices = snapshotAccessoryStructure(this.accessory);
-        if (JSON.stringify(originalServices) !== JSON.stringify(newServices)) {
-          // We have changes detected for our accessory (services and/or characteristics)
-          // Notify Homebridge if that's our "backend" system
+        // Check whether the bridged HAP structure or metadata changed.
+        let updatedAccessory = snapshotAccessoryCache(this.accessory);
+        if (JSON.stringify(originalAccessory) !== JSON.stringify(updatedAccessory)) {
+          // Persist the changed HAP accessory in Homebridge's platform cache.
           this.#platform.updatePlatformAccessories([this.accessory]);
         }
       }
@@ -1344,103 +1438,123 @@ export default class HomeKitDevice extends EventEmitter {
     return { merged, changed };
   }
 
-  async #updateAccessoryInformation(deviceData) {
-    if (
-      typeof deviceData?.serialNumber === 'string' &&
-      deviceData.serialNumber !== '' &&
-      deviceData.serialNumber.toUpperCase() !== this.deviceData.serialNumber?.toUpperCase()
-    ) {
+  async #updateAccessoryMetadata(deviceData) {
+    // Synchronise common metadata across the available HAP and Matter representations.
+    // The merged device data is fully validated before this method is called.
+    if (deviceData.serialNumber.toUpperCase() !== this.deviceData.serialNumber?.toUpperCase()) {
       this?.log?.warn?.('Serial number on "%s" has changed', deviceData.description);
       this?.log?.warn?.('This may cause the device to become unresponsive in HomeKit or Matter');
     }
 
-    // AccessoryInformation exists only for a HAP representation.
-    if (this.accessory !== undefined) {
-      let informationService = this.accessory?.getService?.(this.hap.Service.AccessoryInformation);
-      if (informationService === undefined) {
-        this?.log?.error?.('AccessoryInformation service not found on accessory for "%s"', this.deviceData.description);
-      } else {
-        // Update details associated with the accessory: Name, Manufacturer, Model, Serial # and firmware version
-        // Check against actual characteristic values to ensure sync regardless of how state got out of sync
+    // HAP stores common metadata as characteristics on AccessoryInformation.
+    // Matter only devices have no HAP accessory, so no service is resolved.
+    let informationService = this.accessory?.getService?.(this.hap.Service.AccessoryInformation);
+    if (this.accessory !== undefined && informationService === undefined) {
+      this?.log?.error?.('AccessoryInformation service not found on accessory for "%s"', this.deviceData.description);
+    }
 
-        // Description/Name
-        if (typeof deviceData?.description === 'string' && deviceData.description !== '') {
-          informationService.updateCharacteristic(this.hap.Characteristic.Name, deviceData.description);
-          if (typeof this.accessory === 'object' && this.accessory.displayName !== deviceData.description) {
-            this.accessory.displayName = deviceData.description;
-          }
-        }
+    // Each entry maps one validated device value to its HAP characteristic and
+    // Matter descriptor property so both representations use the same source.
+    let metadata = [
+      [deviceData.description, this.hap?.Characteristic?.Name, 'displayName'],
+      [deviceData.manufacturer, this.hap?.Characteristic?.Manufacturer, 'manufacturer'],
+      [deviceData.model, this.hap?.Characteristic?.Model, 'model'],
+      [deviceData.serialNumber, this.hap?.Characteristic?.SerialNumber, 'serialNumber'],
+      [deviceData.softwareVersion, this.hap?.Characteristic?.FirmwareRevision, 'firmwareRevision'],
+    ];
 
-        // Manufacturer
-        if (typeof deviceData?.manufacturer === 'string' && deviceData.manufacturer !== '') {
-          informationService.updateCharacteristic(this.hap.Characteristic.Manufacturer, deviceData.manufacturer);
-        }
+    // Retain changed Matter properties until its single batched cache update
+    // succeeds, allowing the descriptor to be restored if persistence fails.
+    let previous = new Map();
 
-        // Model
-        if (typeof deviceData?.model === 'string' && deviceData.model !== '') {
-          informationService.updateCharacteristic(this.hap.Characteristic.Model, deviceData.model);
-        }
+    for (let [value, characteristic, property] of metadata) {
+      // HAP characteristic values update the live accessory immediately.
+      if (informationService !== undefined && informationService.getCharacteristic(characteristic)?.value !== value) {
+        informationService.updateCharacteristic(characteristic, value);
+      }
 
-        // Firmware Revision
-        if (typeof deviceData?.softwareVersion === 'string' && deviceData.softwareVersion !== '') {
-          informationService.updateCharacteristic(this.hap.Characteristic.FirmwareRevision, deviceData.softwareVersion);
+      // The HAP accessory name is also held outside AccessoryInformation.
+      if (property === 'displayName' && informationService !== undefined && this.accessory.displayName !== value) {
+        this.accessory.displayName = value;
+      }
 
-          // Remove SoftwareRevision if it exists
-          if (informationService.testCharacteristic(this.hap.Characteristic.SoftwareRevision) === true) {
-            this.removeCharacteristic(informationService, this.hap.Characteristic.SoftwareRevision);
-          }
-        }
-
-        // SerialNumber
-        if (typeof deviceData?.serialNumber === 'string' && deviceData.serialNumber !== '') {
-          let currentSerial = informationService.getCharacteristic(this.hap.Characteristic.SerialNumber)?.value;
-          if (currentSerial !== deviceData.serialNumber) {
-            informationService.updateCharacteristic(this.hap.Characteristic.SerialNumber, deviceData.serialNumber);
-          }
-        }
+      // Matter metadata lives directly on its cached accessory descriptor.
+      if (
+        typeof this.matterAccessory === 'object' &&
+        this.matterAccessory !== null &&
+        this.matterAccessory[property] !== value
+      ) {
+        previous.set(property, {
+          exists: Object.hasOwn(this.matterAccessory, property),
+          value: this.matterAccessory[property],
+        });
+        this.matterAccessory[property] = value;
       }
     }
 
-    // Matter metadata is stored directly on the MatterAccessory descriptor.
-    // Update its cache once after applying all changed common information.
-    if (typeof this.matterAccessory === 'object' && this.matterAccessory !== null) {
-      let metadata = {
-        displayName: deviceData.description,
-        manufacturer: deviceData.manufacturer,
-        model: deviceData.model,
-        serialNumber: deviceData.serialNumber,
-        firmwareRevision: deviceData.softwareVersion,
-      };
-      let previous = new Map();
+    // FirmwareRevision supersedes the legacy HAP SoftwareRevision value.
+    if (informationService?.testCharacteristic(this.hap.Characteristic.SoftwareRevision) === true) {
+      this.removeCharacteristic(informationService, this.hap.Characteristic.SoftwareRevision);
+    }
 
-      Object.entries(metadata).forEach(([key, value]) => {
-        if (typeof value === 'string' && value !== '' && this.matterAccessory[key] !== value) {
-          previous.set(key, {
-            exists: Object.hasOwn(this.matterAccessory, key),
-            value: this.matterAccessory[key],
-          });
-          this.matterAccessory[key] = value;
-        }
-      });
+    // Keep declared device data in each available representation's owned context.
+    // HAP persistence is handled by the surrounding cache snapshot; Matter joins
+    // the pending metadata changes in the same updatePlatformAccessories() call.
+    if (this.#persistedFields.length !== 0) {
+      let persistedData = Object.fromEntries(
+        this.#persistedFields
+          .filter((field) => Object.hasOwn(deviceData, field))
+          .map((field) => [field, deviceData[field]]),
+      );
+      let persistedState = JSON.stringify(HomeKitDevice.#normaliseForCompare(persistedData));
 
-      if (previous.size !== 0 && typeof this.matter?.updatePlatformAccessories === 'function') {
-        try {
-          await this.matter.updatePlatformAccessories([this.matterAccessory]);
-        } catch (error) {
-          // Restore the last cached representation so a later update can retry.
-          previous.forEach((entry, key) => {
-            if (entry.exists === true) {
-              this.matterAccessory[key] = entry.value;
-            } else {
-              delete this.matterAccessory[key];
-            }
-          });
-          this?.log?.warn?.(
-            'Failed to update Matter accessory information for "%s": %s',
-            deviceData.description,
-            String(error?.stack || error),
-          );
-        }
+      if (
+        this.accessory !== undefined &&
+        JSON.stringify(
+          HomeKitDevice.#normaliseForCompare(
+            this.accessory?.context?.[this.constructor.PERSISTENCE_NAMESPACE],
+          ),
+        ) !== persistedState
+      ) {
+        this.accessory.context ??= {};
+        this.accessory.context[this.constructor.PERSISTENCE_NAMESPACE] = structuredClone(persistedData);
+      }
+
+      if (
+        this.matterAccessory !== undefined &&
+        JSON.stringify(
+          HomeKitDevice.#normaliseForCompare(
+            this.matterAccessory?.context?.[this.constructor.PERSISTENCE_NAMESPACE],
+          ),
+        ) !== persistedState
+      ) {
+        previous.set('context', {
+          exists: Object.hasOwn(this.matterAccessory, 'context'),
+          value: structuredClone(this.matterAccessory.context),
+        });
+        this.matterAccessory.context ??= {};
+        this.matterAccessory.context[this.constructor.PERSISTENCE_NAMESPACE] = structuredClone(persistedData);
+      }
+    }
+
+    // Persist all changed Matter metadata and context in one update after applying it.
+    if (previous.size !== 0 && typeof this.matter?.updatePlatformAccessories === 'function') {
+      try {
+        await this.matter.updatePlatformAccessories([this.matterAccessory]);
+      } catch (error) {
+        // Restore the last cached representation so a later update can retry.
+        previous.forEach((entry, key) => {
+          if (entry.exists === true) {
+            this.matterAccessory[key] = entry.value;
+          } else {
+            delete this.matterAccessory[key];
+          }
+        });
+        this?.log?.warn?.(
+          'Failed to update Matter accessory metadata for "%s": %s',
+          deviceData.description,
+          String(error?.stack || error),
+        );
       }
     }
 

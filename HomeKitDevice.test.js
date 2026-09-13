@@ -175,6 +175,62 @@ test('Homebridge honours the explicit Matter enablement check', () => {
   assert.equal(device.matterAccessory, cachedMatterAccessory);
 });
 
+test('constructor restores declared fields from a subclass persistence namespace', () => {
+  class PersistedDevice extends HomeKitDevice {
+    static PERSISTENCE_NAMESPACE = 'PersistedDevice';
+  }
+
+  let cachedHapAccessory = new MockAccessory('Cached HAP accessory', 'uuid:homebridge-example_PERSISTED-DATA');
+  cachedHapAccessory.context = {
+    PersistedDevice: {
+      hapSetting: { source: 'hap' },
+      sharedSetting: 'cached-hap',
+      ignoredSetting: 'ignored',
+    },
+  };
+  let cachedMatterAccessory = {
+    UUID: 'uuid:homebridge-example_PERSISTED-DATA',
+    deviceType: { name: 'OnOffSwitch' },
+    context: {
+      PersistedDevice: {
+        matterSetting: 'matter',
+        sharedSetting: 'cached-matter',
+      },
+    },
+  };
+  let api = {
+    version: 2.7,
+    hap,
+    matter: {},
+    isMatterEnabled() {
+      return true;
+    },
+    on() {},
+  };
+  let device = new PersistedDevice(
+    [cachedHapAccessory, cachedMatterAccessory],
+    api,
+    { ...deviceData('PERSISTED-DATA'), sharedSetting: 'current' },
+    ['hapSetting', 'matterSetting', 'sharedSetting'],
+  );
+
+  assert.deepEqual(device.deviceData.hapSetting, { source: 'hap' });
+  assert.equal(device.deviceData.matterSetting, 'matter');
+  assert.equal(device.deviceData.sharedSetting, 'current');
+  assert.equal(device.deviceData.ignoredSetting, undefined);
+
+  cachedHapAccessory.context.PersistedDevice.hapSetting.source = 'changed';
+  assert.deepEqual(device.deviceData.hapSetting, { source: 'hap' });
+});
+
+test('constructor rejects invalid persisted device data field declarations', () => {
+  let data = deviceData('INVALID-PERSISTED-DATA');
+
+  assert.throws(() => new HomeKitDevice(undefined, hap, data, 'setting'), TypeError);
+  assert.throws(() => new HomeKitDevice(undefined, hap, data, ['']), TypeError);
+  assert.throws(() => new HomeKitDevice(undefined, hap, data, ['setting', 'setting']), TypeError);
+});
+
 test('Homebridge honours the explicit HAP enablement check and legacy default', async () => {
   let hapEnabledChecks = 0;
   let hapRegistrations = 0;
@@ -292,6 +348,7 @@ test('Matter device type is required only when Matter is the sole Homebridge rep
 test('Homebridge exposes HAP and Matter through the existing lifecycle', async () => {
   let calls = {
     hapRegistered: [],
+    hapUpdated: [],
     hapUnregistered: [],
     matterRegistered: [],
     matterUnregistered: [],
@@ -323,11 +380,15 @@ test('Homebridge exposes HAP and Matter through the existing lifecycle', async (
     platformAccessory: MockAccessory,
     registerPlatformAccessories(plugin, platform, accessories) {
       calls.hapRegistered.push({ plugin, platform, accessories });
+      accessories[0]._associatedPlugin = plugin;
+      accessories[0]._associatedPlatform = platform;
     },
     unregisterPlatformAccessories(plugin, platform, accessories) {
       calls.hapUnregistered.push({ plugin, platform, accessories });
     },
-    updatePlatformAccessories() {},
+    updatePlatformAccessories(accessories) {
+      calls.hapUpdated.push(accessories);
+    },
     on() {},
   };
 
@@ -353,7 +414,7 @@ test('Homebridge exposes HAP and Matter through the existing lifecycle', async (
     }
   }
 
-  let device = new MatterSwitch(undefined, api, { ...deviceData('HB-MATTER'), on: false });
+  let device = new MatterSwitch(undefined, api, { ...deviceData('HB-MATTER'), on: false }, ['on']);
   let added = await device.add({
     hapAccessoryName: 'Switch',
     hapCategory: hap.Categories.SWITCH,
@@ -366,10 +427,30 @@ test('Homebridge exposes HAP and Matter through the existing lifecycle', async (
   assert.equal(device.accessory.category, hap.Categories.SWITCH);
   assert.equal(added, true);
   assert.equal(calls.hapRegistered.length, 1);
+  assert.equal(calls.hapUpdated.length, 0);
   assert.equal(calls.matterRegistered.length, 1);
   assert.equal(calls.matterInformationUpdated.length, 0);
   assert.equal(calls.matterRegistered[0].accessories[0], device.matterAccessory);
+  assert.deepEqual(calls.hapRegistered[0].accessories[0].context.HomeKitDevice, { on: false });
+  assert.deepEqual(calls.matterRegistered[0].accessories[0].context.HomeKitDevice, { on: false });
+  assert.notEqual(
+    calls.hapRegistered[0].accessories[0].context.HomeKitDevice,
+    calls.matterRegistered[0].accessories[0].context.HomeKitDevice,
+  );
   assert.deepEqual(calls.matterUpdated.at(-1).attributes, { onOff: false });
+
+  await device.update({ on: true });
+
+  assert.deepEqual(device.accessory.context.HomeKitDevice, { on: true });
+  assert.deepEqual(device.matterAccessory.context.HomeKitDevice, { on: true });
+  assert.notEqual(device.accessory.context.HomeKitDevice, device.matterAccessory.context.HomeKitDevice);
+  assert.equal(calls.hapUpdated.length, 1);
+  assert.equal(calls.matterInformationUpdated.length, 1);
+
+  await device.update({ on: true });
+
+  assert.equal(calls.hapUpdated.length, 1);
+  assert.equal(calls.matterInformationUpdated.length, 1);
 
   await device.remove();
 
@@ -377,6 +458,83 @@ test('Homebridge exposes HAP and Matter through the existing lifecycle', async (
   assert.equal(calls.matterUnregistered.length, 1);
   assert.equal(device.accessory, undefined);
   assert.equal(device.matterAccessory, undefined);
+});
+
+test('Matter persisted context rolls back and retries after a cache update failure', async () => {
+  let updateCalls = 0;
+  let failUpdate = true;
+  let api = {
+    version: 2.7,
+    hap,
+    matter: {
+      async registerPlatformAccessories() {},
+      async updatePlatformAccessories() {
+        updateCalls += 1;
+        if (failUpdate === true) {
+          throw new Error('Matter cache unavailable');
+        }
+      },
+    },
+    isHapEnabled() {
+      return false;
+    },
+    isMatterEnabled() {
+      return true;
+    },
+    on() {},
+  };
+  let device = new HomeKitDevice(undefined, api, { ...deviceData('MATTER-CONTEXT-RETRY'), on: false }, ['on']);
+
+  assert.equal(await device.add({ hapAccessoryName: null, matterDeviceType: {} }), true);
+
+  await device.update({ on: true });
+
+  assert.deepEqual(device.matterAccessory.context.HomeKitDevice, { on: false });
+  assert.equal(updateCalls, 1);
+
+  failUpdate = false;
+  await device.update({ on: true });
+
+  assert.deepEqual(device.matterAccessory.context.HomeKitDevice, { on: true });
+  assert.equal(updateCalls, 2);
+
+  await device.remove();
+});
+
+test('Matter teardown still runs when HAP teardown fails', async () => {
+  let calls = [];
+  let cachedHapAccessory = new MockAccessory('Cached HAP accessory', 'uuid:homebridge-example_TEARDOWN');
+  cachedHapAccessory._associatedPlatform = HomeKitDevice.PLATFORM_NAME;
+  let cachedMatterAccessory = {
+    UUID: 'uuid:homebridge-example_TEARDOWN',
+    deviceType: { name: 'OnOffSwitch' },
+  };
+  let api = {
+    version: 2.7,
+    hap,
+    matter: {
+      async unregisterPlatformAccessories() {
+        calls.push('matter');
+      },
+    },
+    isMatterEnabled() {
+      return true;
+    },
+    unregisterPlatformAccessories() {
+      calls.push('hap');
+      throw new Error('HAP teardown failed');
+    },
+    on() {},
+  };
+  let device = new HomeKitDevice(
+    [cachedHapAccessory, cachedMatterAccessory],
+    api,
+    deviceData('TEARDOWN'),
+  );
+
+  await device.remove();
+
+  assert.deepEqual(calls, ['hap', 'matter']);
 });
 
 test('Homebridge supports Matter without creating a HAP accessory or AccessoryInformation service', async () => {
@@ -469,6 +627,8 @@ test('Homebridge add without arguments preserves the default HAP representation 
     platformAccessory: MockAccessory,
     registerPlatformAccessories(plugin, platform, accessories) {
       calls.registered.push({ plugin, platform, accessories });
+      accessories[0]._associatedPlugin = plugin;
+      accessories[0]._associatedPlatform = platform;
     },
     updatePlatformAccessories(accessories) {
       calls.updated.push(accessories);
@@ -497,6 +657,130 @@ test('Homebridge add without arguments preserves the default HAP representation 
   await device.remove();
 
   assert.equal(calls.unregistered.length, 1);
+});
+
+test('Homebridge publishes external HAP only after onAdd completes', async () => {
+  let calls = { registered: 0, unregistered: 0, updated: 0, published: 0, onAdd: 0 };
+  let api = {
+    version: 2.7,
+    hap,
+    platformAccessory: MockAccessory,
+    registerPlatformAccessories() {
+      calls.registered += 1;
+    },
+    unregisterPlatformAccessories() {
+      calls.unregistered += 1;
+    },
+    updatePlatformAccessories() {
+      calls.updated += 1;
+    },
+    publishExternalAccessories(plugin, accessories) {
+      calls.published += 1;
+      assert.equal(plugin, HomeKitDevice.PLUGIN_NAME);
+      assert.equal(accessories[0].configured, true);
+      assert.equal(accessories[0].updated, true);
+      accessories[0]._associatedPlugin = plugin;
+    },
+    on() {},
+  };
+
+  class ExternalTelevision extends HomeKitDevice {
+    async onAdd() {
+      calls.onAdd += 1;
+      assert.equal(calls.registered, 0);
+      assert.equal(calls.published, 0);
+      assert.notEqual(this.accessory, undefined);
+      this.accessory.configured = true;
+    }
+
+    async onUpdate() {
+      this.accessory.updated = true;
+    }
+  }
+
+  let device = new ExternalTelevision(undefined, api, deviceData('EXTERNAL-TV'));
+  let added = await device.add({
+    hapAccessoryName: 'Television',
+    hapCategory: 31,
+    externalPublish: true,
+  });
+
+  assert.equal(added, true);
+  assert.equal(calls.onAdd, 1);
+  assert.equal(calls.registered, 0);
+  assert.equal(calls.updated, 0);
+  assert.equal(calls.published, 1);
+
+  await device.remove();
+
+  assert.equal(calls.unregistered, 0);
+});
+
+test('Homebridge requires its external publishing API before external onAdd', async () => {
+  let onAddCalls = 0;
+  let api = {
+    version: 2.7,
+    hap,
+    platformAccessory: MockAccessory,
+    registerPlatformAccessories() {},
+    on() {},
+  };
+
+  class ExternalTelevision extends HomeKitDevice {
+    async onAdd() {
+      onAddCalls += 1;
+    }
+  }
+
+  let device = new ExternalTelevision(undefined, api, deviceData('EXTERNAL-UNAVAILABLE'));
+
+  assert.equal(await device.add({ hapAccessoryName: 'Television', externalPublish: true }), undefined);
+  assert.equal(device.accessory, undefined);
+  assert.equal(onAddCalls, 0);
+});
+
+test('independent HAP publication failures use the same failure path', async () => {
+  let homebridgeApi = {
+    version: 2.7,
+    hap,
+    platformAccessory: MockAccessory,
+    publishExternalAccessories() {
+      throw new Error('External publish failed');
+    },
+    on() {},
+  };
+  let externalDevice = new HomeKitDevice(undefined, homebridgeApi, deviceData('EXTERNAL-PUBLISH-FAILED'));
+
+  assert.equal(await externalDevice.add({ hapAccessoryName: 'Television', externalPublish: true }), false);
+  assert.equal(externalDevice.accessory, undefined);
+
+  class FailingAccessory extends MockAccessory {
+    async publish() {
+      throw new Error('Standalone publish failed');
+    }
+  }
+
+  let standaloneHap = {
+    ...hap,
+    Accessory: FailingAccessory,
+    HAPLibraryVersion() {
+      return '2.0.0';
+    },
+  };
+  let standaloneDevice = new HomeKitDevice(undefined, standaloneHap, {
+    ...deviceData('STANDALONE-PUBLISH-FAILED'),
+    hkUsername: '11:22:33:44:55:77',
+    hkPairingCode: '123-45-678',
+  });
+
+  assert.equal(
+    await standaloneDevice.add({ hapAccessoryName: 'Switch', hapCategory: standaloneHap.Categories.SWITCH }),
+    false,
+  );
+  assert.equal(standaloneDevice.accessory, undefined);
+
+  await externalDevice.remove();
+  await standaloneDevice.remove();
 });
 
 test('Homebridge does not call onAdd when HAP registration leaves no usable representation', async () => {
@@ -675,7 +959,11 @@ test('standalone HAP-NodeJS remains HAP-only', async () => {
     hkPairingCode: '123-45-678',
   };
   let device = new HomeKitDevice(undefined, standaloneHap, data);
-  let added = await device.add({ hapAccessoryName: 'Switch', hapCategory: standaloneHap.Categories.SWITCH });
+  let added = await device.add({
+    hapAccessoryName: 'Switch',
+    hapCategory: standaloneHap.Categories.SWITCH,
+    externalPublish: true,
+  });
 
   assert.equal(device.backend, HomeKitDevice.HAP_NODEJS);
   assert.equal(device.matter, undefined);

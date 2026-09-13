@@ -2,6 +2,25 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2026/09/12
+
+### Added
+
+- Added the `externalPublish` option for Homebridge HAP accessories, creating the platform accessory before `onAdd()` and publishing it externally only after its services, controllers, and initial state have been configured
+- Added optional persistence for selected `deviceData` fields under the context key defined by static `PERSISTENCE_NAMESPACE` (defaulting to `HomeKitDevice`), including constructor restoration, initial HAP and Matter registration data, HAP cache detection, and batched Matter updates
+
+### Changed
+
+- Unified external Homebridge and standalone HAP publication logging and failure handling
+- Combined HAP and Matter removal into the shared lifecycle teardown while retaining their protocol-specific unregister APIs
+- Renamed `#updateAccessoryInformation()` to `#updateAccessoryMetadata()` and unified validated HAP and Matter metadata mapping in one synchronisation pass
+
+### Fixed
+
+- Restricted Homebridge HAP cache snapshots and `updatePlatformAccessories()` calls to cached bridged accessories, excluding externally published accessories
+- Prevented externally published HAP accessories from being passed to Homebridge's bridged-accessory unregister API
+- Ensured Matter unregistration still runs when HAP unregistration fails for a dual-protocol accessory
+
 ## 2026/09/11
 
 ### Changed
@@ -35,7 +54,7 @@ All notable changes to the `HomeKitDevice` module are documented in this file.
 - Clarified that `backend` identifies the runtime: standalone HAP-NodeJS or Homebridge, with Homebridge optionally providing both HAP and Matter
 - Restructured `add()` into standalone HAP-NodeJS, Homebridge HAP, shared HAP metadata/history, and Homebridge Matter phases
 - Allowed Homebridge Matter-only devices to omit the HAP name/category without creating a HAP accessory or requiring `AccessoryInformation`
-- Synchronized shared name, manufacturer, model, serial number, and firmware metadata to Matter during the existing `UPDATE` route
+- Synchronised shared name, manufacturer, model, serial number, and firmware metadata to Matter during the existing `UPDATE` route
 - Coalesced changed Matter metadata into one `updatePlatformAccessories()` call and retained retryable local values when that call fails
 - Preserved HAP as the default for existing Homebridge `add()` calls and made `add(null)` the explicit Matter-only form
 - Validated HAP information before registration, reported failed setup truthfully, and retained HAP when optional Matter registration fails
