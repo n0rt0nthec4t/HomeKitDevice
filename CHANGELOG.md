@@ -2,6 +2,18 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2026/09/21
+
+### Changed
+
+- Added JSDoc contracts for device data, representation setup, lifecycle and message routing, timers, HAP helpers, Matter cluster configuration, and internal validation and persistence helpers
+
+## 2026/09/17
+
+### Added
+
+- Added `addMatterCluster()` to configure and merge initial cluster state and Matter command handlers before registration
+
 ## 2026/09/12
 
 ### Added

@@ -16,7 +16,8 @@ The `HomeKitDevice` module provides:
 - Static and instance `.message()` routing
 - Public wrapper methods (`add()`, `update()`, `remove()`, `shutdown()`, `get()`, `set()`, `history()`)
 - Internal named timer system (`addTimer`, `removeTimer`, `hasTimer`)
-- Safe service and characteristic helpers (`addService`, `removeService`, `addCharacteristic`, `removeCharacteristic`)
+- Safe HAP service/characteristic helpers and Matter cluster setup (`addService`, `removeService`, `addCharacteristic`,
+  `removeCharacteristic`, `addMatterCluster`)
 - EveHome-compatible history support (`history`)
 - Internal device registry for UUID-based lookup and messaging
 - Selected `deviceData` persistence through Homebridge HAP and Matter accessory context
@@ -215,6 +216,32 @@ Supported `options`:
 
 Removes the specified characteristic from a HAP service if present.  
 Accepts either an existing characteristic instance or a HAP characteristic type. Returns `true` when a characteristic was removed.
+
+---
+
+### `addMatterCluster(clusterName, options)`
+
+Adds or extends a cluster on `this.matterAccessory` before Matter registration and returns its configured initial state.
+Repeated calls merge initial state and command handlers without duplicating the cluster.
+
+Supported `options`:
+
+- `initialState` – Initial cluster attributes, corresponding to `initialValue` for a HAP characteristic
+- `handlers` – Matter command names mapped to their handler functions
+
+```js
+this.addMatterCluster(this.matter.clusterNames.OnOff, {
+  initialState: { onOff: this.deviceData.on === true },
+  handlers: {
+    on: () => this.set({ on: true }),
+    off: () => this.set({ on: false }),
+  },
+});
+```
+
+Later device state changes should be published through `this.matter.updateAccessoryState()`. Command handlers remain explicitly
+named because Matter commands are not generic characteristic writes. A subclass with an exceptional live-read requirement can
+provide Matter's accessory-level `getState(cluster, attribute)` callback directly on `this.matterAccessory`.
 
 ---
 

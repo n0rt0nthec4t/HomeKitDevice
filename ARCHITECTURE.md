@@ -4,7 +4,7 @@
 
 `HomeKitDevice` is a shared base class for accessory implementations. It sits between application-owned device data and either the standalone HAP-NodeJS runtime or the Homebridge runtime, giving each device type a common lifecycle, message bus, accessory helper layer, timer system, and optional EveHome history integration. Homebridge may expose HAP, Matter, or both.
 
-**Version:** 2026.09.12
+**Version:** 2026.09.17
 **Primary module:** `HomeKitDevice.js`  
 **Consumers:** subclasses and host applications
 
@@ -328,7 +328,7 @@ The snapshot tracks the display name, AccessoryInformation values, service UUIDs
 
 ---
 
-## Service And Characteristic Helpers
+## HAP Service/Characteristic And Matter Cluster Helpers
 
 ### `addService(serviceType, name, subType, eveOptions)`
 
@@ -352,6 +352,17 @@ The helper respects optional characteristics and avoids adding duplicates.
 ### `removeCharacteristic(service, characteristicOrType)`
 
 Removes an existing characteristic by instance or type without using `getCharacteristic()`, which can add optional characteristics as a side effect.
+
+### `addMatterCluster(clusterName, options)`
+
+Ensures a root Matter cluster exists before registration and optionally applies:
+
+- `initialState` - initial cluster attributes, corresponding to `initialValue` for a HAP characteristic
+- `handlers` - Matter command names mapped to their handler functions
+
+Repeated calls merge initial state and command handlers with the existing cluster declaration. The helper returns the configured
+initial state, or `undefined` when the cluster name or Matter descriptor is unavailable. Later operational state changes use
+Matter's `updateAccessoryState()` API.
 
 ---
 

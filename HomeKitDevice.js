@@ -1,6 +1,6 @@
 // Base Class: HomeKitDevice
 //
-// Shared base class for HomeKit-enabled devices across multiple projects.
+// Shared base class for HAP and Matter devices across multiple projects.
 // Supports the Homebridge runtime (optional HAP and Matter) and the direct
 // HAP-NodeJS runtime.
 //
@@ -11,9 +11,9 @@
 // Responsibilities:
 // - Manage HAP and Matter representation creation and removal
 // - Provide unified message routing for device lifecycle and custom events
-// - Maintain internal device registry -> cross-device messaging
-// - Standardise HomeKit service and characteristic helper methods
-// - Integrate optional EveHome-compatible history support
+// - Maintain internal device registry -> cross device messaging
+// - Standardise HAP service/characteristic and Matter cluster helper methods
+// - Integrate optional EveHome compatible history support
 // - Provide internal timer management for device instances
 //
 // Lifecycle Hooks (optional in subclasses):
@@ -37,8 +37,8 @@
 // - Internal lifecycle events and custom interactions use the same message system
 //
 // Key Features:
-// - addService() / addCharacteristic()
-//     -> simplified HomeKit setup helpers
+// - addService() / addCharacteristic() / addMatterCluster()
+//     -> simplified HAP and Matter setup helpers
 // - addTimer() / removeTimer() / hasTimer()
 //     -> per-device timer management
 // - history()
@@ -48,20 +48,46 @@
 //
 // Architecture:
 // - Designed to be extended per device type (e.g. Camera, Thermostat, Valve)
-// - Operates as the abstraction layer between raw device data and HomeKit
+// - Operates as the abstraction layer between raw device data and HAP/Matter representations
 // - Can run under Homebridge or standalone HAP-NodeJS environments
 //
 // Example:
 //
 // class MyDevice extends HomeKitDevice {
 //   async onAdd() {
-//     let service = this.addService(this.hap.Service.Switch, this.deviceData.description);
+//     if (this.accessory !== undefined) {
+//       this.addService(this.hap.Service.Switch, this.deviceData.description);
+//     }
+//
+//     if (this.matterAccessory !== undefined) {
+//       this.addMatterCluster(this.matter.clusterNames.OnOff, {
+//         initialState: { onOff: this.deviceData.on === true },
+//         handlers: {
+//           on: () => this.set({ on: true }),
+//           off: () => this.set({ on: false }),
+//         },
+//       });
+//     }
+//   }
+//
+//   async onUpdate(deviceData) {
+//     if (this.matterAccessory !== undefined) {
+//       await this.matter.updateAccessoryState(
+//         this.uuid,
+//         this.matter.clusterNames.OnOff,
+//         { onOff: deviceData.on === true },
+//       );
+//     }
 //   }
 // }
 //
 // HomeKitDevice.LOGGER = log;
-// let device = new MyDevice(undefined, hap, deviceData);
-// await device.add({ hapAccessoryName: 'My Device', hapCategory: hap.Categories.SWITCH });
+// let device = new MyDevice(cachedAccessory, api, deviceData);
+// await device.add({
+//   hapAccessoryName: 'My Device',
+//   hapCategory: api.hap.Categories.SWITCH,
+//   matterDeviceType: api.matter?.deviceTypes.OnOffSwitch,
+// });
 //
 // Notes:
 // - Designed for subclassing only
@@ -86,7 +112,88 @@ const LOG_LEVELS = {
   DEBUG: 'debug',
 };
 
-// Define our HomeKit device class
+/**
+ * Core identity and metadata shared by HAP and Matter representations.
+ * Device subclasses may add their own fields to this object.
+ *
+ * @typedef {object} HomeKitDeviceData
+ * @property {string} serialNumber Stable device serial number.
+ * @property {string} softwareVersion Device firmware or software version.
+ * @property {string} description User-visible device name.
+ * @property {string} manufacturer Device manufacturer.
+ * @property {string} model Device model.
+ * @property {string} [hkUsername] MAC-style HAP username required by standalone HAP-NodeJS.
+ * @property {string} [hkPairingCode] HAP setup code required by standalone HAP-NodeJS.
+ * @property {boolean} [online] Current device reachability state.
+ * @property {boolean} [eveHistory] Whether configured HAP services should be linked to Eve history.
+ */
+
+/**
+ * Options controlling which protocol representations are created by {@link HomeKitDevice#add}.
+ *
+ * @typedef {object} HomeKitDeviceAddOptions
+ * @property {string|null} [hapAccessoryName] HAP name, or `null` to suppress creation of a new HAP accessory.
+ * @property {number} [hapCategory] HAP accessory category; required by standalone HAP-NodeJS.
+ * @property {boolean} [externalPublish=false] Whether Homebridge should publish the HAP accessory outside its bridge.
+ * @property {object} [matterDeviceType] Homebridge Matter device type descriptor.
+ * @property {boolean} [enableHistory=false] Whether to create Eve-compatible history for the HAP representation.
+ */
+
+/**
+ * Options for an Eve-compatible history entry.
+ *
+ * @typedef {object} HomeKitHistoryOptions
+ * @property {boolean} [force=false] Store the entry even when its values match the latest entry.
+ * @property {number} [timegap] Minimum interval in seconds delegated to the history service.
+ */
+
+/**
+ * Options for a named device timer.
+ *
+ * @typedef {object} HomeKitTimerOptions
+ * @property {number} [delay] Milliseconds before the first invocation.
+ * @property {number} [interval] Milliseconds between repeated invocations.
+ * @property {boolean} [reset=false] Replace an existing timer with the same handle.
+ * @property {Object<string, *>} [message] Payload supplied to the callback or `onTimer` hook.
+ */
+
+/**
+ * Called when a named device timer fires.
+ *
+ * @callback HomeKitTimerCallback
+ * @param {string} timerHandle Name of the timer that fired.
+ * @param {Object<string, *>} message Timer payload.
+ * @returns {*|Promise<*>} Optional callback result; timer execution does not consume it.
+ */
+
+/**
+ * Options applied while resolving a HAP characteristic.
+ *
+ * @typedef {object} HomeKitCharacteristicOptions
+ * @property {Object<string, *>} [props] HAP characteristic constraints and metadata.
+ * @property {Function} [onSet] Handler invoked for a HomeKit write.
+ * @property {Function} [onGet] Handler invoked for a HomeKit read.
+ * @property {*} [initialValue] Value applied through the service without invoking `onSet`.
+ */
+
+/**
+ * Declarative state and command handlers for a Matter cluster.
+ *
+ * @typedef {object} HomeKitMatterClusterOptions
+ * @property {Object<string, *>} [initialState] Initial cluster attribute values.
+ * @property {Object<string, Function>} [handlers] Command names mapped to their handlers.
+ */
+
+/**
+ * Base abstraction for devices exposed through HAP and/or Matter.
+ *
+ * HomeKitDevice owns device identity, persistence, protocol representation
+ * lifecycle, message routing, history integration, and timer management.
+ * Device-specific implementations extend this class and implement the
+ * appropriate lifecycle hooks.
+ *
+ * @extends EventEmitter
+ */
 export default class HomeKitDevice extends EventEmitter {
   // Device messages
   static ADD = 'HomeKitDevice.onAdd';
@@ -112,7 +219,7 @@ export default class HomeKitDevice extends EventEmitter {
   static EVEHOME = undefined; // HomeKitHistory object
   static LOGGER = undefined; // Logging object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.09.12'; // Code version
+  static VERSION = '2026.09.17'; // Code version
 
   // Persistent context namespace for this class. Subclasses may override to isolate their own context.
   static PERSISTENCE_NAMESPACE = 'HomeKitDevice';
@@ -143,6 +250,15 @@ export default class HomeKitDevice extends EventEmitter {
   #postSetupDetails = []; // Use for extra output details once a device has been setup
   #timers = new Map(); // Internal timers for this device
 
+  /**
+   * Create a HomeKit device instance.
+   *
+   * @param {object|object[]|undefined} accessory Restored Homebridge accessory representation or representations.
+   * @param {object|undefined} api Homebridge API or HAP-NodeJS API.
+   * @param {HomeKitDeviceData} deviceData Initial device data.
+   * @param {string[]} persistedFields Device data fields persisted in accessory context.
+   * @throws {TypeError} When device data or persisted fields fail validation.
+   */
   constructor(accessory = undefined, api = undefined, deviceData = {}, persistedFields = []) {
     super(); // Setup event emitter for our class ONLY
 
@@ -272,7 +388,16 @@ export default class HomeKitDevice extends EventEmitter {
     }
   }
 
-  // Class functions
+  /**
+   * Create, configure, and register the requested HAP and Matter representations.
+   *
+   * The subclass `onAdd` hook runs after base descriptors exist and before
+   * Matter registration or independent HAP publication.
+   *
+   * @param {HomeKitDeviceAddOptions} [options={}] Representation and publication options.
+   * @returns {Promise<boolean|undefined>} `true` when at least one representation is available,
+   * `false` for a completed setup failure, or `undefined` when validation or a hook rejects setup.
+   */
   async add(options = {}) {
     if (options === null || typeof options !== 'object' || options.constructor !== Object) {
       return;
@@ -300,7 +425,7 @@ export default class HomeKitDevice extends EventEmitter {
       return;
     }
 
-    // Copy only declared fields into the library-owned context namespace.
+    // Copy only declared fields into the library owned context namespace.
     // Each representation receives its own data so neither shares mutable state.
     const persistedData = Object.fromEntries(
       this.#persistedFields
@@ -513,11 +638,21 @@ export default class HomeKitDevice extends EventEmitter {
     return this.accessory !== undefined || this.matterAccessory !== undefined;
   }
 
+  /**
+   * Permanently remove this device and release its protocol registrations and resources.
+   *
+   * @returns {Promise<void>}
+   */
   async remove() {
     // Trigger registered handlers (onRemove + listeners)
     await this.message(HomeKitDevice.REMOVE);
   }
 
+  /**
+   * Broadcast the shutdown lifecycle event to every registered device.
+   *
+   * @returns {Promise<void>}
+   */
   static async shutdown() {
     // Notify all registered devices of process shutdown.
     // Calls the instance shutdown() method on each registered device.
@@ -531,11 +666,23 @@ export default class HomeKitDevice extends EventEmitter {
     }
   }
 
+  /**
+   * Notify this device of shutdown and release its timers and listeners.
+   *
+   * @returns {Promise<void>}
+   */
   async shutdown() {
     // Trigger registered handlers (onShutdown + listeners)
     await this.message(HomeKitDevice.SHUTDOWN);
   }
 
+  /**
+   * Merge validated device data, synchronise shared metadata, and dispatch `onUpdate` when changed.
+   *
+   * @param {Partial<HomeKitDeviceData>} deviceData Partial or complete device data.
+   * @param {...*} args Additional values forwarded to update hooks and registered handlers.
+   * @returns {Promise<void>}
+   */
   async update(deviceData, ...args) {
     if (
       deviceData === null || // Must not be null
@@ -550,6 +697,16 @@ export default class HomeKitDevice extends EventEmitter {
     await this.message(HomeKitDevice.UPDATE, deviceData, ...args);
   }
 
+  /**
+   * Store an Eve-compatible history entry and notify hooks after the service accepts it.
+   *
+   * A missing or non-finite `entry.time` is replaced with the current epoch time in seconds.
+   *
+   * @param {object} target HAP service associated with the history entry; it must expose a UUID.
+   * @param {Object<string, *>} entry History values to store.
+   * @param {HomeKitHistoryOptions} [options={}] Duplicate and time-gap controls.
+   * @returns {Promise<void>}
+   */
   async history(target, entry, options = {}) {
     if (
       typeof this.historyService !== 'object' ||
@@ -576,6 +733,13 @@ export default class HomeKitDevice extends EventEmitter {
     await this.message(HomeKitDevice.HISTORY, target, entry, options);
   }
 
+  /**
+   * Dispatch a plain-object write request through the `SET` lifecycle route.
+   *
+   * @param {Object<string, *>} values Values requested by the caller.
+   * @param {...*} args Additional values forwarded to set hooks and registered handlers.
+   * @returns {Promise<void>}
+   */
   async set(values, ...args) {
     if (
       values === null || // Must not be null
@@ -589,11 +753,31 @@ export default class HomeKitDevice extends EventEmitter {
     await this.message(HomeKitDevice.SET, values, ...args);
   }
 
+  /**
+   * Dispatch a read request through the `GET` lifecycle route.
+   *
+   * @param {*} values Query supplied to get hooks and registered handlers.
+   * @param {...*} args Additional values forwarded with the query.
+   * @returns {Promise<*>} Hook result, merged object results, `false` on a trapped failure, or `undefined`.
+   */
   async get(values, ...args) {
     // Trigger registered handlers (onGet + listeners)
     return this.message(HomeKitDevice.GET, values, ...args);
   }
 
+  /**
+   * Register a handler for a device message type or deliver a message by UUID.
+   *
+   * Passing a function registers it directly. Passing a non-plain object registers
+   * its matching `on<Type>` method with that object as the call context. All other
+   * values are delivered to the currently registered device instance.
+   *
+   * @param {string} uuid Target device UUID.
+   * @param {string} type Message type, normally one of the class lifecycle constants.
+   * @param {*|Function|object} [message] Listener, listener context, or message payload.
+   * @param {...*} args Additional values forwarded during delivery.
+   * @returns {Promise<*>} Delivery result, or `undefined` after registration or when no device matches.
+   */
   static async message(uuid, type, message = undefined, ...args) {
     // This static entry point either registers a listener for a device UUID or
     // forwards a message to the matching live HomeKitDevice instance.
@@ -639,6 +823,18 @@ export default class HomeKitDevice extends EventEmitter {
     return this.#deviceRegistry.get(uuid)?.message?.(type, message, ...args);
   }
 
+  /**
+   * Route a lifecycle or custom message through subclass hooks and registered handlers.
+   *
+   * Named hooks are invoked from the most-derived prototype toward base prototypes.
+   * Object results from hooks and registered handlers are merged, with registered
+   * handler fields taking precedence.
+   *
+   * @param {string} type Message type used to resolve the corresponding `on<Type>` hook.
+   * @param {*} [message] Message payload.
+   * @param {...*} args Additional values forwarded to hooks and registered handlers.
+   * @returns {Promise<*>} Handler result, merged object results, `false` on a trapped failure, or `undefined`.
+   */
   async message(type, message, ...args) {
     if (typeof type !== 'string' || type === '') {
       return;
@@ -652,6 +848,9 @@ export default class HomeKitDevice extends EventEmitter {
       message = {};
     }
 
+    // Keep subclass hook and externally registered handler results separate until
+    // dispatch completes. handled tracks routing, while failed records a trapped
+    // handler error without preventing remaining cleanup or handlers from running.
     let result = { call: undefined, handler: undefined };
     let failed = false;
     let handled = false;
@@ -666,10 +865,13 @@ export default class HomeKitDevice extends EventEmitter {
       // This allows consistent routing to instance methods like onAdd, onSet, onUpdate, etc.
       let methodName = typeof type === 'string' ? type.match(/\.?(on[A-Z][a-zA-Z0-9]*)$/)?.[1] : undefined;
 
-      // Internal helper to call handlers with error trapping. Will also walk up the prototype chain
+      // Invoke one hook source with error isolation. Named lifecycle hooks walk the
+      // prototype chain so a subclass and its base classes can all participate.
       const callLifecycleHook = async (labelOrFn, ...params) => {
         let results = [];
-        let called = new Set(); // track calls using context + function identity
+        // Deduplicate the same function/context pair within this invocation while
+        // retaining distinct overrides declared at different prototype levels.
+        let called = new Set();
 
         const callMethodWithProtoChain = async (obj, method, contextLabel) => {
           let current = obj;
@@ -733,6 +935,8 @@ export default class HomeKitDevice extends EventEmitter {
           }
         }
 
+        // Preserve the historical scalar result for one handler; multiple hooks
+        // return an ordered array matching their invocation order.
         return results.length === 1 ? results[0] : results;
       };
 
@@ -952,10 +1156,14 @@ export default class HomeKitDevice extends EventEmitter {
           typeof options === 'object' &&
           options.constructor === Object
         ) {
+          // History expects epoch seconds. Mutate the caller's entry only when it
+          // did not provide a finite timestamp so every accepted entry is dated.
           if (Number.isFinite(Number(entry?.time)) === false) {
             entry.time = Math.floor(Date.now() / 1000);
           }
 
+          // Unless forced, compare all payload fields except time with the last
+          // entry. Nested values are normalised to avoid key order false positives.
           if (options?.force !== true && typeof this.historyService?.lastHistory === 'function') {
             let last = this.historyService.lastHistory(target);
             if (typeof last === 'object') {
@@ -977,6 +1185,8 @@ export default class HomeKitDevice extends EventEmitter {
           }
 
           if (skipHistory === false) {
+            // EveHome owns time gap suppression; pass only a finite numeric value
+            // and let the history service report whether it accepted the entry.
             let historyResult = await this.historyService.addHistory(
               target,
               entry,
@@ -1023,16 +1233,20 @@ export default class HomeKitDevice extends EventEmitter {
         }
       }
 
-      // No handler at all — not even onMessage()
+      // No handler at all, including onMessage().
       if (handled === false && (Array.isArray(handler) === false || handler.length === 0) && typeof this?.[methodName] !== 'function') {
         this?.log?.debug?.('Unhandled message type "%s" for device "%s"', type, this.deviceData.description);
       }
 
       if (failed === true) {
+        // A trapped hook failure is the public failure signal, even though later
+        // handlers and required lifecycle cleanup were still allowed to complete.
         return false;
       }
 
       if (typeof result.call === 'object' || typeof result.handler === 'object') {
+        // Object results form one response; registered handler fields win when
+        // both sources provide the same key because they are assigned last.
         return Object.assign({}, result.call ?? {}, result.handler ?? {});
       }
     } catch (error) {
@@ -1047,6 +1261,17 @@ export default class HomeKitDevice extends EventEmitter {
     return result.call !== undefined ? result.call : result.handler;
   }
 
+  /**
+   * Register a named one-shot, repeating, or delayed repeating timer.
+   *
+   * When no callback is supplied, each invocation dispatches a `TIMER` message
+   * containing the timer handle and configured message fields.
+   *
+   * @param {string} timerHandle Device-scoped timer name.
+   * @param {HomeKitTimerOptions} [options={}] Timer schedule and payload.
+   * @param {HomeKitTimerCallback} [callback] Direct callback used instead of message dispatch.
+   * @returns {boolean} `true` when the timer exists after the call, otherwise `false`.
+   */
   addTimer(timerHandle, options = {}, callback = undefined) {
     // Register a timer (timeout, interval, or both) that either calls a callback or dispatches via message system
     // Supports three patterns:
@@ -1168,6 +1393,12 @@ export default class HomeKitDevice extends EventEmitter {
     return true;
   }
 
+  /**
+   * Cancel and remove a named timer.
+   *
+   * @param {string} timerHandle Device-scoped timer name.
+   * @returns {boolean} `true` when the handle is valid, including when already absent; otherwise `false`.
+   */
   removeTimer(timerHandle) {
     // Clear a timer by handle. Returns true even if timer doesn't exist (idempotent, safe to call multiple times)
     if (typeof timerHandle !== 'string' || timerHandle === '') {
@@ -1200,6 +1431,12 @@ export default class HomeKitDevice extends EventEmitter {
     return true;
   }
 
+  /**
+   * Test whether a named timer is currently registered.
+   *
+   * @param {string} timerHandle Device-scoped timer name.
+   * @returns {boolean} Whether the timer is registered.
+   */
   hasTimer(timerHandle) {
     // Check if a timer with this handle is currently active/registered
     if (typeof timerHandle !== 'string' || timerHandle === '') {
@@ -1209,26 +1446,42 @@ export default class HomeKitDevice extends EventEmitter {
     return this.#timers.has(timerHandle) === true;
   }
 
+  /**
+   * Resolve or create a HAP service and optionally defer its Eve configuration.
+   *
+   * @param {Function|object} serviceType HAP service constructor or service type accepted by the runtime.
+   * @param {string} [name=''] Display name used when a service is created.
+   * @param {string} [subType] Stable subtype used to distinguish services of the same type.
+   * @param {Object<string, *>} [eveOptions] Options passed to the Eve history integration after setup.
+   * @returns {object|undefined} Existing or newly created HAP service.
+   */
   addService(serviceType, name = '', subType = undefined, eveOptions = undefined) {
     let service = undefined;
 
+    // Work only with a HAP accessory exposing every lookup and creation method
+    // needed by this helper. Matter-only devices therefore return undefined
+    // without requiring callers to add a separate protocol guard.
     if (
       serviceType !== undefined &&
       typeof this?.accessory?.getService === 'function' &&
       typeof this?.accessory?.getServiceById === 'function' &&
       typeof this?.accessory?.addService === 'function'
     ) {
+      // A subtype identifies one of several services with the same type. Without
+      // one, reuse the accessory's primary service of that type.
       if (subType !== undefined) {
         service = this.accessory.getServiceById(serviceType, subType);
       } else {
         service = this.accessory.getService(serviceType);
       }
 
+      // Create only when lookup found no match, making repeated setup idempotent.
       if (service === undefined) {
         service = this.accessory.addService(serviceType, name, subType);
       }
 
-      // Setup for EveHome history if enabled. The actual linkage will be done in .add() after returning from .onAdd()
+      // Retain Eve configuration on the resolved service. add() links it only
+      // after onAdd() has finished building the complete HAP representation.
       if (service !== undefined && eveOptions !== null && typeof eveOptions === 'object' && eveOptions.constructor === Object) {
         service[HomeKitDevice?.EVEHOME?.EVE_OPTIONS] = eveOptions;
       }
@@ -1237,16 +1490,27 @@ export default class HomeKitDevice extends EventEmitter {
     return service;
   }
 
+  /**
+   * Remove a HAP service instance or a service resolved from its type and subtype.
+   *
+   * @param {object|Function} serviceOrType Existing HAP service or service type.
+   * @param {string} [subType] Subtype used when resolving a service type.
+   * @returns {boolean} `true` when a service was removed.
+   */
   removeService(serviceOrType, subType = undefined) {
     let service = undefined;
+
+    // Callers may pass either the concrete service returned by addService() or a
+    // service constructor to resolve. instanceof is guarded because Matter-only
+    // devices and incomplete HAP stubs do not expose the Service base class.
     let isServiceInstance = typeof this?.hap?.Service === 'function' && serviceOrType instanceof this.hap.Service;
 
-    // Accessory must support service removal.
+    // A missing HAP accessory is a safe no-op rather than an exceptional path.
     if (typeof this?.accessory?.removeService !== 'function') {
       return false;
     }
 
-    // Accept an existing service instance directly.
+    // An instance already identifies the exact service and avoids another lookup.
     if (isServiceInstance === true) {
       service = serviceOrType;
     } else if (
@@ -1254,7 +1518,8 @@ export default class HomeKitDevice extends EventEmitter {
       typeof this?.accessory?.getService === 'function' &&
       typeof this?.accessory?.getServiceById === 'function'
     ) {
-      // Or resolve the service by type, optionally with a subtype.
+      // Resolve by subtype when several services share a type; otherwise target
+      // the accessory's primary service of that type.
       if (subType !== undefined) {
         service = this.accessory.getServiceById(serviceOrType, subType);
       } else {
@@ -1262,18 +1527,30 @@ export default class HomeKitDevice extends EventEmitter {
       }
     }
 
-    // Nothing to remove.
+    // Report absence explicitly so callers can distinguish it from removal.
     if (service === undefined) {
       return false;
     }
 
+    // Delegate structural cleanup to HAP and report that a service was removed.
     this.accessory.removeService(service);
     return true;
   }
 
+  /**
+   * Resolve or add a HAP characteristic, then apply its handlers, properties, and initial value.
+   *
+   * @param {object} service HAP service receiving the characteristic.
+   * @param {Function|object} characteristicType HAP characteristic constructor or type.
+   * @param {HomeKitCharacteristicOptions} [options={}] Characteristic behavior and metadata.
+   * @returns {object|undefined} Resolved HAP characteristic.
+   */
   addCharacteristic(service, characteristicType, { props, onSet, onGet, initialValue } = {}) {
     let characteristic = undefined;
 
+    // Work only with a HAP service like object exposing the complete surface this
+    // helper needs. Returning undefined keeps the method safe for absent HAP
+    // representations and prevents partially configuring an incompatible object.
     if (
       characteristicType !== undefined &&
       typeof service?.getCharacteristic === 'function' &&
@@ -1281,6 +1558,8 @@ export default class HomeKitDevice extends EventEmitter {
       typeof service?.addCharacteristic === 'function' &&
       typeof service?.addOptionalCharacteristic === 'function'
     ) {
+      // Reuse an existing characteristic. If it is merely advertised as optional,
+      // use HAP's optional path so the service creates it with the correct metadata.
       if (service.testCharacteristic(characteristicType) === false) {
         if (
           Array.isArray(service?.optionalCharacteristics) === true &&
@@ -1292,20 +1571,25 @@ export default class HomeKitDevice extends EventEmitter {
         }
       }
 
+      // Resolve the single existing or new instance before attaching any behavior.
       characteristic = service.getCharacteristic(characteristicType);
 
-      // Apply optional config
+      // Bind HomeKit writes and reads only when the caller supplied handlers.
       if (typeof onSet === 'function') {
         characteristic.onSet(onSet);
       }
       if (typeof onGet === 'function') {
         characteristic.onGet(onGet);
       }
+
+      // Characteristic constraints such as range, step, unit, and valid values
+      // belong to the characteristic instance rather than the containing service.
       if (props !== null && typeof props === 'object' && props.constructor === Object && typeof characteristic.setProps === 'function') {
         characteristic.setProps(props);
       }
 
-      // Set initial value if provided
+      // Initialise through the service API so HAP updates its characteristic value
+      // without treating setup as a controller originated onSet operation.
       if (typeof initialValue !== 'undefined' && typeof service?.updateCharacteristic === 'function') {
         service.updateCharacteristic(characteristicType, initialValue);
       }
@@ -1314,37 +1598,125 @@ export default class HomeKitDevice extends EventEmitter {
     return characteristic;
   }
 
+  /**
+   * Add or extend a declarative cluster on the pending Matter accessory descriptor.
+   *
+   * Repeated calls merge attributes and command handlers for the same cluster.
+   *
+   * @param {string} clusterName Matter cluster descriptor key.
+   * @param {HomeKitMatterClusterOptions} [options={}] Initial attributes and command handlers.
+   * @returns {Object<string, *>|undefined} Merged initial state, or `undefined` without a Matter descriptor.
+   */
+  addMatterCluster(clusterName, { initialState, handlers } = {}) {
+    // Matter cluster names are descriptor keys, and configuration requires the
+    // root Matter descriptor created or restored before onAdd() runs.
+    if (
+      typeof clusterName !== 'string' ||
+      clusterName === '' ||
+      typeof this.matterAccessory !== 'object' ||
+      this.matterAccessory === null
+    ) {
+      return;
+    }
+
+    // Reuse previously declared attributes and overlay supplied initial state so
+    // separate setup steps can extend one cluster without discarding each other.
+    let currentClusters =
+      typeof this.matterAccessory.clusters === 'object' && this.matterAccessory.clusters !== null
+        ? this.matterAccessory.clusters
+        : {};
+    let currentState =
+      typeof currentClusters[clusterName] === 'object' && currentClusters[clusterName] !== null
+        ? currentClusters[clusterName]
+        : {};
+    let nextState =
+      initialState !== null && typeof initialState === 'object' && initialState.constructor === Object
+        ? { ...currentState, ...initialState }
+        : { ...currentState };
+
+    // Matter descriptors are declarative. Replacing the containers keeps repeated
+    // helper calls predictable while preserving state already declared for a cluster.
+    this.matterAccessory.clusters = { ...currentClusters, [clusterName]: nextState };
+
+    if (handlers !== null && typeof handlers === 'object' && handlers.constructor === Object) {
+      // Commands are keyed beneath the same cluster name. Merge them independently
+      // from attributes because one cluster commonly declares several commands.
+      let currentHandlers =
+        typeof this.matterAccessory.handlers === 'object' && this.matterAccessory.handlers !== null
+          ? this.matterAccessory.handlers
+          : {};
+      let clusterHandlers =
+        typeof currentHandlers[clusterName] === 'object' && currentHandlers[clusterName] !== null
+          ? currentHandlers[clusterName]
+          : {};
+      this.matterAccessory.handlers = {
+        ...currentHandlers,
+        [clusterName]: { ...clusterHandlers, ...handlers },
+      };
+    }
+
+    return nextState;
+  }
+
+  /**
+   * Remove a HAP characteristic instance or resolve one from its type without creating it.
+   *
+   * @param {object} service HAP service containing the characteristic.
+   * @param {object|Function} characteristicOrType Existing characteristic or characteristic type.
+   * @returns {boolean} `true` when a characteristic was removed.
+   */
   removeCharacteristic(service, characteristicOrType) {
     let characteristic = undefined;
+
+    // Accept either the instance returned by addCharacteristic() or a
+    // characteristic constructor. Guard instanceof for runtimes without HAP.
     let isCharacteristicInstance =
       typeof this?.hap?.Characteristic === 'function' && characteristicOrType instanceof this.hap.Characteristic;
 
+    // Removal requires both the HAP operation and the service's current list so a
+    // type can be resolved without invoking a lookup that may mutate the service.
     if (typeof service?.removeCharacteristic !== 'function' || Array.isArray(service?.characteristics) !== true) {
       return false;
     }
 
-    // Accept an existing characteristic instance directly.
+    // An instance already identifies the exact characteristic to remove.
     if (isCharacteristicInstance === true) {
       characteristic = characteristicOrType;
     } else if (characteristicOrType !== undefined) {
-      // Or resolve by type without calling getCharacteristic(), which can add optional characteristics.
+      // Match by UUID instead of getCharacteristic(), because HAP may create an
+      // optional characteristic as a side effect of that getter.
       characteristic = service.characteristics.find((entry) => entry?.UUID === characteristicOrType?.UUID);
     }
 
-    // Nothing to remove.
+    // Report absence explicitly so callers can distinguish it from removal.
     if (characteristic === undefined) {
       return false;
     }
 
+    // Delegate list and event cleanup to HAP, then confirm removal to the caller.
     service.removeCharacteristic(characteristic);
     return true;
   }
 
+  /**
+   * Queue a formatted detail for the successful setup summary.
+   *
+   * A recognised final `info`, `success`, `warn`, `error`, or `debug` argument
+   * selects the log level and is not passed as a formatting value.
+   *
+   * @param {string} message Logger format string.
+   * @param {...*} args Format values, optionally followed by a log-level string.
+   * @returns {void}
+   */
   postSetupDetail(message, ...args) {
+    // Ignore invalid or empty messages so the deferred setup summary contains
+    // only entries that can be passed safely to the configured logger.
     if (typeof message !== 'string' || message === '') {
       return;
     }
 
+    // Details default to info. A recognised trailing level is control metadata,
+    // not a message format argument, so remove it from the stored argument list.
     let levelKey = 'INFO';
     let lastArg = args.at(-1);
 
@@ -1353,6 +1725,8 @@ export default class HomeKitDevice extends EventEmitter {
       args = args.slice(0, -1);
     }
 
+    // Queue details instead of logging immediately so add() can emit them as one
+    // grouped summary after setup succeeds and discard them after a fatal failure.
     this.#postSetupDetails.push({
       level: LOG_LEVELS[levelKey], // 'info', 'debug', etc.
       message,
@@ -1360,15 +1734,24 @@ export default class HomeKitDevice extends EventEmitter {
     });
   }
 
-  static generateUUID(PLUGIN_NAME, api, serialNumber) {
-    if (typeof PLUGIN_NAME !== 'string' || PLUGIN_NAME === '' || typeof serialNumber !== 'string' || serialNumber === '') {
+  /**
+   * Generate the stable UUID used to identify a device.
+   *
+   * @param {string} pluginName Homebridge plugin name.
+   * @param {object} api Homebridge or HAP-NodeJS API exposing a UUID generator.
+   * @param {string} serialNumber Device serial number.
+   * @returns {string} Generated device UUID.
+   * @throws {TypeError} When an identifier is empty or no runtime UUID can be generated.
+   */
+  static generateUUID(pluginName, api, serialNumber) {
+    if (typeof pluginName !== 'string' || pluginName === '' || typeof serialNumber !== 'string' || serialNumber === '') {
       throw new TypeError('Unable to generate accessory UUID');
     }
 
     // Prefer HAP so enabling Matter cannot change an existing identity. Matter's
     // UUID API is its alias; direct HAP-NodeJS exposes the API at the root.
     let uuid = (api?.hap?.uuid ?? api?.matter?.uuid ?? api?.uuid)?.generate?.(
-      PLUGIN_NAME + '_' + serialNumber.toUpperCase(),
+      pluginName + '_' + serialNumber.toUpperCase(),
     );
     if (typeof uuid !== 'string' || uuid === '') {
       throw new TypeError('Unable to generate accessory UUID');
@@ -1376,10 +1759,16 @@ export default class HomeKitDevice extends EventEmitter {
     return uuid;
   }
 
+  /**
+   * Remove characters that HomeKit does not accept at the start, middle, or end of a name.
+   *
+   * @param {*} name Candidate name. Non-string values are returned unchanged.
+   * @returns {*} Sanitised name, `Unknown Device` for an empty sanitised string, or the original non-string value.
+   */
   static makeValidHKName(name) {
     // Strip invalid characters to meet HomeKit naming requirements.
     // Ensure names start and end with a Unicode letter or number.
-    // Allow letters, numbers, space-like characters, apostrophes,
+    // Allow letters, numbers, space like characters, apostrophes,
     // and common punctuation only in the middle of the string.
     // Use \p{Zs} instead of \p{Z} to avoid line/paragraph separators.
     // Home app validation rejects names ending in apostrophes,
@@ -1393,10 +1782,22 @@ export default class HomeKitDevice extends EventEmitter {
       : name;
   }
 
+  /**
+   * Return the deterministic identity shared by this device's protocol representations.
+   *
+   * @returns {string|undefined} Device UUID, or `undefined` after permanent removal.
+   */
   get uuid() {
     return this.#uuid;
   }
 
+  /**
+   * Produce a recursively key-sorted value suitable for stable JSON comparison.
+   *
+   * @param {*} value Value to normalise.
+   * @returns {*} Normalised value with array order preserved and `undefined` represented explicitly.
+   * @private
+   */
   static #normaliseForCompare(value) {
     // Normalise values before comparison so JSON.stringify is stable:
     // - object keys are sorted recursively to avoid false positives from key order
@@ -1416,6 +1817,13 @@ export default class HomeKitDevice extends EventEmitter {
           : value;
   }
 
+  /**
+   * Overlay partial updates on current device data and detect semantic changes.
+   *
+   * @param {Partial<HomeKitDeviceData>} [deviceDataUpdates={}] Validated partial device data.
+   * @returns {{merged: HomeKitDeviceData, changed: boolean}} Complete merged data and its change flag.
+   * @private
+   */
   #mergeDeviceData(deviceDataUpdates = {}) {
     let merged = { ...deviceDataUpdates };
 
@@ -1438,6 +1846,13 @@ export default class HomeKitDevice extends EventEmitter {
     return { merged, changed };
   }
 
+  /**
+   * Synchronise common metadata and declared persisted fields across active representations.
+   *
+   * @param {HomeKitDeviceData} deviceData Complete validated device data.
+   * @returns {Promise<void>}
+   * @private
+   */
   async #updateAccessoryMetadata(deviceData) {
     // Synchronise common metadata across the available HAP and Matter representations.
     // The merged device data is fully validated before this method is called.
@@ -1463,8 +1878,9 @@ export default class HomeKitDevice extends EventEmitter {
       [deviceData.softwareVersion, this.hap?.Characteristic?.FirmwareRevision, 'firmwareRevision'],
     ];
 
-    // Retain changed Matter properties until its single batched cache update
-    // succeeds, allowing the descriptor to be restored if persistence fails.
+    // Matter descriptor changes are applied optimistically. Retain each original
+    // property until the single batched cache update succeeds so only Matter can
+    // be rolled back on failure; live HAP characteristic updates remain applied.
     let previous = new Map();
 
     for (let [value, characteristic, property] of metadata) {
@@ -1572,6 +1988,14 @@ export default class HomeKitDevice extends EventEmitter {
     }
   }
 
+  /**
+   * Validate core metadata and standalone HAP pairing fields.
+   *
+   * @param {Partial<HomeKitDeviceData>} [deviceData={}] Device data to validate.
+   * @param {boolean} [strict=false] Require a complete record even when only some core fields are present.
+   * @returns {boolean} Whether the supplied data satisfies the applicable contract.
+   * @private
+   */
   #validDeviceData(deviceData = {}, strict = false) {
     if (
       deviceData === null || // Must not be null
@@ -1582,6 +2006,9 @@ export default class HomeKitDevice extends EventEmitter {
     }
 
     let keys = ['serialNumber', 'softwareVersion', 'description', 'model', 'manufacturer'];
+    // Strict callers require a complete record. A payload containing every core
+    // field is also treated as complete; otherwise it is validated as a partial
+    // update and only supplied fields are checked.
     let isFull = strict === true || keys.every((key) => typeof deviceData[key] !== 'undefined');
 
     for (let key of keys) {
@@ -1600,7 +2027,7 @@ export default class HomeKitDevice extends EventEmitter {
       }
     }
 
-    // Pairing validation (HAP-NodeJS only — no Homebridge platform present)
+    // Pairing validation for HAP-NodeJS only, where no Homebridge platform is present.
     if (this.#platform === undefined) {
       let hasPairing = typeof deviceData?.hkPairingCode !== 'undefined' || typeof deviceData?.hkUsername !== 'undefined';
 
@@ -1640,6 +2067,12 @@ export default class HomeKitDevice extends EventEmitter {
     return true;
   }
 
+  /**
+   * Cancel every timer owned by this device.
+   *
+   * @returns {void}
+   * @private
+   */
   #clearTimers() {
     // Clear all internal timers for this device
     // Snapshot keys first to avoid mutating the Map while iterating

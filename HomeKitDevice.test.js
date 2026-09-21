@@ -345,6 +345,68 @@ test('Matter device type is required only when Matter is the sole Homebridge rep
   assert.equal(registrations, 2);
 });
 
+test('addMatterCluster merges state and command handlers without duplicating the cluster', async () => {
+  let registeredAccessory;
+  let api = {
+    version: 2.7,
+    hap,
+    matter: {
+      clusterNames: { OnOff: 'onOff', LevelControl: 'levelControl' },
+      deviceTypes: { DimmableLight: { name: 'DimmableLight' } },
+      async registerPlatformAccessories(plugin, platform, accessories) {
+        registeredAccessory = accessories[0];
+      },
+    },
+    isHapEnabled() {
+      return false;
+    },
+    isMatterEnabled() {
+      return true;
+    },
+    on() {},
+  };
+
+  let on = () => true;
+  let off = () => false;
+
+  class MatterLight extends HomeKitDevice {
+    async onAdd() {
+      let onOffState = this.addMatterCluster(this.matter.clusterNames.OnOff, {
+        initialState: { onOff: false },
+        handlers: { on },
+      });
+      let mergedOnOffState = this.addMatterCluster(this.matter.clusterNames.OnOff, {
+        initialState: { globalSceneControl: true },
+        handlers: { off },
+      });
+
+      assert.deepEqual(onOffState, { onOff: false });
+      assert.deepEqual(mergedOnOffState, { onOff: false, globalSceneControl: true });
+
+      this.addMatterCluster(this.matter.clusterNames.LevelControl, {
+        initialState: { currentLevel: 100, minLevel: 1 },
+      });
+    }
+  }
+
+  let device = new MatterLight(undefined, api, { ...deviceData('MATTER-HELPER'), on: true, level: 75 });
+  assert.equal(
+    await device.add({ hapAccessoryName: null, matterDeviceType: api.matter.deviceTypes.DimmableLight }),
+    true,
+  );
+
+  assert.equal(registeredAccessory, device.matterAccessory);
+  assert.deepEqual(device.matterAccessory.clusters, {
+    onOff: { onOff: false, globalSceneControl: true },
+    levelControl: { currentLevel: 100, minLevel: 1 },
+  });
+  assert.equal(device.matterAccessory.handlers.onOff.on, on);
+  assert.equal(device.matterAccessory.handlers.onOff.off, off);
+  assert.equal(device.matterAccessory.getState, undefined);
+  assert.equal(device.addMatterCluster('', { initialState: { ignored: true } }), undefined);
+  assert.equal(Object.hasOwn(device.matterAccessory.clusters, ''), false);
+});
+
 test('Homebridge exposes HAP and Matter through the existing lifecycle', async () => {
   let calls = {
     hapRegistered: [],
