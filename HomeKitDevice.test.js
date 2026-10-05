@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { setImmediate } from 'node:timers/promises';
 
 import HomeKitDevice from './HomeKitDevice.js';
 
@@ -1006,6 +1007,271 @@ test('Homebridge does not register or remove a cached HAP accessory when setup f
 
   await device.remove();
   assert.equal(calls.unregistered, 1);
+});
+
+// Lifecycle hooks must walk every override, retaining the device as the receiver.
+for (let method of ['onAdd', 'onUpdate', 'onRemove', 'onShutdown', 'onSet', 'onGet', 'onHistory', 'onTimer', 'onProbe']) {
+  test(method + ' invokes instance and prototype hooks sequentially before registered handlers', async (context) => {
+    let calls = [];
+    class BaseDevice extends HomeKitDevice {}
+    class MiddleDevice extends BaseDevice {}
+    class LeafDevice extends MiddleDevice {}
+    let device = new LeafDevice(undefined, { version: 2.7, hap }, deviceData('CHAIN-' + method));
+    context.after(() => {
+      if (method !== 'onRemove') {
+        return device.remove();
+      }
+    });
+    let payload = { requested: true };
+    let extra = { extra: true };
+    let target = { UUID: 'history-target' };
+    let options = { force: true };
+    device.historyService = { addHistory: () => true };
+
+    // These closures intentionally have identical source but distinct identities.
+    let hook = (level) => async function (...args) {
+      assert.equal(this, device);
+      if (method === 'onHistory') {
+        assert.deepEqual(args, [target, payload, options]);
+      } else {
+        assert.equal(args[0].requested, true);
+        assert.equal(args[1], extra);
+      }
+      calls.push(level + ':start');
+      await setImmediate();
+      calls.push(level + ':end');
+    };
+    BaseDevice.prototype[method] = hook('base');
+    MiddleDevice.prototype[method] = hook('middle');
+    LeafDevice.prototype[method] = hook('leaf');
+    device[method] = hook('instance');
+    let type = 'HomeKitDevice.' + method;
+    await HomeKitDevice.message(device.uuid, type, hook('registered'));
+
+    if (method === 'onHistory') {
+      await device.message(type, target, payload, options);
+    } else {
+      await device.message(type, payload, extra);
+    }
+
+    assert.deepEqual(calls, [
+      'instance:start', 'instance:end', 'leaf:start', 'leaf:end',
+      'middle:start', 'middle:end', 'base:start', 'base:end',
+      'registered:start', 'registered:end',
+    ]);
+  });
+}
+
+test('an inherited hook runs once across prototypes without their own override', async (context) => {
+  let calls = 0;
+  class BaseDevice extends HomeKitDevice {
+    onGet() {
+      calls += 1;
+      return { answer: 42 };
+    }
+  }
+  class MiddleDevice extends BaseDevice {}
+  class LeafDevice extends MiddleDevice {}
+  let device = new LeafDevice(undefined, { version: 2.7, hap }, deviceData('CHAIN-INHERITED'));
+  context.after(() => device.remove());
+
+  assert.deepEqual(await device.get({}), { answer: 42 });
+  assert.equal(calls, 1);
+});
+
+test('prototype traversal resolves parent hooks after awaited child changes', async (context) => {
+  let calls = [];
+  class BaseDevice extends HomeKitDevice {
+    onGet() {
+      calls.push('old-base');
+    }
+  }
+  class LeafDevice extends BaseDevice {
+    async onGet() {
+      calls.push('leaf');
+      await setImmediate();
+      BaseDevice.prototype.onGet = function () {
+        assert.equal(this, device);
+        calls.push('new-base');
+      };
+    }
+  }
+  let device = new LeafDevice(undefined, { version: 2.7, hap }, deviceData('CHAIN-LIVE'));
+  context.after(() => device.remove());
+
+  await device.get({});
+  assert.deepEqual(calls, ['leaf', 'new-base']);
+});
+
+test('generic onMessage fallback retains its scalar result and original arguments', async (context) => {
+  class BaseDevice extends HomeKitDevice {
+    onMessage(...args) {
+      assert.equal(this, device);
+      assert.deepEqual(args, ['custom', 'payload', 42]);
+      return 'handled';
+    }
+  }
+  class LeafDevice extends BaseDevice {}
+  let device = new LeafDevice(undefined, { version: 2.7, hap }, deviceData('CHAIN-FALLBACK'));
+  context.after(() => device.remove());
+
+  assert.equal(await device.message('custom', 'payload', 42), 'handled');
+});
+
+test('prototype traversal deduplicates shared function identities', async (context) => {
+  let calls = 0;
+  class BaseDevice extends HomeKitDevice {}
+  class LeafDevice extends BaseDevice {}
+  let device = new LeafDevice(undefined, { version: 2.7, hap }, deviceData('CHAIN-SHARED'));
+  context.after(() => device.remove());
+  let shared = function () {
+    assert.equal(this, device);
+    calls += 1;
+  };
+  BaseDevice.prototype.onGet = shared;
+  LeafDevice.prototype.onGet = shared;
+  device.onGet = shared;
+
+  await device.get({});
+  assert.equal(calls, 1);
+});
+
+test('registered object handlers traverse prototypes and retain distinct contexts', async (context) => {
+  let calls = [];
+  class BaseListener {
+    onGet() {
+      calls.push(this.name + ':base');
+    }
+  }
+  class LeafListener extends BaseListener {
+    onGet() {
+      calls.push(this.name + ':leaf');
+    }
+  }
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('CHAIN-LISTENERS'));
+  context.after(() => device.remove());
+  let first = new LeafListener();
+  first.name = 'first';
+  let second = new LeafListener();
+  second.name = 'second';
+  await HomeKitDevice.message(device.uuid, HomeKitDevice.GET, first);
+  await HomeKitDevice.message(device.uuid, HomeKitDevice.GET, first);
+  await HomeKitDevice.message(device.uuid, HomeKitDevice.GET, second);
+
+  await device.get({});
+  assert.deepEqual(calls, ['first:leaf', 'first:base', 'second:leaf', 'second:base']);
+});
+
+test('distinct registered closures run once each even when their source text matches', async (context) => {
+  let calls = [];
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('CHAIN-CLOSURES'));
+  context.after(() => device.remove());
+  let hook = (name) => function () {
+    assert.equal(this, device);
+    calls.push(name);
+  };
+  let first = hook('first');
+  await HomeKitDevice.message(device.uuid, HomeKitDevice.GET, first);
+  await HomeKitDevice.message(device.uuid, HomeKitDevice.GET, first);
+  await HomeKitDevice.message(device.uuid, HomeKitDevice.GET, hook('second'));
+
+  await device.get({});
+  assert.deepEqual(calls, ['first', 'second']);
+});
+
+test('hook failures do not prevent parent hooks or registered handlers from running', async (context) => {
+  let calls = [];
+  class BaseDevice extends HomeKitDevice {
+    onGet() {
+      calls.push('base');
+    }
+  }
+  class LeafDevice extends BaseDevice {
+    async onGet() {
+      calls.push('leaf');
+      throw new Error('Leaf failed');
+    }
+  }
+  let device = new LeafDevice(undefined, { version: 2.7, hap }, deviceData('CHAIN-FAILURE'));
+  context.after(() => device.remove());
+  let warnings = [];
+  device.log = { warn: (...args) => warnings.push(args) };
+  await HomeKitDevice.message(device.uuid, HomeKitDevice.GET, () => {
+    calls.push('failed-listener');
+    throw new Error('Listener failed');
+  });
+  await HomeKitDevice.message(device.uuid, HomeKitDevice.GET, () => calls.push('last-listener'));
+
+  assert.equal(await device.get({}), false);
+  assert.deepEqual(calls, ['leaf', 'base', 'failed-listener', 'last-listener']);
+  assert.equal(warnings.length, 2);
+});
+
+test('hook result ordering and registered object precedence remain unchanged', async (context) => {
+  class BaseDevice extends HomeKitDevice {
+    onGet() {
+      return { level: 'base' };
+    }
+  }
+  class LeafDevice extends BaseDevice {
+    onGet() {
+      return { level: 'leaf' };
+    }
+  }
+  let device = new LeafDevice(undefined, { version: 2.7, hap }, deviceData('CHAIN-RESULTS'));
+  context.after(() => device.remove());
+
+  assert.deepEqual(await device.get({}), { 0: { level: 'leaf' }, 1: { level: 'base' } });
+  delete BaseDevice.prototype.onGet;
+  await HomeKitDevice.message(device.uuid, HomeKitDevice.GET, () => ({ level: 'registered', extra: true }));
+  assert.deepEqual(await device.get({}), { level: 'registered', extra: true });
+});
+
+test('one-shot timers clean up after a synchronous callback failure', { timeout: 1000 }, async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('TIMER-THROW-ONCE'));
+  context.after(() => device.shutdown());
+  let calls = 0;
+  let notify;
+  let fired = new Promise((resolve) => {
+    notify = resolve;
+  });
+
+  device.addTimer('throw-once', { delay: 10 }, () => {
+    calls += 1;
+    notify();
+    throw new Error('Timer callback failed');
+  });
+
+  await fired;
+  // Let rejection handling and final cleanup finish after the callback throws.
+  await setImmediate();
+
+  assert.equal(calls, 1);
+  assert.equal(device.hasTimer('throw-once'), false);
+});
+
+test('repeating timers continue after a synchronous callback failure', { timeout: 1000 }, async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('TIMER-THROW-REPEAT'));
+  context.after(() => device.shutdown());
+  let calls = 0;
+  let notify;
+  let recovered = new Promise((resolve) => {
+    notify = resolve;
+  });
+
+  device.addTimer('throw-repeat', { interval: 10 }, () => {
+    calls += 1;
+    if (calls === 1) {
+      throw new Error('Timer callback failed');
+    }
+    notify();
+  });
+
+  await recovered;
+  await setImmediate();
+
+  assert.equal(calls, 2);
+  assert.equal(device.hasTimer('throw-repeat'), true);
 });
 
 test('standalone HAP-NodeJS remains HAP-only', async () => {

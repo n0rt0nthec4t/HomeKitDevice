@@ -219,7 +219,7 @@ export default class HomeKitDevice extends EventEmitter {
   static EVEHOME = undefined; // HomeKitHistory object
   static LOGGER = undefined; // Logging object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.09.17'; // Code version
+  static VERSION = '2026.10.05'; // Code version
 
   // Persistent context namespace for this class. Subclasses may override to isolate their own context.
   static PERSISTENCE_NAMESPACE = 'HomeKitDevice';
@@ -867,71 +867,45 @@ export default class HomeKitDevice extends EventEmitter {
 
       // Invoke one hook source with error isolation. Named lifecycle hooks walk the
       // prototype chain so a subclass and its base classes can all participate.
-      const callLifecycleHook = async (labelOrFn, ...params) => {
+      const callLifecycleHook = async (methodOrHandlers, ...params) => {
         let results = [];
         // Deduplicate the same function/context pair within this invocation while
         // retaining distinct overrides declared at different prototype levels.
-        let called = new Set();
+        let called = [];
+        let hooks =
+          typeof methodOrHandlers === 'string'
+            ? [{ handler: methodOrHandlers, context: this }]
+            : Array.isArray(methodOrHandlers) === true
+              ? methodOrHandlers[1] || []
+              : [];
 
-        const callMethodWithProtoChain = async (obj, method, contextLabel) => {
-          let current = obj;
+        for (let item of hooks) {
+          let context = item?.context ?? this;
+          let method = item?.handler;
+          let current = context;
           let seen = new Set();
+          let label =
+            typeof method === 'string'
+              ? (context?.constructor?.name ?? 'handler') + '.' + method
+              : 'registered ' + methodOrHandlers[0];
 
-          while (current && typeof current === 'object' && seen.has(current) === false) {
+          // Resolve named methods at each level after the preceding hook completes.
+          // Every override retains the original receiver, including listener objects.
+          while (current !== null && typeof current === 'object' && seen.has(current) === false) {
             seen.add(current);
-
-            let fn = current?.[method];
-            if (typeof fn === 'function') {
-              let key = fn + '@' + obj;
-              if (called.has(key) === false) {
-                called.add(key);
-                try {
-                  results.push(await fn.apply(obj, params));
-                } catch (error) {
-                  failed = true;
-                  this?.log?.warn?.('Error in %s.%s(): %s', contextLabel, method, String(error?.stack || error));
-                }
+            let fn = typeof method === 'string' ? current[method] : method;
+            if (typeof fn === 'function' && called.some((call) => call.fn === fn && call.context === context) === false) {
+              called.push({ fn, context });
+              try {
+                results.push(await fn.apply(context, params));
+              } catch (error) {
+                failed = true;
+                this?.log?.warn?.('Error in %s(): %s', label, String(error?.stack || error));
               }
             }
 
-            current = Object.getPrototypeOf(current);
-          }
-        };
-
-        if (typeof labelOrFn === 'string') {
-          await callMethodWithProtoChain(this, labelOrFn, this?.constructor?.name ?? 'this');
-        } else if (typeof labelOrFn === 'function') {
-          let key = labelOrFn + '@' + this;
-          if (called.has(key) === false) {
-            called.add(key);
-            try {
-              results.push(await labelOrFn(...params));
-            } catch (error) {
-              failed = true;
-              this?.log?.warn?.('Error in inline function handler: %s', String(error?.stack || error));
-            }
-          }
-        } else if (Array.isArray(labelOrFn) === true) {
-          let [label, list] = labelOrFn;
-
-          for (let item of list || []) {
-            let fn = item?.handler;
-            let context = item?.context ?? this;
-            let key = fn + '@' + context;
-
-            if (typeof fn === 'function') {
-              if (called.has(key) === false) {
-                called.add(key);
-                try {
-                  results.push(await fn.call(context, ...params));
-                } catch (error) {
-                  failed = true;
-                  this?.log?.warn?.('Error in registered %s(): %s', label, String(error?.stack || error));
-                }
-              }
-            } else if (typeof fn === 'string' && context) {
-              await callMethodWithProtoChain(context, fn, context?.constructor?.name ?? 'handler');
-            }
+            // Direct functions run once; named hooks continue through the live chain.
+            current = typeof method === 'string' ? Object.getPrototypeOf(current) : undefined;
           }
         }
 
@@ -1328,14 +1302,16 @@ export default class HomeKitDevice extends EventEmitter {
 
       entry.running = true;
 
-      Promise.resolve(
-        typeof entry.callback === 'function'
-          ? entry.callback(timerHandle, entry.message)
-          : this.message(HomeKitDevice.TIMER, {
-              timer: timerHandle,
-              ...entry.message,
-            }),
-      )
+      // Invoke inside the promise chain so synchronous throws also reach cleanup.
+      Promise.resolve()
+        .then(() =>
+          typeof entry.callback === 'function'
+            ? entry.callback(timerHandle, entry.message)
+            : this.message(HomeKitDevice.TIMER, {
+                timer: timerHandle,
+                ...entry.message,
+              }),
+        )
         .catch(() => {
           // Empty
         })

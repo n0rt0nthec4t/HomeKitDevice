@@ -4,7 +4,7 @@
 
 `HomeKitDevice` is a shared base class for accessory implementations. It sits between application-owned device data and either the standalone HAP-NodeJS runtime or the Homebridge runtime, giving each device type a common lifecycle, message bus, accessory helper layer, timer system, and optional EveHome history integration. Homebridge may expose HAP, Matter, or both.
 
-**Version:** 2026.09.17
+**Version:** 2026.10.05
 **Primary module:** `HomeKitDevice.js`  
 **Consumers:** subclasses and host applications
 

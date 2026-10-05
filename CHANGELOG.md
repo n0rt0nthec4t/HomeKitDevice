@@ -2,6 +2,20 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2026/10/05
+
+### Fixed
+
+- Caught synchronous timer callback errors through the existing promise chain, ensuring one-shot timers are removed and repeating timers can continue after a failure
+- Added regression tests for one-shot cleanup and repeating timer recovery after synchronous callback errors
+- Deduplicated lifecycle hooks and registered handlers by function and context identity, preventing distinct closures, prototype overrides, and listener objects from being skipped
+
+### Changed
+
+- Simplified lifecycle hook dispatch into one invocation and error-handling loop while preserving live subclass-to-base prototype traversal
+- Removed the unused direct inline-function dispatch path while retaining registered function handlers
+- Added tests for lifecycle hook ordering, awaited execution, argument and receiver preservation, inherited hooks, live prototype changes, deduplication, failure isolation, and result handling
+
 ## 2026/09/21
 
 ### Changed
