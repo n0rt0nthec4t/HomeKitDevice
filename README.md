@@ -146,7 +146,7 @@ Matter command handlers should route device writes through the existing `set()` 
 
 When `remove()` is called, bridged HAP and Matter representations are unregistered through their respective Homebridge APIs, while standalone HAP-NodeJS accessories are unpublished. Homebridge currently owns the lifetime of published external HAP accessories and does not expose a corresponding public unpublish API, so they remain published until Homebridge shuts down. Existing HAP-only subclasses require no changes.
 
-For combined exposure, a Matter registration failure is logged and the registered HAP representation remains available. Matter-only setup never reports success without a registered Matter representation; failed or rejected requests return `false` or `undefined`.
+For combined exposure, a Matter registration failure is logged and the registered HAP representation remains available. Matter-only setup never reports success without a registered Matter representation; validation and representation failures return `false` or `undefined`. Errors from setup handlers reject the `add()` promise.
 
 The host Homebridge platform should pass objects restored by `configureAccessory()` and `configureMatterAccessory()` through the constructor `accessory` argument. Pass one object for a single cached representation and combine both objects in one array for a dual-protocol device.
 
@@ -156,7 +156,7 @@ The host Homebridge platform should pass objects restored by `configureAccessory
 
 ### `add(options?)`
 
-Creates and registers the representations requested by the device, then returns `true` when at least one valid representation is available. Failed or rejected requests return `false` or `undefined`. `options` is a plain object with these fields:
+Creates and registers the representations requested by the device, then returns `true` when at least one valid representation is available. Validation and representation failures return `false` or `undefined`; errors from `onAdd()`, the initial `onUpdate()`, or their registered handlers reject the promise. `options` is a plain object with these fields:
 
 - `hapAccessoryName` – HAP accessory name. Set this to `null` for Matter-only operation.
 - `hapCategory` – HAP accessory category, passed to Homebridge and required by standalone HAP-NodeJS.
@@ -266,11 +266,11 @@ await this.history(this.myService, {
 
 ### `set(values, ...args)`
 
-Validates a plain-object payload and dispatches it through the `SET` route to `onSet()` and registered handlers. Matching existing keys in `deviceData` are updated after the handlers complete.
+Validates a plain-object payload and dispatches it through the `SET` route to `onSet()` and registered handlers. Matching existing keys in `deviceData` are updated only when every handler completes without throwing or rejecting. Success and invalid input resolve to `undefined`; dispatch failures reject with the original error. SET handler return values are ignored, so handlers must throw or reject to signal a failed write.
 
 ### `get(values, ...args)`
 
-Dispatches a request through the `GET` route to `onGet()` and registered handlers, and returns their result.
+Dispatches a request through the `GET` route to `onGet()` and registered handlers, and returns their result. `false` is a valid successful result. A handler or dispatch failure rejects with the original error.
 
 ### `remove()`
 
@@ -315,10 +315,24 @@ await this.update({
 Send a message to any registered device using its UUID:
 
 ```js
-HomeKitDevice.message(uuid, HomeKitDevice.SET, value);
+await HomeKitDevice.message(uuid, HomeKitDevice.SET, value);
 ```
 
 Known message types route to their matching lifecycle hook, such as `SET` to `onSet(message)`. Custom types fall back to `onMessage(type, message)`.
+
+Handlers must throw or reject when their operation fails. The dispatcher logs each handler failure, continues remaining handlers and required lifecycle cleanup, and then rejects with the first handler error. Dispatch processing errors also reject. This applies to instance messages, UUID delivery, and wrappers such as `set()`, `get()`, `update()`, and `remove()`.
+
+Callers must handle rejected promises instead of checking for `false` as a failure signal:
+
+```js
+try {
+  await device.set({ on: true });
+} catch (error) {
+  log.warn('Device write failed: %s', String(error));
+}
+```
+
+Internal timers catch and log rejections while preserving timer cleanup and repeat execution. The global shutdown broadcaster catches logged device rejections so it can continue shutting down other devices.
 
 > **Important:**  
 > The `message` payload is not guaranteed to be an object.

@@ -396,7 +396,8 @@ export default class HomeKitDevice extends EventEmitter {
    *
    * @param {HomeKitDeviceAddOptions} [options={}] Representation and publication options.
    * @returns {Promise<boolean|undefined>} `true` when at least one representation is available,
-   * `false` for a completed setup failure, or `undefined` when validation or a hook rejects setup.
+   * `false` for a completed setup failure, or `undefined` when validation rejects setup.
+   * @throws {*} When ADD or initial UPDATE dispatch rejects.
    */
   async add(options = {}) {
     if (options === null || typeof options !== 'object' || options.constructor !== Object) {
@@ -544,13 +545,15 @@ export default class HomeKitDevice extends EventEmitter {
     this.postSetupDetail('Serial number "%s"', this.deviceData.serialNumber, LOG_LEVELS.DEBUG);
     this.postSetupDetail('Software version "%s"', this.deviceData.softwareVersion, LOG_LEVELS.DEBUG);
 
-    // message() reports trapped handler failures so setup can stop cleanly.
-    if ((await this.message(HomeKitDevice.ADD)) === false) {
+    // Preserve setup cleanup while forwarding the original dispatch rejection.
+    try {
+      await this.message(HomeKitDevice.ADD);
+    } catch (error) {
       // These may be cached accessories supplied by Homebridge. Do not
       // unregister them as setup rollback; permanent removal belongs to remove().
       this.#postSetupDetails = [];
       this?.log?.error?.('Accessory setup failed for "%s"', this.deviceData.description);
-      return;
+      throw error;
     }
 
     // Register Matter only after onAdd() has completed the descriptor with its
@@ -583,8 +586,15 @@ export default class HomeKitDevice extends EventEmitter {
       this.postSetupDetail('EveHome support as "%s"', this.historyService.EveHome.evetype);
     }
 
-    // Trigger registered handlers (onUpdate + listeners) for initial device data updates
-    await this.message(HomeKitDevice.UPDATE, this.deviceData, { force: true });
+    // Initial update failures must stop independent publication and clear the
+    // deferred setup summary just like failures while building the accessory.
+    try {
+      await this.message(HomeKitDevice.UPDATE, this.deviceData, { force: true });
+    } catch (error) {
+      this.#postSetupDetails = [];
+      this?.log?.error?.('Accessory setup failed for "%s"', this.deviceData.description);
+      throw error;
+    }
 
     // Publish HAP accessories that advertise independently, now that onAdd()
     // and the forced initial update have configured their services and state.
@@ -642,6 +652,7 @@ export default class HomeKitDevice extends EventEmitter {
    * Permanently remove this device and release its protocol registrations and resources.
    *
    * @returns {Promise<void>}
+   * @throws {*} When a REMOVE handler throws or rejects; lifecycle cleanup still completes.
    */
   async remove() {
     // Trigger registered handlers (onRemove + listeners)
@@ -659,9 +670,8 @@ export default class HomeKitDevice extends EventEmitter {
     for (let device of Array.from(HomeKitDevice.#deviceRegistry.values())) {
       try {
         await device.shutdown();
-        // eslint-disable-next-line no-unused-vars
-      } catch (error) {
-        // Empty
+      } catch {
+        // Device dispatch logs its rejection; continue shutting down the rest.
       }
     }
   }
@@ -670,6 +680,7 @@ export default class HomeKitDevice extends EventEmitter {
    * Notify this device of shutdown and release its timers and listeners.
    *
    * @returns {Promise<void>}
+   * @throws {*} When a SHUTDOWN handler throws or rejects; lifecycle cleanup still completes.
    */
   async shutdown() {
     // Trigger registered handlers (onShutdown + listeners)
@@ -682,6 +693,7 @@ export default class HomeKitDevice extends EventEmitter {
    * @param {Partial<HomeKitDeviceData>} deviceData Partial or complete device data.
    * @param {...*} args Additional values forwarded to update hooks and registered handlers.
    * @returns {Promise<void>}
+   * @throws {*} When message dispatch throws or a handler rejects.
    */
   async update(deviceData, ...args) {
     if (
@@ -706,6 +718,7 @@ export default class HomeKitDevice extends EventEmitter {
    * @param {Object<string, *>} entry History values to store.
    * @param {HomeKitHistoryOptions} [options={}] Duplicate and time-gap controls.
    * @returns {Promise<void>}
+   * @throws {*} When history processing or a handler throws or rejects.
    */
   async history(target, entry, options = {}) {
     if (
@@ -738,7 +751,8 @@ export default class HomeKitDevice extends EventEmitter {
    *
    * @param {Object<string, *>} values Values requested by the caller.
    * @param {...*} args Additional values forwarded to set hooks and registered handlers.
-   * @returns {Promise<void>}
+   * @returns {Promise<void>} Resolves after SET dispatch, or immediately for invalid input.
+   * @throws {*} When a SET handler or message dispatch throws or rejects.
    */
   async set(values, ...args) {
     if (
@@ -750,7 +764,7 @@ export default class HomeKitDevice extends EventEmitter {
     }
 
     // Trigger registered handlers (onSet + listeners)
-    await this.message(HomeKitDevice.SET, values, ...args);
+    return this.message(HomeKitDevice.SET, values, ...args);
   }
 
   /**
@@ -758,7 +772,8 @@ export default class HomeKitDevice extends EventEmitter {
    *
    * @param {*} values Query supplied to get hooks and registered handlers.
    * @param {...*} args Additional values forwarded with the query.
-   * @returns {Promise<*>} Hook result, merged object results, `false` on a trapped failure, or `undefined`.
+   * @returns {Promise<*>} Hook result, merged object results, or `undefined`; `false` is a valid result.
+   * @throws {*} When a GET handler or message dispatch throws or rejects.
    */
   async get(values, ...args) {
     // Trigger registered handlers (onGet + listeners)
@@ -777,6 +792,7 @@ export default class HomeKitDevice extends EventEmitter {
    * @param {*|Function|object} [message] Listener, listener context, or message payload.
    * @param {...*} args Additional values forwarded during delivery.
    * @returns {Promise<*>} Delivery result, or `undefined` after registration or when no device matches.
+   * @throws {*} When delivery to the target device rejects.
    */
   static async message(uuid, type, message = undefined, ...args) {
     // This static entry point either registers a listener for a device UUID or
@@ -829,11 +845,14 @@ export default class HomeKitDevice extends EventEmitter {
    * Named hooks are invoked from the most-derived prototype toward base prototypes.
    * Object results from hooks and registered handlers are merged, with registered
    * handler fields taking precedence.
+   * Handler failures are logged without interrupting remaining handlers or
+   * required lifecycle cleanup. Dispatch then rejects with the first handler error.
    *
    * @param {string} type Message type used to resolve the corresponding `on<Type>` hook.
    * @param {*} [message] Message payload.
    * @param {...*} args Additional values forwarded to hooks and registered handlers.
-   * @returns {Promise<*>} Handler result, merged object results, `false` on a trapped failure, or `undefined`.
+   * @returns {Promise<*>} Handler result, merged object results, or `undefined`; `false` is a valid result.
+   * @throws {*} The first handler error, or an error from dispatch processing.
    */
   async message(type, message, ...args) {
     if (typeof type !== 'string' || type === '') {
@@ -853,6 +872,7 @@ export default class HomeKitDevice extends EventEmitter {
     // handler error without preventing remaining cleanup or handlers from running.
     let result = { call: undefined, handler: undefined };
     let failed = false;
+    let failure;
     let handled = false;
     let handler =
       Array.isArray(HomeKitDevice.#listeners?.[this.#uuid]?.[type]) === true
@@ -899,6 +919,9 @@ export default class HomeKitDevice extends EventEmitter {
               try {
                 results.push(await fn.apply(context, params));
               } catch (error) {
+                if (failed === false) {
+                  failure = error;
+                }
                 failed = true;
                 this?.log?.warn?.('Error in %s(): %s', label, String(error?.stack || error));
               }
@@ -1063,9 +1086,10 @@ export default class HomeKitDevice extends EventEmitter {
           this.#platform = undefined;
         }
 
-        // Update the internal data for the set values, as could take some time once we emit the event
+        // Apply requested values only after every SET hook and listener completes
+        // without throwing, so a rejected device command cannot appear accepted.
         if (type === HomeKitDevice.SET) {
-          if (message !== null && typeof message === 'object' && message.constructor === Object) {
+          if (failed === false && message !== null && typeof message === 'object' && message.constructor === Object) {
             Object.entries(message).forEach(([key, value]) => {
               if (this.deviceData?.[key] !== undefined) {
                 this.deviceData[key] = value;
@@ -1217,13 +1241,7 @@ export default class HomeKitDevice extends EventEmitter {
         this?.log?.debug?.('Unhandled message type "%s" for device "%s"', type, this.deviceData.description);
       }
 
-      if (failed === true) {
-        // A trapped hook failure is the public failure signal, even though later
-        // handlers and required lifecycle cleanup were still allowed to complete.
-        return false;
-      }
-
-      if (typeof result.call === 'object' || typeof result.handler === 'object') {
+      if (failed === false && (typeof result.call === 'object' || typeof result.handler === 'object')) {
         // Object results form one response; registered handler fields win when
         // both sources provide the same key because they are assigned last.
         return Object.assign({}, result.call ?? {}, result.handler ?? {});
@@ -1235,7 +1253,12 @@ export default class HomeKitDevice extends EventEmitter {
         this.deviceData?.description,
         typeof error?.stack === 'string' ? error.stack : String(error),
       );
-      return false;
+      throw error;
+    }
+    // Reject outside the dispatch catch so an already logged handler failure is
+    // forwarded unchanged after cleanup, without being logged a second time.
+    if (failed === true) {
+      throw failure;
     }
     return result.call !== undefined ? result.call : result.handler;
   }

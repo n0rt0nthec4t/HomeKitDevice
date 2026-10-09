@@ -770,7 +770,7 @@ for (let asynchronous of [false, true]) {
 
     // Persistent failures stop after two attempts and surface at the boundary.
     failuresRemaining = 2;
-    assert.equal(await device.message(HomeKitDevice.UPDATE, { setting: 3 }), false);
+    await assert.rejects(device.message(HomeKitDevice.UPDATE, { setting: 3 }), /HAP cache unavailable/);
     assert.equal(attempts, 4);
     assert.equal(warnings.length, 3);
     assert.match(warnings[2][3], /HAP cache unavailable/);
@@ -1053,21 +1053,47 @@ test('Homebridge does not register or remove a cached HAP accessory when setup f
     on() {},
   };
 
+  let setupError = new Error('Setup failed');
   class BrokenHapSwitch extends HomeKitDevice {
     async onAdd() {
-      throw new Error('Setup failed');
+      throw setupError;
     }
   }
 
   let device = new BrokenHapSwitch(cachedHapAccessory, api, deviceData('HAP-ROLLBACK'));
 
-  assert.equal(await device.add(), undefined);
+  await assert.rejects(device.add(), (error) => error === setupError);
   assert.equal(device.accessory, cachedHapAccessory);
   assert.equal(calls.registered, 0);
   assert.equal(calls.unregistered, 0);
 
   await device.remove();
   assert.equal(calls.unregistered, 1);
+});
+
+test('initial UPDATE rejection stops external publication and forwards its original error', async (context) => {
+  let failure = new Error('Initial update failed');
+  let published = 0;
+  let errors = [];
+  let cachedAccessory = new MockAccessory('Cached', 'uuid:homebridge-example_INITIAL-REJECTION');
+  let device = new HomeKitDevice(cachedAccessory, {
+    version: 2.7,
+    hap,
+    publishExternalAccessories() {
+      published += 1;
+    },
+  }, deviceData('INITIAL-REJECTION'));
+  context.after(() => device.remove());
+  device.log = { error: (...args) => errors.push(args) };
+  device.onUpdate = async () => {
+    await setImmediate();
+    throw failure;
+  };
+
+  await assert.rejects(device.add({ externalPublish: true }), (error) => error === failure);
+  assert.equal(published, 0);
+  assert.equal(device.accessory, cachedAccessory);
+  assert.deepEqual(errors, [['Accessory setup failed for "%s"', device.deviceData.description]]);
 });
 
 // Lifecycle hooks must walk every override, retaining the device as the receiver.
@@ -1242,6 +1268,7 @@ test('distinct registered closures run once each even when their source text mat
 
 test('hook failures do not prevent parent hooks or registered handlers from running', async (context) => {
   let calls = [];
+  let leafError = new Error('Leaf failed');
   class BaseDevice extends HomeKitDevice {
     onGet() {
       calls.push('base');
@@ -1250,7 +1277,7 @@ test('hook failures do not prevent parent hooks or registered handlers from runn
   class LeafDevice extends BaseDevice {
     async onGet() {
       calls.push('leaf');
-      throw new Error('Leaf failed');
+      throw leafError;
     }
   }
   let device = new LeafDevice(undefined, { version: 2.7, hap }, deviceData('CHAIN-FAILURE'));
@@ -1263,7 +1290,7 @@ test('hook failures do not prevent parent hooks or registered handlers from runn
   });
   await HomeKitDevice.message(device.uuid, HomeKitDevice.GET, () => calls.push('last-listener'));
 
-  assert.equal(await device.get({}), false);
+  await assert.rejects(device.get({}), (error) => error === leafError);
   assert.deepEqual(calls, ['leaf', 'base', 'failed-listener', 'last-listener']);
   assert.equal(warnings.length, 2);
 });
@@ -1288,6 +1315,123 @@ test('hook result ordering and registered object precedence remain unchanged', a
   assert.deepEqual(await device.get({}), { level: 'registered', extra: true });
 });
 
+test('GET rejects a registered handler failure even after a successful hook result', async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('GET-REJECTION'));
+  context.after(() => device.remove());
+  let failure = new Error('Read failed');
+  let completed = false;
+  device.onGet = () => ({ value: 42 });
+  await HomeKitDevice.message(device.uuid, HomeKitDevice.GET, async () => {
+    await setImmediate();
+    throw failure;
+  });
+  await HomeKitDevice.message(device.uuid, HomeKitDevice.GET, () => {
+    completed = true;
+    return { value: 99 };
+  });
+
+  await assert.rejects(HomeKitDevice.message(device.uuid, HomeKitDevice.GET, {}), (error) => error === failure);
+  assert.equal(completed, true);
+});
+
+test('custom message fallback rejects with its original error', async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('CUSTOM-REJECTION'));
+  context.after(() => device.remove());
+  let failure = new Error('Custom operation failed');
+  device.onMessage = async () => {
+    await setImmediate();
+    throw failure;
+  };
+  await assert.rejects(device.message('custom', {}), (error) => error === failure);
+});
+
+for (let method of ['remove', 'shutdown']) {
+  test(method + ' completes cleanup before rejecting a handler failure', async (context) => {
+    let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('CLEANUP-' + method));
+    let failure = new Error('Cleanup hook failed');
+    let completed = false;
+    let uuid = device.uuid;
+    context.after(async () => {
+      delete device.onRemove;
+      delete device.onShutdown;
+      await device.remove();
+    });
+    device.on('probe', () => {});
+    device.addTimer('poll', { interval: 10000 }, () => {});
+    device[method === 'remove' ? 'onRemove' : 'onShutdown'] = () => {
+      throw failure;
+    };
+    await HomeKitDevice.message(uuid, method === 'remove' ? HomeKitDevice.REMOVE : HomeKitDevice.SHUTDOWN, async () => {
+      await setImmediate();
+      completed = true;
+    });
+
+    await assert.rejects(device[method](), (error) => error === failure);
+    assert.equal(completed, true);
+    assert.equal(device.hasTimer('poll'), false);
+    assert.equal(device.listenerCount('probe'), 0);
+    assert.equal(await HomeKitDevice.message(uuid, HomeKitDevice.GET, {}), undefined);
+    if (method === 'remove') {
+      assert.deepEqual(device.deviceData, {});
+      assert.equal(device.uuid, undefined);
+    }
+  });
+}
+
+test('set forwards dispatch failures and waits for asynchronous handlers', async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, { ...deviceData('SET-RESULTS'), requested: false });
+  context.after(() => device.remove());
+  let originalData = structuredClone(device.deviceData);
+  let calls = 0;
+  let payload = { requested: true };
+  let extra = { source: 'test' };
+  let writeError = new Error('Write failed');
+  let registeredError = new Error('Registered write failed');
+  device.onSet = (values, options) => {
+    assert.equal(values, payload);
+    assert.equal(options, extra);
+    calls += 1;
+    throw writeError;
+  };
+  await assert.rejects(device.set(payload, extra), (error) => error === writeError);
+  assert.equal(calls, 1);
+  assert.deepEqual(device.deviceData, originalData);
+
+  delete device.onSet;
+  await HomeKitDevice.message(device.uuid, HomeKitDevice.SET, async () => {
+    await setImmediate();
+    calls += 1;
+    throw registeredError;
+  });
+  await assert.rejects(device.set(payload), (error) => error === registeredError);
+  assert.equal(calls, 2);
+  assert.deepEqual(device.deviceData, originalData);
+
+  // UUID delivery uses the same SET failure guard as the public wrapper.
+  await assert.rejects(HomeKitDevice.message(device.uuid, HomeKitDevice.SET, payload), (error) => error === registeredError);
+  assert.equal(calls, 3);
+  assert.deepEqual(device.deviceData, originalData);
+
+  assert.equal(await device.set(null), undefined);
+  assert.equal(calls, 3);
+});
+
+test('set preserves the undefined result after a successful asynchronous hook', async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, { ...deviceData('SET-SUCCESS'), requested: false });
+  context.after(() => device.remove());
+  let completed = false;
+  device.onSet = async () => {
+    await setImmediate();
+    completed = true;
+  };
+  let result = device.set({ requested: true, unknown: 1 });
+  assert.equal(device.deviceData.requested, false);
+  assert.equal(await result, undefined);
+  assert.equal(completed, true);
+  assert.equal(device.deviceData.requested, true);
+  assert.equal(Object.hasOwn(device.deviceData, 'unknown'), false);
+});
+
 test('named hooks and registered handlers preserve scalar results', async (context) => {
   let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('SCALAR-RESULTS'));
   context.after(() => device.remove());
@@ -1300,8 +1444,33 @@ test('named hooks and registered handlers preserve scalar results', async (conte
   }
 
   delete device.onGet;
-  await HomeKitDevice.message(device.uuid, HomeKitDevice.GET, () => 42);
+  let registeredResult = 42;
+  await HomeKitDevice.message(device.uuid, HomeKitDevice.GET, () => registeredResult);
   assert.equal(await device.get({}), 42);
+  registeredResult = false;
+  assert.equal(await device.get({}), false);
+});
+
+test('timer message rejection is handled and the one-shot timer is removed', { timeout: 1000 }, async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('TIMER-DISPATCH-REJECTION'));
+  context.after(() => device.shutdown());
+  let warnings = [];
+  let notify;
+  let fired = new Promise((resolve) => {
+    notify = resolve;
+  });
+  device.log = { warn: (...args) => warnings.push(args) };
+  device.onTimer = async () => {
+    notify();
+    throw new Error('Timer hook failed');
+  };
+  device.addTimer('message-poll', { delay: 10 });
+
+  await fired;
+  await setImmediate();
+  assert.equal(device.hasTimer('message-poll'), false);
+  assert.equal(warnings.length, 2);
+  assert.deepEqual(warnings[1], ['Timer callback failed for "%s"', device.deviceData.description]);
 });
 
 for (let asynchronous of [false, true]) {

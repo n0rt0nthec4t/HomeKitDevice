@@ -290,6 +290,10 @@ Dispatch order is:
 
 For lifecycle hook methods, `HomeKitDevice` walks the prototype chain. This allows both a subclass and a parent class to implement `onUpdate()` without requiring each subclass to call `super.onUpdate()`.
 
+Handlers signal failure by throwing or rejecting. Each handler error is logged, remaining hooks and listeners run, and required REMOVE or SHUTDOWN cleanup completes before dispatch rejects with the first handler error. Errors in dispatch processing also reject. Instance messages, UUID delivery, and public wrappers forward the rejection; callers must use `try/catch` or promise rejection handling. GET results such as `false` remain valid successful values. SET ignores handler return values and skips its automatic data update after a handler failure.
+
+Timer execution catches dispatch rejections to retain cleanup and repeat scheduling. Global shutdown catches logged device rejections to continue processing the registry.
+
 ---
 
 ## Message Types
@@ -483,7 +487,7 @@ When adding or refining subclasses:
 - Device instances are registry-owned until removed or shutdown.
 - Static listeners are removed when the target device is removed or shut down.
 - Bridged HAP structure, metadata, and declared context changes during message handling are automatically pushed to Homebridge.
-- `SET` optimistically updates matching keys in `deviceData` after handlers run.
+- `SET` updates matching keys in `deviceData` after all hooks and registered handlers complete without throwing or rejecting. A trapped handler failure skips this automatic update.
 - `UPDATE` only invokes `onUpdate()` when data changed or `{ force: true }` is supplied.
 - `ONLINE` and `OFFLINE` are derived from `deviceData.online` transitions during AccessoryInformation updates.
 - `REMOVE` clears HomeKitDevice state aggressively so stale instances can be garbage collected.

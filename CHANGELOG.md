@@ -6,6 +6,8 @@ All notable changes to the `HomeKitDevice` module are documented in this file.
 
 ### Fixed
 
+- Skipped automatic SET updates to `deviceData` when a hook or registered handler throws or rejects
+- Propagated SET dispatch rejections through `set()` while preserving asynchronous completion and existing validation behaviour
 - Preserved scalar results from named message hooks and registered handlers when the other source has no hooks
 - Retried a failed bridged HAP cache write once within message dispatch, including thrown errors and rejected promises, and reported errors when both attempts failed
 - Logged direct timer callback failures while preserving one-shot cleanup and repeating timer recovery
@@ -13,6 +15,8 @@ All notable changes to the `HomeKitDevice` module are documented in this file.
 
 ### Changed
 
+- Changed message dispatch and its public wrappers to reject with the original handler error instead of returning `false`, preserving remaining handler execution and lifecycle cleanup; callers must handle rejected promises
+- Kept successful GET results such as `false` distinct from failures and stopped setup publication after rejected ADD or initial UPDATE dispatch
 - Added module purpose comments to the tests and ESLint configuration and replaced test template literals with string concatenation
 
 ## 2026/10/05
