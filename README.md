@@ -507,5 +507,5 @@ Public static configuration and message constants include:
 Each subclass may define a static `VERSION` string for visibility in logs:
 
 ```js
-static VERSION = '2026.10.09';
+static VERSION = '2026.10.10';
 ```
