@@ -1,6 +1,7 @@
 // Verify protocol lifecycle, persistence, message routing, and timer behaviour
 // using isolated HAP and Matter mocks without starting protocol servers.
 import assert from 'node:assert/strict';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import test from 'node:test';
 import { setImmediate } from 'node:timers/promises';
 
@@ -1226,6 +1227,407 @@ for (let type of [HomeKitDevice.GET, HomeKitDevice.TIMER, 'custom']) {
   });
 }
 
+test('onUpdate can await history with validation, duplicate filtering and all handlers', async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('OWNED-HISTORY'));
+  context.after(() => device.remove());
+  let target = { UUID: 'history-target' };
+  let calls = [];
+  let last;
+  device.historyService = {
+    lastHistory: () => last,
+    addHistory(service, entry, gap) {
+      assert.equal(service, target);
+      assert.equal(Number.isFinite(entry.time), true);
+      assert.equal(gap, 5);
+      last = entry;
+      calls.push('store');
+      return true;
+    },
+  };
+  device.onHistory = (service, entry) => {
+    assert.equal(service, target);
+    assert.equal(entry.status, 1);
+    calls.push('hook');
+  };
+  HomeKitDevice.message(device.uuid, HomeKitDevice.HISTORY, () => calls.push('listener'));
+  device.onUpdate = async () => {
+    await device.history(null, { status: 1 });
+    await device.history(target, { status: 1 }, null);
+    await device.history(target, { status: 1 }, { timegap: 5 });
+    await device.history(target, { status: 1 }, { timegap: 5 });
+    calls.push('update');
+  };
+  await device.update({ a: 1 });
+  assert.deepEqual(calls, ['store', 'hook', 'listener', 'update']);
+});
+
+for (let method of ['remove', 'shutdown']) {
+  test(method + ' waits for history submitted without awaiting from onUpdate', { timeout: 1000 }, async (context) => {
+    let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('OWNED-HISTORY-' + method));
+    let entered = Promise.withResolvers();
+    let release = Promise.withResolvers();
+    context.after(async () => {
+      release.resolve();
+      await device.remove();
+    });
+    let calls = [];
+    device.historyService = {
+      async addHistory() {
+        entered.resolve();
+        await release.promise;
+        calls.push('store');
+        return true;
+      },
+    };
+    device.onHistory = () => calls.push('history');
+    device.onUpdate = () => {
+      device.history({ UUID: 'history-target' }, { status: 1 });
+    };
+    device[method === 'remove' ? 'onRemove' : 'onShutdown'] = () => calls.push(method);
+    let updating = device.update({ a: 1 });
+    await entered.promise;
+    let teardown = device[method]();
+    await setImmediate();
+    assert.deepEqual(calls, []);
+    release.resolve();
+    await Promise.all([updating, teardown]);
+    assert.deepEqual(calls, ['store', 'history', method]);
+  });
+}
+
+test('overlapping nested history entries finish in submission order', { timeout: 1000 }, async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('OWNED-HISTORY-ORDER'));
+  let entered = Promise.withResolvers();
+  let release = Promise.withResolvers();
+  context.after(async () => {
+    release.resolve();
+    await device.remove();
+  });
+  let calls = [];
+  device.historyService = {
+    async addHistory(target, entry) {
+      calls.push('start ' + entry.status);
+      if (entry.status === 1) {
+        entered.resolve();
+        await release.promise;
+      }
+      calls.push('finish ' + entry.status);
+      return true;
+    },
+  };
+  device.onUpdate = () => {
+    device.history({ UUID: 'history-target' }, { status: 1 });
+    device.history({ UUID: 'history-target' }, { status: 2 });
+  };
+  let updating = device.update({ a: 1 });
+  await entered.promise;
+  await setImmediate();
+  assert.deepEqual(calls, ['start 1']);
+  release.resolve();
+  await updating;
+  assert.deepEqual(calls, ['start 1', 'finish 1', 'start 2', 'finish 2']);
+});
+
+for (let method of ['remove', 'shutdown']) {
+  test('history owned by ' + method + ' finishes before cleanup', { timeout: 1000 }, async (context) => {
+    let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('TEARDOWN-HISTORY-' + method));
+    let entered = Promise.withResolvers();
+    let release = Promise.withResolvers();
+    context.after(async () => {
+      release.resolve();
+      await device.remove();
+    });
+    let historyService = {
+      async addHistory() {
+        entered.resolve();
+        await release.promise;
+        return true;
+      },
+    };
+    device.historyService = historyService;
+    let completed = false;
+    device.onHistory = () => {
+      assert.equal(device.historyService, historyService);
+      assert.equal(device.hap, hap);
+      completed = true;
+    };
+    device[method === 'remove' ? 'onRemove' : 'onShutdown'] = () => {
+      device.history({ UUID: 'history-target' }, { status: 1 });
+    };
+    let teardown = device[method]();
+    await entered.promise;
+    assert.equal(device.historyService, historyService);
+    assert.equal(completed, false);
+    release.resolve();
+    await teardown;
+    assert.equal(completed, true);
+  });
+}
+
+for (let awaited of [true, false]) {
+  test('nested history failure rejects its owner and the queue recovers, awaited: ' + awaited, async (context) => {
+    let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('OWNED-HISTORY-FAIL-' + awaited));
+    context.after(() => device.remove());
+    let failure = new Error('History hook failed');
+    device.historyService = { addHistory: () => true };
+    device.onHistory = () => {
+      throw failure;
+    };
+    device.onUpdate = async () => {
+      let history = device.history({ UUID: 'history-target' }, { status: 1 });
+      if (awaited === true) {
+        await history;
+      }
+    };
+    await assert.rejects(device.update({ a: 1 }), (error) => error === failure);
+    delete device.onHistory;
+    await device.update({ a: 2 });
+    assert.equal(device.deviceData.a, 2);
+  });
+}
+
+test('nested GET, HISTORY and custom handlers share ownership without bypassing state-change guards', async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('OWNED-NESTED-ROUTES'));
+  context.after(() => device.remove());
+  let calls = [];
+  device.historyService = { addHistory: () => true };
+  device.onMessage = (type) => {
+    calls.push(type);
+    return 42;
+  };
+  device.onHistory = async () => {
+    assert.equal(await device.message('custom', {}), 42);
+    await assert.rejects(device.update({ a: 99 }), /Reentrant lifecycle message/);
+    calls.push('history');
+  };
+  device.onGet = async () => {
+    await device.history({ UUID: 'history-target' }, { status: 1 });
+    calls.push('get');
+    return { value: 1 };
+  };
+  device.onUpdate = async () => {
+    assert.deepEqual(await device.get({}), { value: 1 });
+    calls.push('update');
+  };
+  await device.update({ a: 1 });
+  assert.deepEqual(calls, ['custom', 'history', 'get', 'update']);
+  assert.equal(device.deviceData.a, 1);
+});
+
+for (let type of [HomeKitDevice.TIMER, HomeKitDevice.GET, 'plugin-command']) {
+  test('nested state work uses generic ownership under ' + type, { timeout: 1000 }, async (context) => {
+    let device = new HomeKitDevice(undefined, { version: 2.7, hap }, { ...deviceData('NESTED-STATE-' + type), a: 0, b: 0 });
+    context.after(() => device.remove());
+    let calls = [];
+    device.historyService = { addHistory: () => calls.push('history') };
+    device.onUpdate = async () => {
+      await device.history({ UUID: 'history-target' }, { status: 1 });
+      calls.push('update');
+    };
+    device.onSet = () => calls.push('set');
+    await HomeKitDevice.message(device.uuid, type, async () => {
+      await device.update({ a: 1 });
+      await device.set({ b: 2 });
+      return 42;
+    });
+    assert.equal(await device.message(type, {}), 42);
+    assert.deepEqual(calls, ['history', 'update', 'set']);
+    assert.equal(device.deviceData.a, 1);
+    assert.equal(device.deviceData.b, 2);
+  });
+}
+
+test('polling can await GET then UPDATE while external teardown waits for the entire operation', { timeout: 1000 }, async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, { ...deviceData('NESTED-POLLING'), a: 0 });
+  context.after(() => device.remove());
+  let entered = Promise.withResolvers();
+  let release = Promise.withResolvers();
+  context.after(() => release.resolve());
+  let calls = [];
+  device.onGet = async () => {
+    entered.resolve();
+    await release.promise;
+    return { a: 1 };
+  };
+  device.onTimer = async () => {
+    await device.update(await device.get({}));
+    calls.push('timer');
+  };
+  device.onUpdate = () => calls.push('update');
+  device.onShutdown = () => calls.push('shutdown');
+  let polling = device.message(HomeKitDevice.TIMER);
+  await entered.promise;
+  let shutdown = device.shutdown();
+  await setImmediate();
+  assert.deepEqual(calls, []);
+  release.resolve();
+  await Promise.all([polling, shutdown]);
+  assert.deepEqual(calls, ['update', 'timer', 'shutdown']);
+  assert.equal(device.deviceData.a, 1);
+});
+
+test('ignored nested SET and UPDATE remain ordered before external work', { timeout: 1000 }, async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, { ...deviceData('NESTED-IGNORED-STATE'), a: 0, b: 0 });
+  context.after(() => device.remove());
+  let entered = Promise.withResolvers();
+  let release = Promise.withResolvers();
+  context.after(() => release.resolve());
+  let calls = [];
+  device.onSet = async () => {
+    entered.resolve();
+    await release.promise;
+    calls.push('set');
+  };
+  device.onUpdate = (data) => calls.push([data.a, data.b]);
+  device.onMessage = () => {
+    device.set({ a: 1 });
+    device.update({ b: 2 });
+  };
+  let command = device.message('plugin-command');
+  await entered.promise;
+  let external = device.update({ b: 3 });
+  await setImmediate();
+  assert.deepEqual(calls, []);
+  release.resolve();
+  await Promise.all([command, external]);
+  assert.deepEqual(calls, ['set', [1, 2], [1, 3]]);
+  assert.equal(device.deviceData.a, 1);
+  assert.equal(device.deviceData.b, 3);
+});
+
+test('ignored nested write failures reject the owner without leaving unobserved wrapper promises', async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, { ...deviceData('IGNORED-STATE-FAILURE'), a: 0 });
+  context.after(() => device.remove());
+  let failure = new Error('Device write failed');
+  device.onSet = () => {
+    throw failure;
+  };
+  device.onMessage = () => {
+    device.set({ a: 1 });
+  };
+  await assert.rejects(device.message('plugin-command'), (error) => error === failure);
+  await setImmediate();
+  assert.equal(device.deviceData.a, 0);
+  delete device.onSet;
+  await device.update({ a: 2 });
+  assert.equal(device.deviceData.a, 2);
+});
+
+test('inherited context from a finished child rejoins the active owner in submission order', { timeout: 1000 }, async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, { ...deviceData('FINISHED-STATE-OWNER'), a: 0, b: 0 });
+  context.after(() => device.remove());
+  let entered = Promise.withResolvers();
+  let release = Promise.withResolvers();
+  context.after(() => release.resolve());
+  let inherited;
+  let calls = [];
+  device.onUpdate = (data) => {
+    inherited ??= AsyncLocalStorage.snapshot();
+    calls.push([data.a, data.b]);
+  };
+  device.onSet = async () => {
+    entered.resolve();
+    await release.promise;
+    calls.push('set');
+  };
+  device.onMessage = async () => {
+    await device.update({ a: 1 });
+    let set = device.set({ a: 2 });
+    await entered.promise;
+    // The captured UPDATE context has finished; its active parent owns this submission.
+    let update = inherited(() => device.update({ b: 3 }));
+    await setImmediate();
+    assert.deepEqual(calls, [[1, 0]]);
+    release.resolve();
+    await Promise.all([set, update]);
+  };
+  await device.message('plugin-command');
+  assert.deepEqual(calls, [[1, 0], 'set', [2, 3]]);
+});
+
+test('SET ownership protects its delayed commit from a nested UPDATE', async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, { ...deviceData('SET-STATE-OWNER'), a: 0, b: 0 });
+  context.after(() => device.remove());
+  let updates = 0;
+  device.onUpdate = () => updates += 1;
+  device.onSet = () => device.update({ a: 2, b: 2 });
+  await assert.rejects(device.set({ a: 1 }), /Reentrant lifecycle message/);
+  assert.equal(updates, 0);
+  assert.equal(device.deviceData.a, 0);
+  assert.equal(device.deviceData.b, 0);
+});
+
+test('indirect nested state changes cannot take ownership from an unfinished commit', async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, { ...deviceData('INDIRECT-STATE-OWNER'), a: 0, b: 0 });
+  context.after(() => device.remove());
+  device.onMessage = () => device.set({ b: 2 });
+  device.onUpdate = () => device.message('plugin-command');
+  await assert.rejects(device.update({ a: 1 }), /Reentrant lifecycle message/);
+  assert.equal(device.deviceData.a, 1);
+  assert.equal(device.deviceData.b, 0);
+});
+
+for (let method of ['remove', 'shutdown']) {
+  test('nested ' + method + ' finishes cleanup and prevents later owned state work', async (context) => {
+    let device = new HomeKitDevice(undefined, { version: 2.7, hap }, { ...deviceData('NESTED-TEARDOWN-' + method), a: 0 });
+    context.after(() => device.remove());
+    device.historyService = { addHistory: () => true };
+    let histories = 0;
+    let updates = 0;
+    device.onHistory = () => histories += 1;
+    device.onUpdate = () => updates += 1;
+    device[method === 'remove' ? 'onRemove' : 'onShutdown'] = () => device.history({ UUID: 'history-target' }, { status: 1 });
+    device.onMessage = async () => {
+      await device[method]();
+      await device.update({ a: 99 });
+    };
+    await device.message('plugin-command');
+    assert.equal(histories, 1);
+    assert.equal(updates, 0);
+    assert.notEqual(device.deviceData.a, 99);
+  });
+}
+
+test('recursive history rejects instead of deadlocking its owning dispatch', async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('RECURSIVE-HISTORY'));
+  context.after(() => device.remove());
+  device.historyService = { addHistory: () => true };
+  device.onHistory = () => device.history({ UUID: 'history-target' }, { status: 2 });
+  device.onUpdate = () => device.history({ UUID: 'history-target' }, { status: 1 });
+  await assert.rejects(device.update({ a: 1 }), /Reentrant lifecycle message/);
+});
+
+test('global shutdown isolates a stalled device queue and a rejecting shutdown hook', { timeout: 1000 }, async (context) => {
+  let devices = ['STALLED', 'HEALTHY', 'REJECTING'].map((name) => new HomeKitDevice(
+    undefined, { version: 2.7, hap }, deviceData('SHUTDOWN-ISOLATION-' + name),
+  ));
+  let entered = Promise.withResolvers();
+  let release = Promise.withResolvers();
+  context.after(async () => {
+    release.resolve();
+    await Promise.all(devices.map((device) => device.remove()));
+  });
+  let calls = [];
+  devices[0].onUpdate = async () => {
+    entered.resolve();
+    await release.promise;
+  };
+  devices[0].onShutdown = () => calls.push('stalled');
+  devices[1].onShutdown = () => calls.push('healthy');
+  devices[2].onShutdown = () => {
+    calls.push('rejecting');
+    throw new Error('Shutdown hook failed');
+  };
+  let updating = devices[0].update({ a: 1 });
+  await entered.promise;
+  let shutdown = HomeKitDevice.shutdown();
+  await setImmediate();
+  assert.deepEqual(calls, ['healthy', 'rejecting']);
+  release.resolve();
+  await Promise.all([updating, shutdown]);
+  assert.deepEqual(calls, ['healthy', 'rejecting', 'stalled']);
+});
+
 test('overlapping runtime shutdown events broadcast once and invoke each device hook once', { timeout: 1000 }, async (context) => {
   let broadcasts = 0;
   let originalShutdown = HomeKitDevice.shutdown;
@@ -1341,8 +1743,7 @@ test('a failed UPDATE rejects its caller without blocking queued updates', { tim
   assert.equal(device.deviceData.b, 1);
 });
 
-for (let type of [HomeKitDevice.UPDATE, HomeKitDevice.SET, HomeKitDevice.GET, HomeKitDevice.TIMER,
-  HomeKitDevice.REMOVE, HomeKitDevice.SHUTDOWN, 'custom']) {
+for (let type of [HomeKitDevice.UPDATE, HomeKitDevice.SET, HomeKitDevice.REMOVE, HomeKitDevice.SHUTDOWN]) {
   test('reentrant ' + type + ' rejects without deadlocking or changing nested state', { timeout: 1000 }, async (context) => {
     let device = new HomeKitDevice(undefined, { version: 2.7, hap }, { ...deviceData('REENTRANT-' + type), a: 0, b: 0 });
     context.after(() => device.remove());

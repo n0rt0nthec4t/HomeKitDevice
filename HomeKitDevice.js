@@ -405,10 +405,16 @@ export default class HomeKitDevice extends EventEmitter {
    * `false` for a completed setup failure, or `undefined` when validation rejects setup or the device has been torn down.
    * @throws {*} When dispatch rejects or submission would create a lifecycle wait cycle.
    */
-  async add(options = {}) {
+  add(options = {}) {
     // Hold one queue slot through descriptor creation, hooks, registration,
     // the initial update and publication so teardown cannot overtake setup.
     return this.#queueMessage(HomeKitDevice.ADD, async () => {
+      // Setup owns registration and publication until the entire operation finishes.
+      let context = HomeKitDevice.#lifecycleContext.getStore();
+      if (context.stateOwner?.active === true && context.stateOwner !== context) {
+        throw new Error('Reentrant lifecycle message "' + HomeKitDevice.ADD + '" on the same device');
+      }
+      context.stateOwner = context;
       if (this.#lifecycleState !== undefined) {
         return;
       }
@@ -668,9 +674,9 @@ export default class HomeKitDevice extends EventEmitter {
    * @returns {Promise<void>}
    * @throws {*} When a REMOVE handler throws or rejects; lifecycle cleanup still completes.
    */
-  async remove() {
+  remove() {
     // Trigger registered handlers (onRemove + listeners)
-    await this.message(HomeKitDevice.REMOVE);
+    return this.message(HomeKitDevice.REMOVE);
   }
 
   /**
@@ -679,15 +685,9 @@ export default class HomeKitDevice extends EventEmitter {
    * @returns {Promise<void>}
    */
   static async shutdown() {
-    // Notify all registered devices of process shutdown.
-    // Calls the instance shutdown() method on each registered device.
-    for (let device of Array.from(HomeKitDevice.#deviceRegistry.values())) {
-      try {
-        await device.shutdown();
-      } catch {
-        // Device dispatch logs its rejection; continue shutting down the rest.
-      }
-    }
+    // Notify independently so a stalled queue cannot delay other devices.
+    // Dispatch logs failures; settle every notification without stopping the rest.
+    await Promise.allSettled(Array.from(HomeKitDevice.#deviceRegistry.values(), async (device) => device.shutdown()));
   }
 
   /**
@@ -696,9 +696,9 @@ export default class HomeKitDevice extends EventEmitter {
    * @returns {Promise<void>}
    * @throws {*} When a SHUTDOWN handler throws or rejects; lifecycle cleanup still completes.
    */
-  async shutdown() {
+  shutdown() {
     // Trigger registered handlers (onShutdown + listeners)
-    await this.message(HomeKitDevice.SHUTDOWN);
+    return this.message(HomeKitDevice.SHUTDOWN);
   }
 
   /**
@@ -709,18 +709,18 @@ export default class HomeKitDevice extends EventEmitter {
    * @returns {Promise<void>}
    * @throws {*} When message dispatch throws or a handler rejects.
    */
-  async update(deviceData, ...args) {
+  update(deviceData, ...args) {
     if (
       deviceData === null || // Must not be null
       typeof deviceData !== 'object' || // Must be an object
       deviceData.constructor !== Object || // Must be a plain JSON object
       this.#validDeviceData(deviceData) === false // Partial validation
     ) {
-      return;
+      return Promise.resolve();
     }
 
     // Trigger registered handlers (onUpdate + listeners)
-    await this.message(HomeKitDevice.UPDATE, deviceData, ...args);
+    return this.message(HomeKitDevice.UPDATE, deviceData, ...args);
   }
 
   /**
@@ -734,7 +734,7 @@ export default class HomeKitDevice extends EventEmitter {
    * @returns {Promise<void>}
    * @throws {*} When history processing or a handler throws or rejects.
    */
-  async history(target, entry, options = {}) {
+  history(target, entry, options = {}) {
     if (
       typeof this.historyService !== 'object' ||
       this.historyService === null ||
@@ -753,11 +753,11 @@ export default class HomeKitDevice extends EventEmitter {
       typeof options !== 'object' ||
       options.constructor !== Object
     ) {
-      return;
+      return Promise.resolve();
     }
 
     // Trigger registered handlers (onHistory + listeners)
-    await this.message(HomeKitDevice.HISTORY, target, entry, options);
+    return this.message(HomeKitDevice.HISTORY, target, entry, options);
   }
 
   /**
@@ -768,13 +768,13 @@ export default class HomeKitDevice extends EventEmitter {
    * @returns {Promise<void>} Resolves after SET dispatch, or immediately for invalid input.
    * @throws {*} When a SET handler or message dispatch throws or rejects.
    */
-  async set(values, ...args) {
+  set(values, ...args) {
     if (
       values === null || // Must not be null
       typeof values !== 'object' || // Must be an object
       values.constructor !== Object // Must be a plain JSON object
     ) {
-      return;
+      return Promise.resolve();
     }
 
     // Trigger registered handlers (onSet + listeners)
@@ -789,7 +789,7 @@ export default class HomeKitDevice extends EventEmitter {
    * @returns {Promise<*>} Hook result, merged object results, or `undefined`; `false` is a valid result.
    * @throws {*} When a GET handler or message dispatch throws or rejects.
    */
-  async get(values, ...args) {
+  get(values, ...args) {
     // Trigger registered handlers (onGet + listeners)
     return this.message(HomeKitDevice.GET, values, ...args);
   }
@@ -863,7 +863,8 @@ export default class HomeKitDevice extends EventEmitter {
    * required lifecycle cleanup. Dispatch then rejects with the first handler error.
    * All messages are ordered per device, including hooks and persistence.
    * State changes after teardown are ignored; REMOVE remains available after SHUTDOWN.
-   * Reentrant calls reject rather than waiting on their own queue.
+   * Nested messages complete within their owning operation, regardless of type.
+   * Overlapping state ownership and recursive routes reject rather than losing state or waiting on themselves.
    *
    * @param {string} type Message type used to resolve the corresponding `on<Type>` hook.
    * @param {*} [message] Message payload.
@@ -871,9 +872,9 @@ export default class HomeKitDevice extends EventEmitter {
    * @returns {Promise<*>} Handler result, merged object results, or `undefined`; `false` is a valid result.
    * @throws {*} The first handler error, a dispatch error, or a lifecycle wait-cycle error.
    */
-  async message(type, message, ...args) {
+  message(type, message, ...args) {
     if (typeof type !== 'string' || type === '') {
-      return;
+      return Promise.resolve();
     }
 
     return this.#queueMessage(type, () => this.#dispatchMessage(type, message, ...args));
@@ -887,27 +888,33 @@ export default class HomeKitDevice extends EventEmitter {
    * @returns {Promise<*>} Operation result, preserving its rejection.
    * @private
    */
-  async #queueMessage(type, operation) {
+  #queueMessage(type, operation) {
     let parent = HomeKitDevice.#lifecycleContext.getStore();
     let caller;
+    let owner;
     for (let context = parent; context !== undefined; context = context.parent) {
       if (context.active === true) {
         caller ??= context;
         if (context.device === this) {
-          throw new Error('Reentrant lifecycle message "' + type + '" on the same device');
+          // Every nested route belongs to its caller; reject recursive routes
+          // and returns through another device that would wait on an ancestor.
+          if (parent.device !== this || context.type === type) {
+            return Promise.reject(new Error('Reentrant lifecycle message "' + type + '" on the same device'));
+          }
+          owner ??= context;
         }
       }
     }
 
     // Independent roots can also form a cycle. Treat outstanding cross-device
     // submissions as waits and reject before extending either queue.
-    if (caller !== undefined) {
+    if (caller !== undefined && owner === undefined) {
       let remaining = [this];
       let seen = new Set();
       while (remaining.length > 0) {
         let device = remaining.pop();
         if (device === caller.device) {
-          throw new Error('Lifecycle message "' + type + '" would create a cross-device wait cycle');
+          return Promise.reject(new Error('Lifecycle message "' + type + '" would create a cross-device wait cycle'));
         }
         if (seen.has(device) === false) {
           seen.add(device);
@@ -917,38 +924,77 @@ export default class HomeKitDevice extends EventEmitter {
       caller.waiting.set(this, (caller.waiting.get(this) ?? 0) + 1);
     }
 
-    let pending = this.#lifecycleTail.then(async () => {
-      let context = { device: this, active: true, parent, waiting: new Map() };
-      this.#activeLifecycle = context;
+    let root = owner?.root ?? owner;
+    let pending = (owner === undefined ? this.#lifecycleTail : owner.tail ?? Promise.resolve()).then(async () => {
+      let context = {
+        device: this, type, active: true, parent, root, stateOwner: owner?.stateOwner,
+        waiting: root?.waiting ?? new Map(), children: [],
+      };
+      if (owner === undefined) {
+        this.#activeLifecycle = context;
+      }
       return HomeKitDevice.#lifecycleContext.run(context, async () => {
+        let result;
+        let failed = false;
+        let failure;
         try {
-          return await operation();
+          try {
+            result = await operation();
+          } catch (error) {
+            failed = true;
+            failure = error;
+          }
+          // Hooks may submit work without awaiting it. Keep ownership active
+          // until every descendant completes, including work spawned by children.
+          if (owner === undefined) {
+            while (context.children.length > 0) {
+              for (let child of await Promise.allSettled(context.children.splice(0))) {
+                if (child.status === 'rejected' && failed === false) {
+                  failed = true;
+                  failure = child.reason;
+                }
+              }
+            }
+          }
+          if (failed === true) {
+            throw failure;
+          }
+          return result;
         } finally {
           context.active = false;
-          context.waiting.clear();
-          this.#activeLifecycle = undefined;
+          if (owner === undefined) {
+            context.waiting.clear();
+            this.#activeLifecycle = undefined;
+          }
         }
       });
     });
-    this.#lifecycleTail = pending.catch(() => {
-      // The caller receives the rejection; later submissions still run.
-    });
-    try {
-      return await pending;
-    } finally {
-      if (caller !== undefined) {
+    if (caller !== undefined && owner === undefined) {
+      pending = pending.finally(() => {
         let count = caller.waiting.get(this) ?? 0;
         if (count > 1) {
           caller.waiting.set(this, count - 1);
         } else {
           caller.waiting.delete(this);
         }
-      }
+      });
     }
+    let settled = pending.catch(() => {
+      // Preserve caller rejections while allowing later submissions to run.
+    });
+    if (owner !== undefined) {
+      owner.tail = settled;
+      root.children.push(pending);
+    } else {
+      this.#lifecycleTail = settled;
+    }
+    return pending;
   }
 
   /**
    * Execute one message after the lifecycle ordering boundary, including cache persistence.
+   * State/resource handlers claim the context until their commit or cleanup finishes.
+   * Descendant handlers may use those resources but cannot take overlapping ownership.
    *
    * @param {string} type Message type.
    * @param {*} message Message payload.
@@ -957,15 +1003,14 @@ export default class HomeKitDevice extends EventEmitter {
    * @private
    */
   async #dispatchMessage(type, message, ...args) {
-    // Lifecycle handlers own teardown policy; the queue treats all types alike.
+    // Only work inside unfinished state/resource ownership can use teardown resources.
+    let context = HomeKitDevice.#lifecycleContext.getStore();
     if (
-      this.#lifecycleState === HomeKitDevice.REMOVE ||
-      (this.#lifecycleState === HomeKitDevice.SHUTDOWN && type !== HomeKitDevice.REMOVE)
+      context?.stateOwner?.active !== true &&
+      (this.#lifecycleState === HomeKitDevice.REMOVE ||
+        (this.#lifecycleState === HomeKitDevice.SHUTDOWN && type !== HomeKitDevice.REMOVE))
     ) {
       return;
-    }
-    if (type === HomeKitDevice.REMOVE || type === HomeKitDevice.SHUTDOWN) {
-      this.#lifecycleState = type;
     }
     if (
       (message === undefined || message === null) &&
@@ -1032,6 +1077,9 @@ export default class HomeKitDevice extends EventEmitter {
                 }
                 failed = true;
                 this?.log?.warn?.('Error in %s(): %s', label, String(error?.stack || error));
+              } finally {
+                // Finish work owned by this hook before the next hook, commit or cleanup.
+                await HomeKitDevice.#lifecycleContext.getStore()?.tail;
               }
             }
 
@@ -1091,6 +1139,13 @@ export default class HomeKitDevice extends EventEmitter {
 
       // Handle built-in types with special behavior
       if (type === HomeKitDevice.ADD || type === HomeKitDevice.REMOVE || type === HomeKitDevice.SET) {
+        if (context.stateOwner?.active === true && context.stateOwner !== context) {
+          throw new Error('Reentrant lifecycle message "' + type + '" on the same device');
+        }
+        context.stateOwner = context;
+        if (type === HomeKitDevice.REMOVE) {
+          this.#lifecycleState = type;
+        }
         // Call the dynamic on<Type> method (ie. onAdd, onRemove, onSet) and after
         // Any static handler registered via HomeKitDevice.message(uuid, type, handler)
         await callLifecycleHook(methodName, message, ...args);
@@ -1206,6 +1261,11 @@ export default class HomeKitDevice extends EventEmitter {
           }
         }
       } else if (type === HomeKitDevice.SHUTDOWN) {
+        if (context.stateOwner?.active === true && context.stateOwner !== context) {
+          throw new Error('Reentrant lifecycle message "' + type + '" on the same device');
+        }
+        context.stateOwner = context;
+        this.#lifecycleState = type;
         if (HomeKitDevice.#deviceRegistry.has(this.#uuid) === true) {
           // Deregister first so we don't get shutdown twice via global broadcaster
           HomeKitDevice.#deviceRegistry.delete(this.#uuid);
@@ -1223,6 +1283,10 @@ export default class HomeKitDevice extends EventEmitter {
         }
         handled = true;
       } else if (type === HomeKitDevice.UPDATE) {
+        if (context.stateOwner?.active === true && context.stateOwner !== context) {
+          throw new Error('Reentrant lifecycle message "' + type + '" on the same device');
+        }
+        context.stateOwner = context;
         if (message !== null && typeof message === 'object' && message.constructor === Object) {
           let { merged, changed } = this.#mergeDeviceData(message);
 
