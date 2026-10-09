@@ -1,3 +1,4 @@
+// Configure JavaScript syntax, correctness, and formatting checks for this project.
 import stylistic from '@stylistic/eslint-plugin';
 import parserTs from '@typescript-eslint/parser';
 

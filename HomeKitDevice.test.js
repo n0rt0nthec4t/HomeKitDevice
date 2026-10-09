@@ -1,3 +1,5 @@
+// Verify protocol lifecycle, persistence, message routing, and timer behaviour
+// using isolated HAP and Matter mocks without starting protocol servers.
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { setImmediate } from 'node:timers/promises';
@@ -89,7 +91,7 @@ const hap = {
   Service: MockService,
   uuid: {
     generate(value) {
-      return `uuid:${value}`;
+      return 'uuid:' + value;
     },
   },
 };
@@ -97,7 +99,7 @@ const hap = {
 const deviceData = (serialNumber) => ({
   serialNumber,
   softwareVersion: '1.0.0',
-  description: `Device ${serialNumber}`,
+  description: 'Device ' + serialNumber,
   manufacturer: 'Example',
   model: 'Switch',
 });
@@ -722,6 +724,65 @@ test('Homebridge add without arguments preserves the default HAP representation 
   assert.equal(calls.unregistered.length, 1);
 });
 
+for (let asynchronous of [false, true]) {
+  test('HAP cache retries once within a message after a ' + (asynchronous === true ? 'rejected' : 'thrown') + ' write', async (context) => {
+    let attempts = 0;
+    let failuresRemaining = 0;
+    let stored;
+    let warnings = [];
+    let api = {
+      version: 2.7,
+      hap,
+      platformAccessory: MockAccessory,
+      registerPlatformAccessories(plugin, platform, accessories) {
+        assert.equal(plugin, HomeKitDevice.PLUGIN_NAME);
+        accessories[0]._associatedPlatform = platform;
+      },
+      updatePlatformAccessories(accessories) {
+        attempts += 1;
+        if (failuresRemaining > 0) {
+          failuresRemaining -= 1;
+          let error = new Error('HAP cache unavailable');
+          if (asynchronous === true) {
+            return Promise.reject(error);
+          }
+          throw error;
+        }
+        stored = structuredClone(accessories[0].context.HomeKitDevice);
+      },
+    };
+    let device = new HomeKitDevice(undefined, api, { ...deviceData('HAP-RETRY-' + asynchronous), setting: 1 }, ['setting']);
+    context.after(() => device.remove());
+    assert.equal(await device.add(), true);
+    device.log = { warn: (...args) => warnings.push(args) };
+    attempts = 0;
+    failuresRemaining = 1;
+
+    assert.equal(await device.message(HomeKitDevice.UPDATE, { setting: 2 }), undefined);
+    assert.equal(attempts, 2);
+    assert.equal(device.deviceData.setting, 2);
+    assert.deepEqual(stored, { setting: 2 });
+    assert.equal(warnings.length, 1);
+
+    // An unchanged message needs no cache write after successful persistence.
+    await device.update({ setting: 2 });
+    assert.equal(attempts, 2);
+
+    // Persistent failures stop after two attempts and surface at the boundary.
+    failuresRemaining = 2;
+    assert.equal(await device.message(HomeKitDevice.UPDATE, { setting: 3 }), false);
+    assert.equal(attempts, 4);
+    assert.equal(warnings.length, 3);
+    assert.match(warnings[2][3], /HAP cache unavailable/);
+    assert.deepEqual(stored, { setting: 2 });
+
+    // A later change still persists the current state without remembered retries.
+    await device.update({ setting: 4 });
+    assert.equal(attempts, 5);
+    assert.deepEqual(stored, { setting: 4 });
+  });
+}
+
 test('Homebridge publishes external HAP only after onAdd completes', async () => {
   let calls = { registered: 0, unregistered: 0, updated: 0, published: 0, onAdd: 0 };
   let api = {
@@ -1226,6 +1287,48 @@ test('hook result ordering and registered object precedence remain unchanged', a
   await HomeKitDevice.message(device.uuid, HomeKitDevice.GET, () => ({ level: 'registered', extra: true }));
   assert.deepEqual(await device.get({}), { level: 'registered', extra: true });
 });
+
+test('named hooks and registered handlers preserve scalar results', async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('SCALAR-RESULTS'));
+  context.after(() => device.remove());
+
+  for (let value of [42, false, 'ready', undefined]) {
+    device.onGet = () => value;
+    assert.equal(await device.get({}), value);
+    device.onProbe = () => value;
+    assert.equal(await device.message('HomeKitDevice.onProbe'), value);
+  }
+
+  delete device.onGet;
+  await HomeKitDevice.message(device.uuid, HomeKitDevice.GET, () => 42);
+  assert.equal(await device.get({}), 42);
+});
+
+for (let asynchronous of [false, true]) {
+  test('timer logs a ' + (asynchronous === true ? 'rejected' : 'thrown') + ' callback error', { timeout: 1000 }, async (context) => {
+    let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('TIMER-LOG-' + asynchronous));
+    context.after(() => device.shutdown());
+    let warnings = [];
+    let notify;
+    let fired = new Promise((resolve) => {
+      notify = resolve;
+    });
+    device.log = { warn: (...args) => warnings.push(args) };
+    device.addTimer('failed-poll', { delay: 10 }, () => {
+      notify();
+      let error = new Error('Polling failed');
+      if (asynchronous === true) {
+        return Promise.reject(error);
+      }
+      throw error;
+    });
+
+    await fired;
+    await setImmediate();
+    assert.deepEqual(warnings, [['Timer callback failed for "%s"', device.deviceData.description]]);
+    assert.equal(device.hasTimer('failed-poll'), false);
+  });
+}
 
 test('one-shot timers clean up after a synchronous callback failure', { timeout: 1000 }, async (context) => {
   let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('TIMER-THROW-ONCE'));

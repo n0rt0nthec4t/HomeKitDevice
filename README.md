@@ -54,7 +54,7 @@ import HomeKitDevice from './HomeKitDevice.js';
 
 export default class MyDevice extends HomeKitDevice {
   static TYPE = 'MyDevice';
-  static VERSION = '2025.06.18';
+  static VERSION = '2025.10.09';
 
   async onAdd() {
     this.myService = this.addService(this.hap.Service.Switch);
@@ -489,5 +489,5 @@ Public static configuration and message constants include:
 Each subclass may define a static `VERSION` string for visibility in logs:
 
 ```js
-static VERSION = '2026.05.05';
+static VERSION = '2026.10.09';
 ```

@@ -219,7 +219,7 @@ export default class HomeKitDevice extends EventEmitter {
   static EVEHOME = undefined; // HomeKitHistory object
   static LOGGER = undefined; // Logging object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.10.05'; // Code version
+  static VERSION = '2026.10.09'; // Code version
 
   // Persistent context namespace for this class. Subclasses may override to isolate their own context.
   static PERSISTENCE_NAMESPACE = 'HomeKitDevice';
@@ -909,9 +909,9 @@ export default class HomeKitDevice extends EventEmitter {
           }
         }
 
-        // Preserve the historical scalar result for one handler; multiple hooks
-        // return an ordered array matching their invocation order.
-        return results.length === 1 ? results[0] : results;
+        // An empty hook list contributes no result, preserving scalar responses
+        // from the other source. Multiple hooks retain their ordered result array.
+        return results.length === 0 ? undefined : results.length === 1 ? results[0] : results;
       };
 
       // Snapshot the bridged HAP structure, metadata, and owned context that Homebridge persists
@@ -948,8 +948,8 @@ export default class HomeKitDevice extends EventEmitter {
         };
       };
 
-      // Snapshot the cached, bridged HAP accessory before invoking message handlers.
-      // External HAP and Matter accessories do not use this Homebridge cache update path.
+      // Snapshot this message's bridged HAP changes locally. External HAP and
+      // Matter accessories use separate persistence paths.
       let originalAccessory =
         this.backend === HomeKitDevice.HOMEBRIDGE &&
         this.accessory !== undefined &&
@@ -1199,11 +1199,16 @@ export default class HomeKitDevice extends EventEmitter {
         this.accessory?._associatedPlatform !== undefined &&
         typeof this.#platform?.updatePlatformAccessories === 'function'
       ) {
-        // Check whether the bridged HAP structure or metadata changed.
         let updatedAccessory = snapshotAccessoryCache(this.accessory);
         if (JSON.stringify(originalAccessory) !== JSON.stringify(updatedAccessory)) {
-          // Persist the changed HAP accessory in Homebridge's platform cache.
-          this.#platform.updatePlatformAccessories([this.accessory]);
+          try {
+            await this.#platform.updatePlatformAccessories([this.accessory]);
+          } catch (error) {
+            // Retry once within this dispatch without retaining class state.
+            // A second failure reaches the message boundary and is reported.
+            this?.log?.warn?.('Retrying HAP cache update for "%s": %s', this.deviceData.description, String(error?.stack || error));
+            await this.#platform.updatePlatformAccessories([this.accessory]);
+          }
         }
       }
 
@@ -1313,7 +1318,9 @@ export default class HomeKitDevice extends EventEmitter {
               }),
         )
         .catch(() => {
-          // Empty
+          // Surface direct callback failures while retaining timer cleanup and
+          // allowing repeating timers to attempt their next scheduled invocation.
+          this?.log?.warn?.('Timer callback failed for "%s"', this.deviceData.description);
         })
         .finally(() => {
           if (entry.cancelled === true) {

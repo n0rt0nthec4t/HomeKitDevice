@@ -2,6 +2,19 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2026.10.09
+
+### Fixed
+
+- Preserved scalar results from named message hooks and registered handlers when the other source has no hooks
+- Retried a failed bridged HAP cache write once within message dispatch, including thrown errors and rejected promises, and reported errors when both attempts failed
+- Logged direct timer callback failures while preserving one-shot cleanup and repeating timer recovery
+- Added regression coverage for scalar responses, HAP cache retries, and timer error logging
+
+### Changed
+
+- Added module purpose comments to the tests and ESLint configuration and replaced test template literals with string concatenation
+
 ## 2026/10/05
 
 ### Fixed
