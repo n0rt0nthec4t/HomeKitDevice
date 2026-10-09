@@ -1097,6 +1097,500 @@ test('initial UPDATE rejection stops external publication and forwards its origi
 });
 
 // Lifecycle hooks must walk every override, retaining the device as the receiver.
+test('overlapping UPDATE routes preserve committed fields and run hooks in submission order', { timeout: 1000 }, async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, { ...deviceData('OVERLAP'), a: 0, b: 0 });
+  context.after(() => device.remove());
+  let entered = Promise.withResolvers();
+  let release = Promise.withResolvers();
+  let snapshots = [];
+  device.onUpdate = async (data) => {
+    snapshots.push({ a: data.a, b: data.b });
+    if (snapshots.length === 1) {
+      entered.resolve();
+      await release.promise;
+    }
+  };
+
+  let first = device.update({ a: 1 });
+  await entered.promise;
+  let second = HomeKitDevice.message(device.uuid, HomeKitDevice.UPDATE, { b: 1 });
+  await setImmediate();
+  assert.deepEqual(snapshots, [{ a: 1, b: 0 }]);
+  release.resolve();
+  await Promise.all([first, second]);
+  assert.deepEqual(snapshots, [{ a: 1, b: 0 }, { a: 1, b: 1 }]);
+  assert.equal(device.deviceData.a, 1);
+  assert.equal(device.deviceData.b, 1);
+});
+
+test('lifecycle ordering includes HAP cache writes while other devices continue', { timeout: 1000 }, async (context) => {
+  let entered = Promise.withResolvers();
+  let release = Promise.withResolvers();
+  let holdCache = false;
+  let stored;
+  let api = {
+    version: 2.7,
+    hap,
+    platformAccessory: MockAccessory,
+    registerPlatformAccessories(plugin, platform, accessories) {
+      accessories[0]._associatedPlatform = platform;
+    },
+    async updatePlatformAccessories(accessories) {
+      if (holdCache === true) {
+        holdCache = false;
+        entered.resolve();
+        await release.promise;
+      }
+      stored = structuredClone(accessories[0].context.HomeKitDevice);
+    },
+  };
+  let device = new HomeKitDevice(undefined, api, { ...deviceData('CACHE-ORDER'), a: 0, b: 0 }, ['a', 'b']);
+  let other = new HomeKitDevice(undefined, { version: 2.7, hap }, { ...deviceData('INDEPENDENT-ORDER'), a: 0 });
+  context.after(() => device.remove());
+  context.after(() => other.remove());
+  assert.equal(await device.add(), true);
+  let snapshots = [];
+  device.onUpdate = (data) => snapshots.push({ a: data.a, b: data.b });
+  holdCache = true;
+
+  let first = device.update({ a: 1 });
+  await entered.promise;
+  assert.equal(device.deviceData.a, 1);
+  let second = device.update({ b: 1 });
+  await other.update({ a: 2 });
+  assert.equal(other.deviceData.a, 2);
+  assert.deepEqual(snapshots, [{ a: 1, b: 0 }]);
+  assert.deepEqual(device.accessory.context.HomeKitDevice, { a: 1, b: 0 });
+  release.resolve();
+  await Promise.all([first, second]);
+  assert.deepEqual(stored, { a: 1, b: 1 });
+  assert.deepEqual(snapshots, [{ a: 1, b: 0 }, { a: 1, b: 1 }]);
+});
+
+test('UPDATE waits for preceding SET and merges its committed state', { timeout: 1000 }, async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, { ...deviceData('SET-OVERLAP'), a: 0, b: 0 });
+  let entered = Promise.withResolvers();
+  let release = Promise.withResolvers();
+  context.after(async () => {
+    release.resolve();
+    await device.remove();
+  });
+  device.onSet = async () => {
+    entered.resolve();
+    await release.promise;
+  };
+  let snapshots = [];
+  device.onUpdate = (data) => snapshots.push({ a: data.a, b: data.b });
+  let first = device.set({ a: 1 });
+  await entered.promise;
+  let second = device.update({ b: 1 });
+  await setImmediate();
+  assert.deepEqual(snapshots, []);
+  release.resolve();
+  await Promise.all([first, second]);
+  assert.deepEqual(snapshots, [{ a: 1, b: 1 }]);
+});
+
+for (let type of [HomeKitDevice.GET, HomeKitDevice.TIMER, 'custom']) {
+  test(type + ' waits for earlier messages on the same device', { timeout: 1000 }, async (context) => {
+    let device = new HomeKitDevice(undefined, { version: 2.7, hap }, { ...deviceData('QUEUE-' + type), a: 0 });
+    let entered = Promise.withResolvers();
+    let release = Promise.withResolvers();
+    context.after(async () => {
+      release.resolve();
+      await device.remove();
+    });
+    let calls = [];
+    device.onUpdate = async () => {
+      entered.resolve();
+      await release.promise;
+      calls.push('update');
+    };
+    let handler = () => {
+      assert.equal(device.deviceData.a, 1);
+      calls.push(type);
+      return 42;
+    };
+    device.onGet = handler;
+    device.onTimer = handler;
+    device.onMessage = handler;
+    let updating = device.update({ a: 1 });
+    await entered.promise;
+    let queued = device.message(type, {});
+    await setImmediate();
+    assert.deepEqual(calls, []);
+    release.resolve();
+    assert.equal(await queued, 42);
+    await updating;
+    assert.deepEqual(calls, ['update', type]);
+  });
+}
+
+test('overlapping runtime shutdown events broadcast once and invoke each device hook once', { timeout: 1000 }, async (context) => {
+  let broadcasts = 0;
+  let originalShutdown = HomeKitDevice.shutdown;
+  HomeKitDevice.shutdown = async () => {
+    broadcasts += 1;
+    await originalShutdown();
+  };
+  context.after(() => {
+    HomeKitDevice.shutdown = originalShutdown;
+  });
+  let shutdown;
+  let registrations = 0;
+  let api = {
+    version: 2.7,
+    hap,
+    on(event, callback) {
+      assert.equal(event, 'shutdown');
+      registrations += 1;
+      shutdown = callback;
+    },
+  };
+  let first = new HomeKitDevice(undefined, api, deviceData('RUNTIME-SHUTDOWN-FIRST'));
+  let second = new HomeKitDevice(undefined, api, deviceData('RUNTIME-SHUTDOWN-SECOND'));
+  let entered = Promise.withResolvers();
+  let release = Promise.withResolvers();
+  context.after(async () => {
+    release.resolve();
+    await Promise.all([first.remove(), second.remove()]);
+  });
+  let calls = [0, 0];
+  first.onShutdown = async () => {
+    calls[0] += 1;
+    entered.resolve();
+    await release.promise;
+  };
+  second.onShutdown = () => {
+    calls[1] += 1;
+  };
+  assert.equal(registrations, 1);
+  let initial = shutdown();
+  await entered.promise;
+  let overlapping = shutdown();
+  release.resolve();
+  await Promise.all([initial, overlapping]);
+  await shutdown();
+  await Promise.all([first.shutdown(), second.shutdown()]);
+  assert.equal(broadcasts, 1);
+  assert.deepEqual(calls, [1, 1]);
+});
+
+for (let method of ['remove', 'shutdown']) {
+  test(method + ' follows pending UPDATE and prevents later state changes', { timeout: 1000 }, async (context) => {
+    let device = new HomeKitDevice(undefined, { version: 2.7, hap }, { ...deviceData('ORDER-' + method), a: 0, b: 0 });
+    context.after(() => device.remove());
+    let entered = Promise.withResolvers();
+    let release = Promise.withResolvers();
+    let calls = [];
+    device.addTimer('poll', { interval: 10000 }, () => {});
+    device.onUpdate = async () => {
+      calls.push('update');
+      entered.resolve();
+      await release.promise;
+    };
+    device[method === 'remove' ? 'onRemove' : 'onShutdown'] = () => {
+      calls.push(method);
+      assert.equal(device.deviceData.a, 1);
+    };
+    device.onSet = () => calls.push('set');
+
+    let first = device.update({ a: 1 });
+    await entered.promise;
+    let teardown = device[method]();
+    let lateUpdate = device.message(HomeKitDevice.UPDATE, { b: 1 });
+    let lateSet = device.set({ b: 2 });
+    await setImmediate();
+    assert.deepEqual(calls, ['update']);
+    release.resolve();
+    await Promise.all([first, teardown, lateUpdate, lateSet]);
+    assert.deepEqual(calls, ['update', method]);
+    assert.equal(device.hasTimer('poll'), false);
+    if (method === 'remove') {
+      assert.deepEqual(device.deviceData, {});
+      assert.equal(device.uuid, undefined);
+    } else {
+      assert.equal(device.deviceData.a, 1);
+      assert.equal(device.deviceData.b, 0);
+    }
+    await device[method]();
+    assert.deepEqual(calls, ['update', method]);
+  });
+}
+
+test('a failed UPDATE rejects its caller without blocking queued updates', { timeout: 1000 }, async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, { ...deviceData('FAILED-OVERLAP'), a: 0, b: 0 });
+  context.after(() => device.remove());
+  let entered = Promise.withResolvers();
+  let release = Promise.withResolvers();
+  let failure = new Error('Update hook failed');
+  device.onUpdate = async (data) => {
+    if (data.b === 0) {
+      entered.resolve();
+      await release.promise;
+      throw failure;
+    }
+  };
+  let first = assert.rejects(device.update({ a: 1 }), (error) => error === failure);
+  await entered.promise;
+  let second = device.update({ b: 1 });
+  release.resolve();
+  await Promise.all([first, second]);
+  // UPDATE retains its existing commit-after-hook-failure behaviour.
+  assert.equal(device.deviceData.a, 1);
+  assert.equal(device.deviceData.b, 1);
+});
+
+for (let type of [HomeKitDevice.UPDATE, HomeKitDevice.SET, HomeKitDevice.GET, HomeKitDevice.TIMER,
+  HomeKitDevice.REMOVE, HomeKitDevice.SHUTDOWN, 'custom']) {
+  test('reentrant ' + type + ' rejects without deadlocking or changing nested state', { timeout: 1000 }, async (context) => {
+    let device = new HomeKitDevice(undefined, { version: 2.7, hap }, { ...deviceData('REENTRANT-' + type), a: 0, b: 0 });
+    context.after(() => device.remove());
+    let nestedFailure;
+    device.onUpdate = async () => {
+      await setImmediate();
+      try {
+        await HomeKitDevice.message(device.uuid, type, { b: 1 });
+      } catch (error) {
+        nestedFailure = error;
+        throw error;
+      }
+    };
+    await assert.rejects(device.update({ a: 1 }), /Reentrant lifecycle message/);
+    assert.match(nestedFailure.message, /Reentrant lifecycle message/);
+    assert.equal(device.deviceData.a, 1);
+    assert.equal(device.deviceData.b, 0);
+    delete device.onUpdate;
+    await device.update({ b: 2 });
+    assert.equal(device.deviceData.b, 2);
+  });
+}
+
+test('hooks can update another device but a lifecycle cycle rejects', { timeout: 1000 }, async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, { ...deviceData('CYCLE-FIRST'), a: 0, b: 0 });
+  let other = new HomeKitDevice(undefined, { version: 2.7, hap }, { ...deviceData('CYCLE-SECOND'), a: 0 });
+  context.after(() => device.remove());
+  context.after(() => other.remove());
+  device.onUpdate = () => other.update({ a: 1 });
+  await device.update({ a: 1 });
+  assert.equal(other.deviceData.a, 1);
+
+  other.onUpdate = () => device.update({ b: 1 });
+  device.onUpdate = () => other.update({ a: 2 });
+  await assert.rejects(device.update({ a: 2 }), /Reentrant lifecycle message/);
+  assert.equal(device.deviceData.a, 2);
+  assert.equal(device.deviceData.b, 0);
+  assert.equal(other.deviceData.a, 2);
+});
+
+test('setup initial UPDATE finishes before a queued external UPDATE', { timeout: 1000 }, async (context) => {
+  let entered = Promise.withResolvers();
+  let release = Promise.withResolvers();
+  let api = {
+    version: 2.7,
+    hap,
+    platformAccessory: MockAccessory,
+    registerPlatformAccessories(plugin, platform, accessories) {
+      accessories[0]._associatedPlatform = platform;
+    },
+    updatePlatformAccessories() {},
+  };
+  let device = new HomeKitDevice(undefined, api, { ...deviceData('SETUP-ORDER'), a: 0 });
+  context.after(() => device.remove());
+  let snapshots = [];
+  device.onAdd = async () => {
+    entered.resolve();
+    await release.promise;
+  };
+  device.onUpdate = (data) => snapshots.push(data.a);
+  let adding = device.add();
+  await entered.promise;
+  let updating = device.update({ a: 1 });
+  await setImmediate();
+  assert.deepEqual(snapshots, []);
+  release.resolve();
+  assert.deepEqual(await Promise.all([adding, updating]), [true, undefined]);
+  assert.deepEqual(snapshots, [0, 1]);
+  assert.equal(device.deviceData.a, 1);
+});
+
+for (let method of ['remove', 'shutdown']) {
+  test(method + ' waits for pending Matter registration and setup publication', { timeout: 1000 }, async (context) => {
+    let entered = Promise.withResolvers();
+    let release = Promise.withResolvers();
+    let registered = new Set();
+    let calls = [];
+    let api = {
+      version: 2.7,
+      hap,
+      platformAccessory: MockAccessory,
+      publishExternalAccessories() {
+        calls.push('publish');
+      },
+      unregisterPlatformAccessories() {},
+      isMatterEnabled() {
+        return true;
+      },
+      matter: {
+        async registerPlatformAccessories(plugin, platform, accessories) {
+          calls.push('register:start');
+          entered.resolve();
+          await release.promise;
+          registered.add(accessories[0].UUID);
+          calls.push('register:end');
+        },
+        unregisterPlatformAccessories(plugin, platform, accessories) {
+          registered.delete(accessories[0].UUID);
+          calls.push('unregister');
+        },
+      },
+    };
+    let device = new HomeKitDevice(undefined, api, deviceData('SETUP-' + method));
+    let uuid = device.uuid;
+    context.after(() => device.remove());
+    device[method === 'remove' ? 'onRemove' : 'onShutdown'] = () => calls.push(method);
+    let adding = device.add({ externalPublish: true, matterDeviceType: { name: 'Switch' } });
+    await entered.promise;
+    let tearingDown = device[method]();
+    await setImmediate();
+    assert.deepEqual(calls, ['register:start']);
+    release.resolve();
+    assert.deepEqual(await Promise.all([adding, tearingDown]), [true, undefined]);
+    assert.deepEqual(calls.slice(0, 4), ['register:start', 'register:end', 'publish', method]);
+    if (method === 'remove') {
+      assert.equal(registered.has(uuid), false);
+      assert.equal(device.uuid, undefined);
+      assert.deepEqual(device.deviceData, {});
+    } else {
+      assert.equal(registered.has(uuid), true);
+      await device.remove();
+      assert.equal(registered.has(uuid), false);
+    }
+  });
+}
+
+test('REMOVE waits for standalone HAP publication before unpublishing', { timeout: 1000 }, async (context) => {
+  let entered = Promise.withResolvers();
+  let release = Promise.withResolvers();
+  let calls = [];
+  class SlowAccessory extends MockAccessory {
+    async publish() {
+      calls.push('publish:start');
+      entered.resolve();
+      await release.promise;
+      await super.publish();
+      calls.push('publish:end');
+    }
+
+    async unpublish() {
+      calls.push('unpublish');
+      await super.unpublish();
+    }
+  }
+  let api = { ...hap, Accessory: SlowAccessory, HAPLibraryVersion: () => 'test' };
+  let device = new HomeKitDevice(undefined, api, {
+    ...deviceData('SETUP-PUBLISH'), hkUsername: 'AA:BB:CC:DD:EE:FF', hkPairingCode: '123-45-678',
+  });
+  context.after(() => device.remove());
+  let adding = device.add({ hapAccessoryName: 'Publish', hapCategory: hap.Categories.SWITCH });
+  await entered.promise;
+  let accessory = device.accessory;
+  let removing = device.remove();
+  await setImmediate();
+  assert.deepEqual(calls, ['publish:start']);
+  release.resolve();
+  assert.deepEqual(await Promise.all([adding, removing]), [true, undefined]);
+  assert.deepEqual(calls, ['publish:start', 'publish:end', 'unpublish']);
+  assert.equal(accessory.unpublished, true);
+  assert.equal(device.accessory, undefined);
+});
+
+test('reentrant add rejects before creating or registering protocol resources', { timeout: 1000 }, async (context) => {
+  let registrations = 0;
+  let api = {
+    version: 2.7,
+    hap,
+    platformAccessory: MockAccessory,
+    registerPlatformAccessories() {
+      registrations += 1;
+    },
+  };
+  let device = new HomeKitDevice(undefined, api, { ...deviceData('REENTRANT-SETUP'), a: 0 });
+  context.after(() => device.remove());
+  device.onUpdate = () => device.add();
+  await assert.rejects(device.update({ a: 1 }), /Reentrant lifecycle message/);
+  assert.equal(registrations, 0);
+  assert.equal(device.accessory, undefined);
+});
+
+test('a hook-created timer callback queues its independent UPDATE',
+  { timeout: 1000 }, async (context) => {
+    let device = new HomeKitDevice(undefined, { version: 2.7, hap }, { ...deviceData('TIMER-CONTEXT'), a: 0, b: 0 });
+    context.after(() => device.remove());
+    let submitted = Promise.withResolvers();
+    let release = Promise.withResolvers();
+    let timerUpdate;
+    let fire = () => {
+      timerUpdate = device.update({ b: 1 });
+      submitted.resolve();
+      return timerUpdate;
+    };
+    device.onUpdate = async (data) => {
+      if (data.b === 0) {
+        device.addTimer('independent', { delay: 1 }, fire);
+        await release.promise;
+      }
+    };
+    let updating = device.update({ a: 1 });
+    await submitted.promise;
+    // The timer submits during the suspended hook; its UPDATE waits its turn.
+    assert.equal(device.deviceData.a, 0);
+    assert.equal(device.deviceData.b, 0);
+    release.resolve();
+    await Promise.all([updating, timerUpdate]);
+    assert.equal(device.deviceData.a, 1);
+    assert.equal(device.deviceData.b, 1);
+  });for (let size of [2, 3]) {
+  test(size + ' independent device dispatches reject a wait cycle and recover their queues', { timeout: 1000 }, async (context) => {
+    let devices = Array.from({ length: size }, (_, index) => new HomeKitDevice(
+      undefined, { version: 2.7, hap }, { ...deviceData('WAIT-' + size + '-' + index), a: 0 },
+    ));
+    let entered = devices.map(() => Promise.withResolvers());
+    for (let [index, device] of devices.entries()) {
+      context.after(() => device.remove());
+      device.onUpdate = async (data) => {
+        if (data.a === 1) {
+          entered[index].resolve();
+          await Promise.all(entered.map((gate) => gate.promise));
+          await devices[(index + 1) % size].update({ a: 2 });
+        }
+      };
+    }
+    let results = await Promise.allSettled(devices.map((device) => device.update({ a: 1 })));
+    assert.equal(results.filter((result) => result.status === 'rejected').length, 1);
+    assert.match(results.find((result) => result.status === 'rejected').reason.message, /cross-device wait cycle/);
+    await Promise.all(devices.map((device) => device.update({ a: 3 })));
+    assert.deepEqual(devices.map((device) => device.deviceData.a), devices.map(() => 3));
+  });
+}
+
+test('async work created by a completed hook can submit a later UPDATE', { timeout: 1000 }, async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, { ...deviceData('INHERITED-CONTEXT'), a: 0, b: 0 });
+  context.after(() => device.remove());
+  let release = Promise.withResolvers();
+  let later;
+  device.onUpdate = (data) => {
+    if (data.b === 0) {
+      later = release.promise.then(() => device.update({ b: 1 }));
+    }
+  };
+  await device.update({ a: 1 });
+  release.resolve();
+  await later;
+  assert.equal(device.deviceData.a, 1);
+  assert.equal(device.deviceData.b, 1);
+});
+
 for (let method of ['onAdd', 'onUpdate', 'onRemove', 'onShutdown', 'onSet', 'onGet', 'onHistory', 'onTimer', 'onProbe']) {
   test(method + ' invokes instance and prototype hooks sequentially before registered handlers', async (context) => {
     let calls = [];

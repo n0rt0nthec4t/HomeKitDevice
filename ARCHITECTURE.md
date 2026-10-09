@@ -4,7 +4,7 @@
 
 `HomeKitDevice` is a shared base class for accessory implementations. It sits between application-owned device data and either the standalone HAP-NodeJS runtime or the Homebridge runtime, giving each device type a common lifecycle, message bus, accessory helper layer, timer system, and optional EveHome history integration. Homebridge may expose HAP, Matter, or both.
 
-**Version:** 2026.10.05
+**Version:** 2026.10.10
 **Primary module:** `HomeKitDevice.js`  
 **Consumers:** subclasses and host applications
 
@@ -250,6 +250,12 @@ HomeKitDevice.shutdown()
 ## Messaging Model
 
 `HomeKitDevice` uses one message path for lifecycle, external handlers, timers, and custom events.
+
+Each instance orders every externally submitted message through a promise tail. The complete add() operation owns one slot through descriptor creation, registration, initial UPDATE, and publication, using internal dispatch directly within that slot. Its initial UPDATE merges an empty payload with current state rather than submitting a full snapshot. The ordering boundary includes metadata persistence, hooks, state commits, and bridged HAP cache writes. UPDATE therefore builds its merged snapshot only after preceding lifecycle work completes. Caller rejections are preserved while the tail recovers so later submissions can proceed.
+
+REMOVE and SHUTDOWN stop subsequent dispatch; REMOVE remains available after SHUTDOWN for protocol cleanup. A device-scoped async context rejects reentrant submissions during active lifecycle dispatch, preventing an awaited nested call from deadlocking its own queue or overwriting state through nested commits. Ancestor contexts preserve this check when a hook routes through another device. Outstanding cross-device submissions are tracked as potential waits on active contexts; graph traversal rejects a submission that closes a cycle, including independently started dispatches. Counts retain dependencies when several submissions target the same device, and completion releases them.
+
+The context becomes inactive on completion so asynchronous work created by a hook can submit later work. HomeKitDevice timer invocation exits the inherited async context before invoking a callback or TIMER dispatch, making timer updates independent submissions even during a suspended hook. GET, TIMER, HISTORY, and custom types use the same queue. Online/offline notifications dispatch internally within the UPDATE slot. The queue has no command-specific scheduling or state reconciliation. Command handlers must finish before submitting follow-up state messages; awaiting an UPDATE behind the current command is an invalid dependency.
 
 ### Static Message API
 

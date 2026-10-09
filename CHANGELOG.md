@@ -2,6 +2,24 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2026.10.10
+
+### Fixed
+
+- Preserved committed device state across overlapping UPDATE and SET messages by ordering all externally submitted messages per device, including hooks and cache persistence
+- Ordered REMOVE and SHUTDOWN after pending lifecycle work and prevented later state changes from restoring removed or shut-down device state
+- Kept queued lifecycle work running after a preceding dispatch rejects
+- Ordered complete device setup through registration, the initial UPDATE, and publication so teardown cannot overtake pending registration and initial setup cannot overwrite later updates
+- Allowed HomeKitDevice timer updates created by suspended hooks to queue independently instead of rejecting them as reentrant
+- Detected cross-device lifecycle wait cycles between independently active queues and rejected the cycle-closing submission
+- Added regression coverage for overlapping updates, SET commits, setup and teardown ordering, failures, timers, and lifecycle wait cycles
+
+### Changed
+
+- Retained the global shutdown-fired guard for once-only runtime broadcasts, with per-device teardown state preventing repeated device cleanup
+- Used the same queue for GET, TIMER, HISTORY, and custom messages, without SET-specific scheduling or reporting helpers
+- Reentrant messages from an active lifecycle dispatch on the same device now reject explicitly to avoid deadlocks and nested state loss; submit follow-up lifecycle work after the outer dispatch completes
+
 ## 2026.10.09
 
 ### Fixed

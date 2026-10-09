@@ -320,6 +320,10 @@ await HomeKitDevice.message(uuid, HomeKitDevice.SET, value);
 
 Known message types route to their matching lifecycle hook, such as `SET` to `onSet(message)`. Custom types fall back to `onMessage(type, message)`.
 
+All externally submitted messages, including GET, TIMER, HISTORY, and custom types, execute in submission order for each device, including their hooks, state commits, and cache writes. The complete `add()` operation holds one queue slot through registration, its initial UPDATE, and publication. Each UPDATE merges against the state committed by preceding operations. A failed operation rejects its caller without blocking later work. After REMOVE or SHUTDOWN begins, subsequent messages are ignored; REMOVE can still release protocol resources after SHUTDOWN.
+
+A message submitted from within the same device's active dispatch rejects with a reentrancy error. Hooks and registered handlers must not submit nested messages or call `add()` on that device. Submit follow-up messages after the outer operation completes. A SET handler that refreshes device state must return before its UPDATE is submitted. HomeKitDevice timer invocations start independently of inherited hook contexts. Timer callbacks can submit queued messages; `onTimer()` follows the same reentrancy rule as other message hooks. Different devices have independent ordering. Internal setup dispatch and online/offline notifications execute within their enclosing queue slot. Outstanding lifecycle submissions from hooks to other devices are tracked conservatively as potential waits; a submission that closes a cycle rejects instead of deadlocking the queues.
+
 Handlers must throw or reject when their operation fails. The dispatcher logs each handler failure, continues remaining handlers and required lifecycle cleanup, and then rejects with the first handler error. Dispatch processing errors also reject. This applies to instance messages, UUID delivery, and wrappers such as `set()`, `get()`, `update()`, and `remove()`.
 
 Callers must handle rejected promises instead of checking for `false` as a failure signal:

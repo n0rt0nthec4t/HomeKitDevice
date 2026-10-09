@@ -100,6 +100,7 @@
 
 // Define nodejs module requirements
 import EventEmitter from 'node:events';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { setInterval, setTimeout, clearInterval, clearTimeout } from 'node:timers';
 import process from 'node:process';
 
@@ -219,7 +220,7 @@ export default class HomeKitDevice extends EventEmitter {
   static EVEHOME = undefined; // HomeKitHistory object
   static LOGGER = undefined; // Logging object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.10.09'; // Code version
+  static VERSION = '2026.10.10'; // Code version
 
   // Persistent context namespace for this class. Subclasses may override to isolate their own context.
   static PERSISTENCE_NAMESPACE = 'HomeKitDevice';
@@ -232,7 +233,8 @@ export default class HomeKitDevice extends EventEmitter {
   static #listeners = {};
   static #deviceRegistry = new Map();
   static #shutdownRegistered = new WeakSet();
-  static #shutdownFired = false;
+  static #shutdownFired = false; // Runtime shutdown events broadcast once across all emitters
+  static #lifecycleContext = new AsyncLocalStorage(); // Track active device dispatches without retaining per-device storage instances
 
   deviceData = {}; // The devices data we store
   historyService = undefined; // HomeKit history service
@@ -249,6 +251,9 @@ export default class HomeKitDevice extends EventEmitter {
   #persistedFields = []; // deviceData fields restored from accessory context
   #postSetupDetails = []; // Use for extra output details once a device has been setup
   #timers = new Map(); // Internal timers for this device
+  #lifecycleTail = Promise.resolve(); // Settled tail keeps failures from blocking later work
+  #lifecycleState = undefined; // Last teardown message; REMOVE can still release resources after SHUTDOWN
+  #activeLifecycle = undefined; // Active dispatch and its outstanding cross-device submissions
 
   /**
    * Create a HomeKit device instance.
@@ -294,8 +299,9 @@ export default class HomeKitDevice extends EventEmitter {
       this.postSetupDetail('HAP-NodeJS library', LOG_LEVELS.DEBUG);
     }
 
-    // Register shutdown once per runtime emitter. The WeakSet avoids retaining
-    // discarded Homebridge APIs, while the callback prevents overlapping events.
+    // Register once per runtime emitter without retaining discarded APIs.
+    // The global guard prevents repeated broadcasts; lifecycle state separately
+    // prevents repeated teardown of an individual device.
     const shutdown = async () => {
       if (HomeKitDevice.#shutdownFired === false) {
         HomeKitDevice.#shutdownFired = true;
@@ -396,256 +402,264 @@ export default class HomeKitDevice extends EventEmitter {
    *
    * @param {HomeKitDeviceAddOptions} [options={}] Representation and publication options.
    * @returns {Promise<boolean|undefined>} `true` when at least one representation is available,
-   * `false` for a completed setup failure, or `undefined` when validation rejects setup.
-   * @throws {*} When ADD or initial UPDATE dispatch rejects.
+   * `false` for a completed setup failure, or `undefined` when validation rejects setup or the device has been torn down.
+   * @throws {*} When dispatch rejects or submission would create a lifecycle wait cycle.
    */
   async add(options = {}) {
-    if (options === null || typeof options !== 'object' || options.constructor !== Object) {
-      return;
-    }
-
-    if (
-      this.backend === undefined ||
-      typeof HomeKitDevice.PLUGIN_NAME !== 'string' || // Plugin name must be defined
-      HomeKitDevice.PLUGIN_NAME === '' ||
-      typeof HomeKitDevice.PLATFORM_NAME !== 'string' || // Platform name must be defined
-      HomeKitDevice.PLATFORM_NAME === '' ||
-      (options?.enableHistory !== undefined && typeof options?.enableHistory !== 'boolean') || // History flag must be boolean
-      (options?.externalPublish !== undefined && typeof options?.externalPublish !== 'boolean') ||
-      this.#validDeviceData(this.deviceData, true) === false // Device data failed validation (core + pairing if required)
-    ) {
-      return;
-    }
-
-    if (
-      this.backend === HomeKitDevice.HAP_NODEJS &&
-      (typeof options?.hapAccessoryName !== 'string' ||
-        options.hapAccessoryName === '' ||
-        typeof this.hap.Categories[options?.hapCategory] === 'undefined')
-    ) {
-      return;
-    }
-
-    // Copy only declared fields into the library owned context namespace.
-    // Each representation receives its own data so neither shares mutable state.
-    const persistedData = Object.fromEntries(
-      this.#persistedFields
-        .filter((field) => Object.hasOwn(this.deviceData, field))
-        .map((field) => [field, this.deviceData[field]]),
-    );
-
-    // Homebridge needs at least one restored or creatable representation.
-    if (
-      this.backend === HomeKitDevice.HOMEBRIDGE &&
-      this.accessory === undefined &&
-      (this.hap === undefined ||
-        options?.hapAccessoryName === null ||
-        typeof this.#platform?.platformAccessory !== 'function' ||
-        (options?.externalPublish === true
-          ? typeof this.#platform?.publishExternalAccessories !== 'function'
-          : typeof this.#platform?.registerPlatformAccessories !== 'function')) &&
-      this.matterAccessory === undefined &&
-      (this.matter === undefined ||
-        typeof this.matter?.registerPlatformAccessories !== 'function' ||
-        typeof options?.matterDeviceType !== 'object' ||
-        options.matterDeviceType === null)
-    ) {
-      return;
-    }
-
-    if (this.accessory === undefined && this.backend === HomeKitDevice.HAP_NODEJS) {
-      // Standalone HAP-NodeJS publishes its own Accessory instance.
-      this.accessory = new this.hap.Accessory(options.hapAccessoryName, this.#uuid);
-      this.accessory.username = this.deviceData.hkUsername;
-      this.accessory.pincode = this.deviceData.hkPairingCode;
-      this.accessory.category = options.hapCategory;
-    }
-
-    if (
-      this.accessory === undefined &&
-      this.backend === HomeKitDevice.HOMEBRIDGE &&
-      this.hap !== undefined &&
-      options?.hapAccessoryName !== null &&
-      typeof this.#platform?.platformAccessory === 'function' &&
-      (options?.externalPublish === true
-        ? typeof this.#platform?.publishExternalAccessories === 'function'
-        : typeof this.#platform?.registerPlatformAccessories === 'function')
-    ) {
-      // External accessories are configured by onAdd() before publication.
-      // Bridged accessories retain the existing registration before onAdd flow.
-      this.accessory = new this.#platform.platformAccessory(this.deviceData.description, this.#uuid, options?.hapCategory);
-      if (Object.keys(persistedData).length !== 0) {
-        this.accessory.context ??= {};
-        this.accessory.context[this.constructor.PERSISTENCE_NAMESPACE] = structuredClone(persistedData);
+    // Hold one queue slot through descriptor creation, hooks, registration,
+    // the initial update and publication so teardown cannot overtake setup.
+    return this.#queueMessage(HomeKitDevice.ADD, async () => {
+      if (this.#lifecycleState !== undefined) {
+        return;
       }
-      if (options?.externalPublish !== true) {
-        try {
-          this.#platform.registerPlatformAccessories(HomeKitDevice.PLUGIN_NAME, HomeKitDevice.PLATFORM_NAME, [this.accessory]);
-        } catch (error) {
-          this.accessory = undefined;
-          this?.log?.warn?.('Failed to register HAP accessory "%s": %s', this.deviceData.description, String(error?.stack || error));
-        }
+      if (options === null || typeof options !== 'object' || options.constructor !== Object) {
+        return;
       }
-    }
 
-    // AccessoryInformation and EveHome are HAP-only concerns. Matter metadata
-    // lives directly on the MatterAccessory descriptor and has no HAP service.
-    if (this.accessory !== undefined) {
-      let informationService = this.accessory.getService?.(this.hap.Service.AccessoryInformation);
-      if (informationService === undefined) {
-        this?.log?.error?.('AccessoryInformation service not found on accessory for "%s"', this.deviceData.description);
-        this.accessory = undefined;
-        this.historyService = undefined;
-      } else {
-        informationService.updateCharacteristic(this.hap.Characteristic.Manufacturer, this.deviceData.manufacturer);
-        informationService.updateCharacteristic(this.hap.Characteristic.Model, this.deviceData.model);
-        informationService.updateCharacteristic(this.hap.Characteristic.SerialNumber, this.deviceData.serialNumber);
-        informationService.updateCharacteristic(this.hap.Characteristic.FirmwareRevision, this.deviceData.softwareVersion);
-        informationService.updateCharacteristic(this.hap.Characteristic.Name, this.deviceData.description);
-
-        if (typeof HomeKitDevice?.EVEHOME === 'function' && this.historyService === undefined && options?.enableHistory === true) {
-          this.historyService = new HomeKitDevice.EVEHOME(this.accessory, this.hap, this.log, {});
-        }
+      if (
+        this.backend === undefined ||
+        typeof HomeKitDevice.PLUGIN_NAME !== 'string' || // Plugin name must be defined
+        HomeKitDevice.PLUGIN_NAME === '' ||
+        typeof HomeKitDevice.PLATFORM_NAME !== 'string' || // Platform name must be defined
+        HomeKitDevice.PLATFORM_NAME === '' ||
+        (options?.enableHistory !== undefined && typeof options?.enableHistory !== 'boolean') || // History flag must be boolean
+        (options?.externalPublish !== undefined && typeof options?.externalPublish !== 'boolean') ||
+        this.#validDeviceData(this.deviceData, true) === false // Device data failed validation (core + pairing if required)
+      ) {
+        return;
       }
-    }
 
-    if (
-      this.matterAccessory === undefined &&
-      this.backend === HomeKitDevice.HOMEBRIDGE &&
-      this.matter !== undefined &&
-      typeof options?.matterDeviceType === 'object' &&
-      options.matterDeviceType !== null
-    ) {
-      // Create the minimum Matter representation before onAdd(), matching the
-      // HAP lifecycle. The subclass adds clusters, handlers, parts, and state.
-      this.matterAccessory = {
-        UUID: this.#uuid,
-        displayName: this.deviceData.description,
-        deviceType: options.matterDeviceType,
-        manufacturer: this.deviceData.manufacturer,
-        model: this.deviceData.model,
-        serialNumber: this.deviceData.serialNumber,
-        firmwareRevision: this.deviceData.softwareVersion,
-        context:
-          Object.keys(persistedData).length === 0
-            ? {}
-            : { [this.constructor.PERSISTENCE_NAMESPACE]: structuredClone(persistedData) },
-      };
-    }
+      if (
+        this.backend === HomeKitDevice.HAP_NODEJS &&
+        (typeof options?.hapAccessoryName !== 'string' ||
+          options.hapAccessoryName === '' ||
+          typeof this.hap.Categories[options?.hapCategory] === 'undefined')
+      ) {
+        return;
+      }
 
-    // Lifecycle setup requires at least one usable protocol representation.
-    // Do not call onAdd() when creation, restoration, or HAP validation left
-    // the device without either representation.
-    if (this.accessory === undefined && this.matterAccessory === undefined) {
-      this.#postSetupDetails = [];
-      this?.log?.error?.('No accessory is available for setup for "%s"', this.deviceData.description);
-      return false;
-    }
+      // Copy only declared fields into the library owned context namespace.
+      // Each representation receives its own data so neither shares mutable state.
+      const persistedData = Object.fromEntries(
+        this.#persistedFields
+          .filter((field) => Object.hasOwn(this.deviceData, field))
+          .map((field) => [field, this.deviceData[field]]),
+      );
 
-    this.postSetupDetail('Serial number "%s"', this.deviceData.serialNumber, LOG_LEVELS.DEBUG);
-    this.postSetupDetail('Software version "%s"', this.deviceData.softwareVersion, LOG_LEVELS.DEBUG);
-
-    // Preserve setup cleanup while forwarding the original dispatch rejection.
-    try {
-      await this.message(HomeKitDevice.ADD);
-    } catch (error) {
-      // These may be cached accessories supplied by Homebridge. Do not
-      // unregister them as setup rollback; permanent removal belongs to remove().
-      this.#postSetupDetails = [];
-      this?.log?.error?.('Accessory setup failed for "%s"', this.deviceData.description);
-      throw error;
-    }
-
-    // Register Matter only after onAdd() has completed the descriptor with its
-    // clusters, handlers, parts, and initial state.
-    if (typeof this.matterAccessory === 'object' && this.matterAccessory !== null) {
+      // Homebridge needs at least one restored or creatable representation.
       if (
         this.backend === HomeKitDevice.HOMEBRIDGE &&
-        typeof this.matter?.registerPlatformAccessories === 'function' &&
-        this.matterAccessory.UUID === this.#uuid
+        this.accessory === undefined &&
+        (this.hap === undefined ||
+          options?.hapAccessoryName === null ||
+          typeof this.#platform?.platformAccessory !== 'function' ||
+          (options?.externalPublish === true
+            ? typeof this.#platform?.publishExternalAccessories !== 'function'
+            : typeof this.#platform?.registerPlatformAccessories !== 'function')) &&
+        this.matterAccessory === undefined &&
+        (this.matter === undefined ||
+          typeof this.matter?.registerPlatformAccessories !== 'function' ||
+          typeof options?.matterDeviceType !== 'object' ||
+          options.matterDeviceType === null)
+      ) {
+        return;
+      }
+
+      if (this.accessory === undefined && this.backend === HomeKitDevice.HAP_NODEJS) {
+        // Standalone HAP-NodeJS publishes its own Accessory instance.
+        this.accessory = new this.hap.Accessory(options.hapAccessoryName, this.#uuid);
+        this.accessory.username = this.deviceData.hkUsername;
+        this.accessory.pincode = this.deviceData.hkPairingCode;
+        this.accessory.category = options.hapCategory;
+      }
+
+      if (
+        this.accessory === undefined &&
+        this.backend === HomeKitDevice.HOMEBRIDGE &&
+        this.hap !== undefined &&
+        options?.hapAccessoryName !== null &&
+        typeof this.#platform?.platformAccessory === 'function' &&
+        (options?.externalPublish === true
+          ? typeof this.#platform?.publishExternalAccessories === 'function'
+          : typeof this.#platform?.registerPlatformAccessories === 'function')
+      ) {
+        // External accessories are configured by onAdd() before publication.
+        // Bridged accessories retain the existing registration before onAdd flow.
+        this.accessory = new this.#platform.platformAccessory(this.deviceData.description, this.#uuid, options?.hapCategory);
+        if (Object.keys(persistedData).length !== 0) {
+          this.accessory.context ??= {};
+          this.accessory.context[this.constructor.PERSISTENCE_NAMESPACE] = structuredClone(persistedData);
+        }
+        if (options?.externalPublish !== true) {
+          try {
+            this.#platform.registerPlatformAccessories(HomeKitDevice.PLUGIN_NAME, HomeKitDevice.PLATFORM_NAME, [this.accessory]);
+          } catch (error) {
+            this.accessory = undefined;
+            this?.log?.warn?.('Failed to register HAP accessory "%s": %s', this.deviceData.description, String(error?.stack || error));
+          }
+        }
+      }
+
+      // AccessoryInformation and EveHome are HAP-only concerns. Matter metadata
+      // lives directly on the MatterAccessory descriptor and has no HAP service.
+      if (this.accessory !== undefined) {
+        let informationService = this.accessory.getService?.(this.hap.Service.AccessoryInformation);
+        if (informationService === undefined) {
+          this?.log?.error?.('AccessoryInformation service not found on accessory for "%s"', this.deviceData.description);
+          this.accessory = undefined;
+          this.historyService = undefined;
+        } else {
+          informationService.updateCharacteristic(this.hap.Characteristic.Manufacturer, this.deviceData.manufacturer);
+          informationService.updateCharacteristic(this.hap.Characteristic.Model, this.deviceData.model);
+          informationService.updateCharacteristic(this.hap.Characteristic.SerialNumber, this.deviceData.serialNumber);
+          informationService.updateCharacteristic(this.hap.Characteristic.FirmwareRevision, this.deviceData.softwareVersion);
+          informationService.updateCharacteristic(this.hap.Characteristic.Name, this.deviceData.description);
+
+          if (typeof HomeKitDevice?.EVEHOME === 'function' && this.historyService === undefined && options?.enableHistory === true) {
+            this.historyService = new HomeKitDevice.EVEHOME(this.accessory, this.hap, this.log, {});
+          }
+        }
+      }
+
+      if (
+        this.matterAccessory === undefined &&
+        this.backend === HomeKitDevice.HOMEBRIDGE &&
+        this.matter !== undefined &&
+        typeof options?.matterDeviceType === 'object' &&
+        options.matterDeviceType !== null
+      ) {
+        // Create the minimum Matter representation before onAdd(), matching the
+        // HAP lifecycle. The subclass adds clusters, handlers, parts, and state.
+        this.matterAccessory = {
+          UUID: this.#uuid,
+          displayName: this.deviceData.description,
+          deviceType: options.matterDeviceType,
+          manufacturer: this.deviceData.manufacturer,
+          model: this.deviceData.model,
+          serialNumber: this.deviceData.serialNumber,
+          firmwareRevision: this.deviceData.softwareVersion,
+          context:
+            Object.keys(persistedData).length === 0
+              ? {}
+              : { [this.constructor.PERSISTENCE_NAMESPACE]: structuredClone(persistedData) },
+        };
+      }
+
+      // Lifecycle setup requires at least one usable protocol representation.
+      // Do not call onAdd() when creation, restoration, or HAP validation left
+      // the device without either representation.
+      if (this.accessory === undefined && this.matterAccessory === undefined) {
+        this.#postSetupDetails = [];
+        this?.log?.error?.('No accessory is available for setup for "%s"', this.deviceData.description);
+        return false;
+      }
+
+      this.postSetupDetail('Serial number "%s"', this.deviceData.serialNumber, LOG_LEVELS.DEBUG);
+      this.postSetupDetail('Software version "%s"', this.deviceData.softwareVersion, LOG_LEVELS.DEBUG);
+
+      // Preserve setup cleanup while forwarding the original dispatch rejection.
+      // Internal setup dispatches already own the queue slot and must not re-enqueue.
+      try {
+        await this.#dispatchMessage(HomeKitDevice.ADD);
+      } catch (error) {
+        // These may be cached accessories supplied by Homebridge. Do not
+        // unregister them as setup rollback; permanent removal belongs to remove().
+        this.#postSetupDetails = [];
+        this?.log?.error?.('Accessory setup failed for "%s"', this.deviceData.description);
+        throw error;
+      }
+
+      // Register Matter only after onAdd() has completed the descriptor with its
+      // clusters, handlers, parts, and initial state.
+      if (typeof this.matterAccessory === 'object' && this.matterAccessory !== null) {
+        if (
+          this.backend === HomeKitDevice.HOMEBRIDGE &&
+          typeof this.matter?.registerPlatformAccessories === 'function' &&
+          this.matterAccessory.UUID === this.#uuid
+        ) {
+          try {
+            await this.matter.registerPlatformAccessories(HomeKitDevice.PLUGIN_NAME, HomeKitDevice.PLATFORM_NAME, [this.matterAccessory]);
+          } catch (error) {
+            this.matterAccessory = undefined;
+            this?.log?.warn?.('Failed to register Matter accessory "%s": %s', this.deviceData.description, String(error?.stack || error));
+          }
+        } else {
+          this.matterAccessory = undefined;
+          this?.log?.warn?.('Matter accessory "%s" could not be registered', this.deviceData.description);
+        }
+      }
+
+      if (this.accessory === undefined && this.matterAccessory === undefined) {
+        this?.log?.error?.('No accessory was registered for "%s"', this.deviceData.description);
+        this.#postSetupDetails = [];
+        return false;
+      }
+
+      if (this.historyService?.EveHome !== undefined) {
+        this.postSetupDetail('EveHome support as "%s"', this.historyService.EveHome.evetype);
+      }
+
+      // Initial update failures must stop independent publication and clear the
+      // deferred setup summary just like failures while building the accessory.
+      try {
+        await this.#dispatchMessage(HomeKitDevice.UPDATE, {}, { force: true });
+      } catch (error) {
+        this.#postSetupDetails = [];
+        this?.log?.error?.('Accessory setup failed for "%s"', this.deviceData.description);
+        throw error;
+      }
+
+      // Publish HAP accessories that advertise independently, now that onAdd()
+      // and the forced initial update have configured their services and state.
+      // Homebridge publishes requested external accessories through its platform
+      // API, while standalone HAP-NodeJS accessories publish themselves directly.
+      if (
+        this.accessory !== undefined &&
+        ((options?.externalPublish === true &&
+          this.backend === HomeKitDevice.HOMEBRIDGE &&
+          this.accessory?._associatedPlatform === undefined) ||
+          this.backend === HomeKitDevice.HAP_NODEJS)
       ) {
         try {
-          await this.matter.registerPlatformAccessories(HomeKitDevice.PLUGIN_NAME, HomeKitDevice.PLATFORM_NAME, [this.matterAccessory]);
+          if (this.backend === HomeKitDevice.HOMEBRIDGE) {
+            this.#platform.publishExternalAccessories(HomeKitDevice.PLUGIN_NAME, [this.accessory]);
+          } else {
+            await this.accessory.publish({
+              username: this.accessory.username,
+              pincode: this.accessory.pincode,
+              category: this.accessory.category,
+            });
+
+            this.postSetupDetail('Advertising as "%s"', this.accessory.displayName);
+            this.postSetupDetail('Pairing code is "%s"', this.accessory.pincode);
+          }
         } catch (error) {
-          this.matterAccessory = undefined;
-          this?.log?.warn?.('Failed to register Matter accessory "%s": %s', this.deviceData.description, String(error?.stack || error));
-        }
-      } else {
-        this.matterAccessory = undefined;
-        this?.log?.warn?.('Matter accessory "%s" could not be registered', this.deviceData.description);
-      }
-    }
-
-    if (this.accessory === undefined && this.matterAccessory === undefined) {
-      this?.log?.error?.('No accessory was registered for "%s"', this.deviceData.description);
-      this.#postSetupDetails = [];
-      return false;
-    }
-
-    if (this.historyService?.EveHome !== undefined) {
-      this.postSetupDetail('EveHome support as "%s"', this.historyService.EveHome.evetype);
-    }
-
-    // Initial update failures must stop independent publication and clear the
-    // deferred setup summary just like failures while building the accessory.
-    try {
-      await this.message(HomeKitDevice.UPDATE, this.deviceData, { force: true });
-    } catch (error) {
-      this.#postSetupDetails = [];
-      this?.log?.error?.('Accessory setup failed for "%s"', this.deviceData.description);
-      throw error;
-    }
-
-    // Publish HAP accessories that advertise independently, now that onAdd()
-    // and the forced initial update have configured their services and state.
-    // Homebridge publishes requested external accessories through its platform
-    // API, while standalone HAP-NodeJS accessories publish themselves directly.
-    if (
-      this.accessory !== undefined &&
-      ((options?.externalPublish === true &&
-        this.backend === HomeKitDevice.HOMEBRIDGE &&
-        this.accessory?._associatedPlatform === undefined) ||
-        this.backend === HomeKitDevice.HAP_NODEJS)
-    ) {
-      try {
-        if (this.backend === HomeKitDevice.HOMEBRIDGE) {
-          this.#platform.publishExternalAccessories(HomeKitDevice.PLUGIN_NAME, [this.accessory]);
-        } else {
-          await this.accessory.publish({
-            username: this.accessory.username,
-            pincode: this.accessory.pincode,
-            category: this.accessory.category,
-          });
-
-          this.postSetupDetail('Advertising as "%s"', this.accessory.displayName);
-          this.postSetupDetail('Pairing code is "%s"', this.accessory.pincode);
-        }
-      } catch (error) {
-        this.accessory = undefined;
-        this.historyService = undefined;
-        this?.log?.warn?.('Failed to publish HAP accessory "%s": %s', this.deviceData.description, String(error?.stack || error));
-        if (this.matterAccessory === undefined) {
-          this.#postSetupDetails = [];
-          return false;
+          this.accessory = undefined;
+          this.historyService = undefined;
+          this?.log?.warn?.('Failed to publish HAP accessory "%s": %s', this.deviceData.description, String(error?.stack || error));
+          if (this.matterAccessory === undefined) {
+            this.#postSetupDetails = [];
+            return false;
+          }
         }
       }
-    }
 
-    this?.log?.success?.(...(typeof options?.hapAccessoryName === 'string' && options.hapAccessoryName !== '' ? ['Setup %s as "%s"', options.hapAccessoryName, this.deviceData.description] : ['Setup "%s"', this.deviceData.description]));
-    this.#postSetupDetails.forEach((entry) => {
-      let level =
-        typeof entry === 'object' &&
-        Object.hasOwn(LOG_LEVELS, entry?.level?.toUpperCase?.()) &&
-        typeof this?.log?.[LOG_LEVELS[entry.level.toUpperCase()]] === 'function'
-          ? LOG_LEVELS[entry.level.toUpperCase()]
-          : LOG_LEVELS.INFO;
-      this?.log?.[level]?.('  += ' + (entry?.message ?? entry), ...(Array.isArray(entry?.args) ? entry.args : []));
+      this?.log?.success?.(...(typeof options?.hapAccessoryName === 'string' && options.hapAccessoryName !== '' ? ['Setup %s as "%s"', options.hapAccessoryName, this.deviceData.description] : ['Setup "%s"', this.deviceData.description]));
+      this.#postSetupDetails.forEach((entry) => {
+        let level =
+          typeof entry === 'object' &&
+          Object.hasOwn(LOG_LEVELS, entry?.level?.toUpperCase?.()) &&
+          typeof this?.log?.[LOG_LEVELS[entry.level.toUpperCase()]] === 'function'
+            ? LOG_LEVELS[entry.level.toUpperCase()]
+            : LOG_LEVELS.INFO;
+        this?.log?.[level]?.('  += ' + (entry?.message ?? entry), ...(Array.isArray(entry?.args) ? entry.args : []));
+      });
+
+      this.#postSetupDetails = []; // Don't need these anymore
+      // Return a simple success flag: true when any valid accessory representation
+      // is present, otherwise false.
+      return this.accessory !== undefined || this.matterAccessory !== undefined;
     });
-
-    this.#postSetupDetails = []; // Don't need these anymore
-    // Return a simple success flag: true when any valid accessory representation
-    // is present, otherwise false.
-    return this.accessory !== undefined || this.matterAccessory !== undefined;
   }
 
   /**
@@ -847,18 +861,112 @@ export default class HomeKitDevice extends EventEmitter {
    * handler fields taking precedence.
    * Handler failures are logged without interrupting remaining handlers or
    * required lifecycle cleanup. Dispatch then rejects with the first handler error.
+   * All messages are ordered per device, including hooks and persistence.
+   * State changes after teardown are ignored; REMOVE remains available after SHUTDOWN.
+   * Reentrant calls reject rather than waiting on their own queue.
    *
    * @param {string} type Message type used to resolve the corresponding `on<Type>` hook.
    * @param {*} [message] Message payload.
    * @param {...*} args Additional values forwarded to hooks and registered handlers.
    * @returns {Promise<*>} Handler result, merged object results, or `undefined`; `false` is a valid result.
-   * @throws {*} The first handler error, or an error from dispatch processing.
+   * @throws {*} The first handler error, a dispatch error, or a lifecycle wait-cycle error.
    */
   async message(type, message, ...args) {
     if (typeof type !== 'string' || type === '') {
       return;
     }
 
+    return this.#queueMessage(type, () => this.#dispatchMessage(type, message, ...args));
+  }
+
+  /**
+   * Order device operations and reject submissions that would wait on themselves.
+   *
+   * @param {string} type Message type for rejection diagnostics.
+   * @param {Function} operation Async setup or dispatch to execute.
+   * @returns {Promise<*>} Operation result, preserving its rejection.
+   * @private
+   */
+  async #queueMessage(type, operation) {
+    let parent = HomeKitDevice.#lifecycleContext.getStore();
+    let caller;
+    for (let context = parent; context !== undefined; context = context.parent) {
+      if (context.active === true) {
+        caller ??= context;
+        if (context.device === this) {
+          throw new Error('Reentrant lifecycle message "' + type + '" on the same device');
+        }
+      }
+    }
+
+    // Independent roots can also form a cycle. Treat outstanding cross-device
+    // submissions as waits and reject before extending either queue.
+    if (caller !== undefined) {
+      let remaining = [this];
+      let seen = new Set();
+      while (remaining.length > 0) {
+        let device = remaining.pop();
+        if (device === caller.device) {
+          throw new Error('Lifecycle message "' + type + '" would create a cross-device wait cycle');
+        }
+        if (seen.has(device) === false) {
+          seen.add(device);
+          remaining.push(...(device.#activeLifecycle?.waiting.keys() ?? []));
+        }
+      }
+      caller.waiting.set(this, (caller.waiting.get(this) ?? 0) + 1);
+    }
+
+    let pending = this.#lifecycleTail.then(async () => {
+      let context = { device: this, active: true, parent, waiting: new Map() };
+      this.#activeLifecycle = context;
+      return HomeKitDevice.#lifecycleContext.run(context, async () => {
+        try {
+          return await operation();
+        } finally {
+          context.active = false;
+          context.waiting.clear();
+          this.#activeLifecycle = undefined;
+        }
+      });
+    });
+    this.#lifecycleTail = pending.catch(() => {
+      // The caller receives the rejection; later submissions still run.
+    });
+    try {
+      return await pending;
+    } finally {
+      if (caller !== undefined) {
+        let count = caller.waiting.get(this) ?? 0;
+        if (count > 1) {
+          caller.waiting.set(this, count - 1);
+        } else {
+          caller.waiting.delete(this);
+        }
+      }
+    }
+  }
+
+  /**
+   * Execute one message after the lifecycle ordering boundary, including cache persistence.
+   *
+   * @param {string} type Message type.
+   * @param {*} message Message payload.
+   * @param {...*} args Additional hook arguments.
+   * @returns {Promise<*>} Dispatch result.
+   * @private
+   */
+  async #dispatchMessage(type, message, ...args) {
+    // Lifecycle handlers own teardown policy; the queue treats all types alike.
+    if (
+      this.#lifecycleState === HomeKitDevice.REMOVE ||
+      (this.#lifecycleState === HomeKitDevice.SHUTDOWN && type !== HomeKitDevice.REMOVE)
+    ) {
+      return;
+    }
+    if (type === HomeKitDevice.REMOVE || type === HomeKitDevice.SHUTDOWN) {
+      this.#lifecycleState = type;
+    }
     if (
       (message === undefined || message === null) &&
       (type === HomeKitDevice.ADD || type === HomeKitDevice.UPDATE || type === HomeKitDevice.REMOVE || type === HomeKitDevice.SET)
@@ -1133,6 +1241,7 @@ export default class HomeKitDevice extends EventEmitter {
 
           // Update our internally stored data with the new data
           this.deviceData = structuredClone(merged);
+
         }
         handled = true;
       } else if (type === HomeKitDevice.HISTORY) {
@@ -1330,8 +1439,9 @@ export default class HomeKitDevice extends EventEmitter {
 
       entry.running = true;
 
-      // Invoke inside the promise chain so synchronous throws also reach cleanup.
-      Promise.resolve()
+      // Timers submit independent work, even when created inside a suspended
+      // hook. Detach its async context; synchronous throws still reach cleanup.
+      HomeKitDevice.#lifecycleContext.exit(() => Promise.resolve()
         .then(() =>
           typeof entry.callback === 'function'
             ? entry.callback(timerHandle, entry.message)
@@ -1355,7 +1465,7 @@ export default class HomeKitDevice extends EventEmitter {
           if (removeAfterRun === true) {
             this.removeTimer(timerHandle);
           }
-        });
+        }));
     };
 
     // delay only => fire once
@@ -1981,15 +2091,16 @@ export default class HomeKitDevice extends EventEmitter {
     }
 
     if (typeof deviceData?.online === 'boolean' && deviceData.online !== this.deviceData.online) {
-      // Device online status has changed. Log and send message to trigger any handlers for this change
+      // Online notifications belong to the current UPDATE slot; dispatch internally
+      // so they complete before its state commit without submitting another queue slot.
       if (deviceData.online === false) {
         this?.log?.warn?.('Device "%s" is offline', deviceData.description);
-        await this.message(HomeKitDevice.OFFLINE);
+        await this.#dispatchMessage(HomeKitDevice.OFFLINE);
       }
 
       if (deviceData.online === true) {
         this?.log?.success?.('Device "%s" is online', deviceData.description);
-        await this.message(HomeKitDevice.ONLINE);
+        await this.#dispatchMessage(HomeKitDevice.ONLINE);
       }
     }
   }
