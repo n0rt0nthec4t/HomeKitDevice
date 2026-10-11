@@ -283,12 +283,19 @@ Used during platform shutdown to allow devices to perform cleanup.
 
 The static `HomeKitDevice.shutdown()` broadcasts this route to every registered device; `device.shutdown()` targets one instance.
 
+Concurrent runtime and application broadcasts await queued cleanup. Devices remain registered until their queued shutdown work settles, so a broadcast also waits for independently started instance cleanup. Repeated requests queue behind earlier work, while lifecycle state prevents duplicate hooks. External broadcasts recheck the registry for devices added while cleanup was pending. Calls from device hooks use normal lifecycle queue checks and perform one broadcast batch so they cannot wait for their own registry entry to clear.
+
+For standalone HAP-NodeJS, a shutdown request immediately releases a pending publication wait. Device shutdown hooks still run on the lifecycle queue after setup hooks and earlier writes complete. Cancelled publication triggers unpublishing, including another cleanup attempt if publication settles late; `add()` returns `undefined` instead of reporting successful setup. This does not cancel the underlying HAP-NodeJS operation or guarantee that late publication cannot briefly advertise before cleanup.
+
+Cancellation, late publication cleanup, and standalone REMOVE unpublish attempts execute in order. Shutdown hooks do not wait for stalled protocol teardown.
+
 All active timers and internal resources are automatically released during shutdown.
 
 > **Note:**  
 > `.REMOVE` permanently unregisters the accessory from the platform.  
 > `.SHUTDOWN` is used during controlled runtime shutdown and does not imply device removal.
 > Standalone HAP-NodeJS applications should still handle their own process exit policy after shutdown has completed, such as calling `process.exit()` from their signal handler when appropriate.
+> Register application signal handlers before awaiting startup, and mark startup as stopping when a signal arrives. HomeKitDevice retains its own SIGINT and SIGTERM handlers for device cleanup.
 
 ### `update(deviceData, ...args)`
 

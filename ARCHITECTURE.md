@@ -237,13 +237,20 @@ Homebridge shutdown or process signal
 HomeKitDevice.shutdown()
         │
         └─ each registered device receives HomeKitDevice.SHUTDOWN
-              ├─ deregister first to avoid duplicate shutdown
+              ├─ mark lifecycle state to avoid duplicate shutdown
               ├─ call onShutdown() and registered handlers
               ├─ clear timers
-              └─ remove EventEmitter listeners
+              ├─ remove EventEmitter listeners
+              └─ deregister after queued work settles
 ```
 
 `SHUTDOWN` is controlled runtime cleanup and does not unregister the accessory from HomeKit.
+
+Runtime events and external static shutdown calls submit requests through the existing device lifecycle queues. Registry entries remain until queued shutdown work settles, including independently started instance cleanup. Repeated requests wait behind earlier work, and lifecycle state prevents duplicate hooks. External broadcasts recheck the registry after each batch to include devices registered while cleanup was pending. Hook-originated broadcasts perform one batch using normal queue admission so they cannot wait for their own registry entry to clear; active ancestors are checked when a hook retains a finished child's async context.
+
+For standalone HAP-NodeJS, an admitted shutdown request marks publication as stopped before joining the lifecycle queue. Setup hooks and writes remain ordered, but a pending publication wait releases its ADD slot immediately. Cancellation starts unpublishing independently of device hooks; late publication settlement repeats cleanup using the captured accessory. The underlying publisher is not cancellable, so this provides eventual teardown rather than a guarantee against briefly advertising after cancellation. REMOVE continues to wait for standalone publication as before.
+
+Standalone unpublishing uses one per-device promise tail shared by cancellation, late publication settlement, and REMOVE. Publication settlement is inspected after checking shutdown intent so a concurrent rejection cannot bypass cancellation cleanup.
 
 ---
 

@@ -220,7 +220,7 @@ export default class HomeKitDevice extends EventEmitter {
   static EVEHOME = undefined; // HomeKitHistory object
   static LOGGER = undefined; // Logging object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.10.10'; // Code version
+  static VERSION = '2026.10.11'; // Code version
 
   // Persistent context namespace for this class. Subclasses may override to isolate their own context.
   static PERSISTENCE_NAMESPACE = 'HomeKitDevice';
@@ -233,7 +233,6 @@ export default class HomeKitDevice extends EventEmitter {
   static #listeners = {};
   static #deviceRegistry = new Map();
   static #shutdownRegistered = new WeakSet();
-  static #shutdownFired = false; // Runtime shutdown events broadcast once across all emitters
   static #lifecycleContext = new AsyncLocalStorage(); // Track active device dispatches without retaining per-device storage instances
 
   deviceData = {}; // The devices data we store
@@ -254,6 +253,8 @@ export default class HomeKitDevice extends EventEmitter {
   #lifecycleTail = Promise.resolve(); // Settled tail keeps failures from blocking later work
   #lifecycleState = undefined; // Last teardown message; REMOVE can still release resources after SHUTDOWN
   #activeLifecycle = undefined; // Active dispatch and its outstanding cross-device submissions
+  #shutdownAbort = new AbortController(); // Per-device shutdown intent; hooks still run on the lifecycle queue
+  #unpublishTail = Promise.resolve(); // Cancellation, late publication, and REMOVE share protocol teardown ordering
 
   /**
    * Create a HomeKit device instance.
@@ -300,14 +301,8 @@ export default class HomeKitDevice extends EventEmitter {
     }
 
     // Register once per runtime emitter without retaining discarded APIs.
-    // The global guard prevents repeated broadcasts; lifecycle state separately
-    // prevents repeated teardown of an individual device.
-    const shutdown = async () => {
-      if (HomeKitDevice.#shutdownFired === false) {
-        HomeKitDevice.#shutdownFired = true;
-        await HomeKitDevice.shutdown();
-      }
-    };
+    // Runtime and application callers use the same queued shutdown route.
+    const shutdown = () => HomeKitDevice.shutdown();
 
     if (
       this.backend === HomeKitDevice.HOMEBRIDGE &&
@@ -402,7 +397,8 @@ export default class HomeKitDevice extends EventEmitter {
    *
    * @param {HomeKitDeviceAddOptions} [options={}] Representation and publication options.
    * @returns {Promise<boolean|undefined>} `true` when at least one representation is available,
-   * `false` for a completed setup failure, or `undefined` when validation rejects setup or the device has been torn down.
+   * `false` for a completed setup failure, or `undefined` when validation rejects setup,
+   * the device has been torn down, or standalone publication is cancelled by shutdown.
    * @throws {*} When dispatch rejects or submission would create a lifecycle wait cycle.
    */
   add(options = {}) {
@@ -415,7 +411,7 @@ export default class HomeKitDevice extends EventEmitter {
         throw new Error('Reentrant lifecycle message "' + HomeKitDevice.ADD + '" on the same device');
       }
       context.stateOwner = context;
-      if (this.#lifecycleState !== undefined) {
+      if (this.#lifecycleState !== undefined || this.#shutdownAbort.signal.aborted === true) {
         return;
       }
       if (options === null || typeof options !== 'object' || options.constructor !== Object) {
@@ -619,6 +615,10 @@ export default class HomeKitDevice extends EventEmitter {
       // and the forced initial update have configured their services and state.
       // Homebridge publishes requested external accessories through its platform
       // API, while standalone HAP-NodeJS accessories publish themselves directly.
+      if (this.#shutdownAbort.signal.aborted === true) {
+        this.#postSetupDetails = [];
+        return;
+      }
       if (
         this.accessory !== undefined &&
         ((options?.externalPublish === true &&
@@ -626,15 +626,52 @@ export default class HomeKitDevice extends EventEmitter {
           this.accessory?._associatedPlatform === undefined) ||
           this.backend === HomeKitDevice.HAP_NODEJS)
       ) {
+        let cancelPublication;
         try {
           if (this.backend === HomeKitDevice.HOMEBRIDGE) {
             this.#platform.publishExternalAccessories(HomeKitDevice.PLUGIN_NAME, [this.accessory]);
           } else {
-            await this.accessory.publish({
-              username: this.accessory.username,
-              pincode: this.accessory.pincode,
-              category: this.accessory.category,
+            let accessory = this.accessory;
+            let log = this.log;
+            let cancelled = new Promise((resolve) => {
+              cancelPublication = resolve;
+              this.#shutdownAbort.signal.addEventListener('abort', cancelPublication, { once: true });
             });
+            // Normalise synchronous throws and stop publication if shutdown
+            // arrives before the publisher starts in the next microtask.
+            let publishing = Promise.resolve().then(() => {
+              if (this.#shutdownAbort.signal.aborted === false) {
+                return accessory.publish({
+                  username: accessory.username,
+                  pincode: accessory.pincode,
+                  category: accessory.category,
+                });
+              }
+            });
+            let result = await Promise.race([Promise.allSettled([publishing]), cancelled]);
+            if (this.#shutdownAbort.signal.aborted === true) {
+              // Cancellation takes precedence over a concurrent rejection.
+              // Keep captured references for cleanup after REMOVE clears them.
+              this.#unpublishTail = this.#unpublishTail.then(() => accessory.unpublish()).catch((error) => {
+                log?.warn?.('Failed to unpublish HAP-NodeJS accessory "%s": %s',
+                  accessory.displayName, String(error?.stack || error));
+              });
+              void publishing.catch((error) => {
+                log?.warn?.('Cancelled HAP publication failed for "%s": %s',
+                  accessory.displayName, String(error?.stack || error));
+              }).then(() => {
+                this.#unpublishTail = this.#unpublishTail.then(() => accessory.unpublish()).catch((error) => {
+                  log?.warn?.('Failed to unpublish HAP-NodeJS accessory "%s": %s',
+                    accessory.displayName, String(error?.stack || error));
+                });
+                return this.#unpublishTail;
+              });
+              this.#postSetupDetails = [];
+              return;
+            }
+            if (result[0].status === 'rejected') {
+              throw result[0].reason;
+            }
 
             this.postSetupDetail('Advertising as "%s"', this.accessory.displayName);
             this.postSetupDetail('Pairing code is "%s"', this.accessory.pincode);
@@ -647,6 +684,8 @@ export default class HomeKitDevice extends EventEmitter {
             this.#postSetupDetails = [];
             return false;
           }
+        } finally {
+          this.#shutdownAbort.signal.removeEventListener('abort', cancelPublication);
         }
       }
 
@@ -681,17 +720,25 @@ export default class HomeKitDevice extends EventEmitter {
 
   /**
    * Broadcast the shutdown lifecycle event to every registered device.
+   * Devices remain registered until their queued shutdown cleanup settles.
    *
    * @returns {Promise<void>}
    */
   static async shutdown() {
-    // Notify independently so a stalled queue cannot delay other devices.
-    // Dispatch logs failures; settle every notification without stopping the rest.
-    await Promise.allSettled(Array.from(HomeKitDevice.#deviceRegistry.values(), async (device) => device.shutdown()));
+    let context = HomeKitDevice.#lifecycleContext.getStore();
+    while (context !== undefined && context.active !== true) {
+      context = context.parent;
+    }
+    // Independent queues clean up concurrently; repeat to include new devices.
+    // A hook broadcasts once so it cannot wait for its own registry entry to clear.
+    do {
+      await Promise.allSettled(Array.from(HomeKitDevice.#deviceRegistry.values(), async (device) => device.shutdown()));
+    } while (context === undefined && HomeKitDevice.#deviceRegistry.size > 0);
   }
 
   /**
    * Notify this device of shutdown and release its timers and listeners.
+   * Standalone publication cancellation is immediate; device hooks remain queued.
    *
    * @returns {Promise<void>}
    * @throws {*} When a SHUTDOWN handler throws or rejects; lifecycle cleanup still completes.
@@ -924,6 +971,12 @@ export default class HomeKitDevice extends EventEmitter {
       caller.waiting.set(this, (caller.waiting.get(this) ?? 0) + 1);
     }
 
+    // An active state owner rejects nested shutdown during dispatch. Such a
+    // rejected request must not stop publication; accepted hooks stay queued.
+    if (type === HomeKitDevice.SHUTDOWN && this.backend === HomeKitDevice.HAP_NODEJS && owner?.stateOwner?.active !== true) {
+      this.#shutdownAbort.abort();
+    }
+
     let root = owner?.root ?? owner;
     let pending = (owner === undefined ? this.#lifecycleTail : owner.tail ?? Promise.resolve()).then(async () => {
       let context = {
@@ -965,6 +1018,12 @@ export default class HomeKitDevice extends EventEmitter {
           if (owner === undefined) {
             context.waiting.clear();
             this.#activeLifecycle = undefined;
+            // Keep in-progress shutdown visible to later global callers until
+            // hooks, descendants, and lifecycle cleanup have all settled.
+            if (this.#lifecycleState === HomeKitDevice.SHUTDOWN && HomeKitDevice.#deviceRegistry.get(this.#uuid) === this) {
+              HomeKitDevice.#deviceRegistry.delete(this.#uuid);
+              delete HomeKitDevice.#listeners[this.#uuid];
+            }
           }
         }
       });
@@ -1227,15 +1286,11 @@ export default class HomeKitDevice extends EventEmitter {
           }
 
           if (this.accessory !== undefined && this.#platform === undefined) {
-            try {
-              await this.accessory.unpublish();
-            } catch (error) {
-              this?.log?.warn?.(
-                'Failed to unpublish HAP-NodeJS accessory "%s": %s',
-                this.deviceData.description,
-                String(error?.stack || error),
-              );
-            }
+            this.#unpublishTail = this.#unpublishTail.then(() => this.accessory.unpublish()).catch((error) => {
+              this?.log?.warn?.('Failed to unpublish HAP-NodeJS accessory "%s": %s',
+                this.deviceData.description, String(error?.stack || error));
+            });
+            await this.#unpublishTail;
           }
 
           this.deviceData = {};
@@ -1267,10 +1322,6 @@ export default class HomeKitDevice extends EventEmitter {
         context.stateOwner = context;
         this.#lifecycleState = type;
         if (HomeKitDevice.#deviceRegistry.has(this.#uuid) === true) {
-          // Deregister first so we don't get shutdown twice via global broadcaster
-          HomeKitDevice.#deviceRegistry.delete(this.#uuid);
-          delete HomeKitDevice.#listeners[this.#uuid];
-
           this?.log?.debug?.('Notifying device "%s" of shutdown', this.deviceData.description);
 
           // Now run shutdown hooks + cleanup

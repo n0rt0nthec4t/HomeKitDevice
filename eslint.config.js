@@ -12,6 +12,7 @@ export default [{
     ecmaVersion: 'latest',
     sourceType: 'module',
     globals: {
+      AbortController: 'readonly',
       structuredClone: 'readonly',
     },
   },

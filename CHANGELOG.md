@@ -2,6 +2,21 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2026.10.11
+
+### Fixed
+
+- Made overlapping runtime and application shutdown calls await the same pending cleanup without making device hooks wait on their own shutdown
+- Included independently started instance cleanup and devices registered during a pending global shutdown before completing the broadcast
+- Ordered cancellation, late publication, and REMOVE unpublish attempts together, and preserved cancellation cleanup when publication rejects concurrently
+- Released pending standalone HAP publication waits on shutdown so queued device cleanup can finish without waiting for publication
+- Prevented standalone publication after a shutdown request during setup, suppressed cancelled setup success, and unpublished cancelled accessories again on late publication completion
+- Added regression coverage for SIGTERM process exit and GPIO cleanup, queued setup hooks, repeated shutdown requests, and late publication success or failure
+
+### Changed
+
+- Removed the lifetime runtime shutdown guard; repeated broadcasts await the existing lifecycle queues, while per-device lifecycle state prevents duplicate hooks
+
 ## 2026.10.10
 
 ### Fixed

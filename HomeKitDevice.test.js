@@ -2,6 +2,7 @@
 // using isolated HAP and Matter mocks without starting protocol servers.
 import assert from 'node:assert/strict';
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { spawn } from 'node:child_process';
 import test from 'node:test';
 import { setImmediate } from 'node:timers/promises';
 
@@ -1628,16 +1629,7 @@ test('global shutdown isolates a stalled device queue and a rejecting shutdown h
   assert.deepEqual(calls, ['healthy', 'rejecting', 'stalled']);
 });
 
-test('overlapping runtime shutdown events broadcast once and invoke each device hook once', { timeout: 1000 }, async (context) => {
-  let broadcasts = 0;
-  let originalShutdown = HomeKitDevice.shutdown;
-  HomeKitDevice.shutdown = async () => {
-    broadcasts += 1;
-    await originalShutdown();
-  };
-  context.after(() => {
-    HomeKitDevice.shutdown = originalShutdown;
-  });
+test('overlapping runtime and direct shutdown calls await cleanup and invoke hooks once', { timeout: 1000 }, async (context) => {
   let shutdown;
   let registrations = 0;
   let api = {
@@ -1669,13 +1661,77 @@ test('overlapping runtime shutdown events broadcast once and invoke each device 
   assert.equal(registrations, 1);
   let initial = shutdown();
   await entered.promise;
+  let during = new HomeKitDevice(undefined, api, deviceData('RUNTIME-SHUTDOWN-DURING'));
+  context.after(() => during.remove());
+  let duringCalls = 0;
+  during.onShutdown = () => { duringCalls += 1; };
   let overlapping = shutdown();
+  let direct = HomeKitDevice.shutdown();
+  let finished = [false, false, false];
+  [initial, overlapping, direct].forEach((pending, index) => {
+    pending.then(() => { finished[index] = true; });
+  });
+  await setImmediate();
+  assert.deepEqual(finished, [false, false, false]);
   release.resolve();
-  await Promise.all([initial, overlapping]);
+  await Promise.all([initial, overlapping, direct]);
+  assert.equal(duringCalls, 1);
   await shutdown();
   await Promise.all([first.shutdown(), second.shutdown()]);
-  assert.equal(broadcasts, 1);
   assert.deepEqual(calls, [1, 1]);
+  let later = new HomeKitDevice(undefined, api, deviceData('RUNTIME-SHUTDOWN-LATER'));
+  context.after(() => later.remove());
+  let laterCalls = 0;
+  later.onShutdown = () => { laterCalls += 1; };
+  await HomeKitDevice.shutdown();
+  assert.equal(laterCalls, 1);
+});
+
+test('global shutdown awaits an independently started instance shutdown', { timeout: 1000 }, async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('INSTANCE-THEN-GLOBAL'));
+  let entered = Promise.withResolvers();
+  let release = Promise.withResolvers();
+  context.after(async () => {
+    release.resolve();
+    await device.remove();
+  });
+  device.onShutdown = async () => {
+    entered.resolve();
+    await release.promise;
+  };
+  let instance = device.shutdown();
+  await entered.promise;
+  let finished = false;
+  let global = HomeKitDevice.shutdown().then(() => { finished = true; });
+  await setImmediate();
+  assert.equal(finished, false);
+  release.resolve();
+  await Promise.all([instance, global]);
+});
+
+test('a shutdown hook can await global shutdown without joining its own cleanup', { timeout: 1000 }, async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('NESTED-GLOBAL-SHUTDOWN'));
+  context.after(() => device.remove());
+  let calls = 0;
+  device.onShutdown = async () => {
+    calls += 1;
+    await HomeKitDevice.shutdown();
+  };
+  await HomeKitDevice.shutdown();
+  assert.equal(calls, 1);
+});
+
+test('global shutdown from a finished child still recognises its active hook parent', { timeout: 1000 }, async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('CHILD-GLOBAL-SHUTDOWN'));
+  context.after(() => device.remove());
+  let resume;
+  device.onGet = () => { resume = AsyncLocalStorage.snapshot(); };
+  device.onShutdown = async () => {
+    await device.get({});
+    // The GET context has finished, but its owning SHUTDOWN is still awaiting us.
+    await resume(() => HomeKitDevice.shutdown());
+  };
+  await HomeKitDevice.shutdown();
 });
 
 for (let method of ['remove', 'shutdown']) {
@@ -1869,6 +1925,225 @@ for (let method of ['remove', 'shutdown']) {
     }
   });
 }
+
+for (let outcome of ['resolve', 'reject']) {
+  test('standalone shutdown releases publication with late ' + outcome, { timeout: 1000 }, async (context) => {
+    let entered = Promise.withResolvers();
+    let release = Promise.withResolvers();
+    let cleanup = Promise.withResolvers();
+    let calls = [];
+    let warnings = [];
+    let activeUnpublishes = 0;
+    let maximumUnpublishes = 0;
+    class SlowAccessory extends MockAccessory {
+      async publish() {
+        calls.push('publish');
+        entered.resolve();
+        await release.promise;
+        this.published = true;
+        calls.push('late publish');
+      }
+
+      async unpublish() {
+        activeUnpublishes += 1;
+        maximumUnpublishes = Math.max(maximumUnpublishes, activeUnpublishes);
+        calls.push('unpublish');
+        await cleanup.promise;
+        this.published = false;
+        activeUnpublishes -= 1;
+      }
+    }
+    let api = { ...hap, Accessory: SlowAccessory, HAPLibraryVersion: () => 'test' };
+    let device = new HomeKitDevice(undefined, api, {
+      ...deviceData('CANCEL-' + outcome), hkUsername: 'AA:BB:CC:DD:EE:FF', hkPairingCode: '123-45-678',
+    });
+    context.after(async () => {
+      release.resolve();
+      cleanup.resolve();
+      await device.remove();
+    });
+    device.log = { warn: (...args) => warnings.push(args), success: () => calls.push('success') };
+    device.onShutdown = () => calls.push('gpio:off', 'gpio:close');
+    let adding = device.add({ hapAccessoryName: 'Cancel', hapCategory: hap.Categories.SWITCH });
+    await entered.promise;
+    let accessory = device.accessory;
+    // Exercise both public wrappers and the message route. Duplicate requests
+    // must neither repeat the hook nor overlap publication cleanup.
+    let shutdown = device.shutdown();
+    let repeated = device.message(HomeKitDevice.SHUTDOWN);
+    assert.deepEqual(await Promise.all([adding, shutdown, repeated]), [undefined, undefined, undefined]);
+    assert.deepEqual(calls, ['publish', 'unpublish', 'gpio:off', 'gpio:close']);
+    let removing = device.remove();
+    await setImmediate();
+    assert.equal(maximumUnpublishes, 1);
+    cleanup.resolve();
+    await removing;
+    assert.equal(device.accessory, undefined);
+    calls.length = 0;
+    warnings.length = 0;
+    if (outcome === 'resolve') {
+      release.resolve();
+    } else {
+      release.reject(new Error('Late publication failure'));
+    }
+    await setImmediate();
+    assert.equal(calls.includes('unpublish'), true);
+    assert.equal(accessory.published, false);
+    assert.equal(warnings.length, outcome === 'reject' ? 1 : 0);
+    assert.equal(calls.includes('success'), false);
+    assert.equal(maximumUnpublishes, 1);
+  });
+}
+
+test('publication rejection concurrent with shutdown still unpublishes the captured accessory', { timeout: 1000 }, async (context) => {
+  let device;
+  let external = AsyncLocalStorage.snapshot();
+  class FailingAccessory extends MockAccessory {
+    publish() {
+      this.published = true;
+      queueMicrotask(() => external(() => { void device.shutdown(); }));
+      return Promise.reject(new Error('Publication failed during shutdown'));
+    }
+
+    async unpublish() {
+      this.published = false;
+      await super.unpublish();
+    }
+  }
+  device = new HomeKitDevice(undefined, { ...hap, Accessory: FailingAccessory, HAPLibraryVersion: () => 'test' }, {
+    ...deviceData('FAILURE-AND-SHUTDOWN'), hkUsername: 'AA:BB:CC:DD:EE:FF', hkPairingCode: '123-45-678',
+  });
+  context.after(() => device.remove());
+  let adding = device.add({ hapAccessoryName: 'Failure', hapCategory: hap.Categories.SWITCH });
+  assert.equal(await adding, undefined);
+  await device.shutdown();
+  await setImmediate();
+  assert.equal(device.accessory.unpublished, true);
+  assert.equal(device.accessory.published, false);
+});
+
+test('standalone shutdown during setup waits for hooks and prevents publication', { timeout: 1000 }, async (context) => {
+  let entered = Promise.withResolvers();
+  let release = Promise.withResolvers();
+  let calls = [];
+  let device = new HomeKitDevice(undefined, { ...hap, HAPLibraryVersion: () => 'test' }, {
+    ...deviceData('CANCEL-SETUP'), hkUsername: 'AA:BB:CC:DD:EE:FF', hkPairingCode: '123-45-678',
+  });
+  context.after(async () => {
+    release.resolve();
+    await device.remove();
+  });
+  device.onAdd = async () => {
+    calls.push('setup:start');
+    entered.resolve();
+    await release.promise;
+    calls.push('setup:end');
+  };
+  device.onShutdown = () => calls.push('gpio:close');
+  let adding = device.add({ hapAccessoryName: 'Cancel', hapCategory: hap.Categories.SWITCH });
+  await entered.promise;
+  let shutdown = device.message(HomeKitDevice.SHUTDOWN);
+  await setImmediate();
+  assert.deepEqual(calls, ['setup:start']);
+  release.resolve();
+  assert.deepEqual(await Promise.all([adding, shutdown]), [undefined, undefined]);
+  assert.deepEqual(calls, ['setup:start', 'setup:end', 'gpio:close']);
+  assert.equal(device.accessory.published, false);
+});
+
+test('standalone shutdown intent belongs only to the requested device', async (context) => {
+  let devices = ['STOPPED', 'RUNNING'].map((name) => new HomeKitDevice(
+    undefined, { ...hap, HAPLibraryVersion: () => 'test' }, {
+      ...deviceData(name), hkUsername: name === 'STOPPED' ? 'AA:BB:CC:DD:EE:FF' : '11:22:33:44:55:66',
+      hkPairingCode: '123-45-678',
+    },
+  ));
+  context.after(() => Promise.all(devices.map((device) => device.remove())));
+  await devices[0].shutdown();
+  let options = { hapAccessoryName: 'Switch', hapCategory: hap.Categories.SWITCH };
+  assert.equal(await devices[0].add(options), undefined);
+  assert.equal(await devices[1].add(options), true);
+  assert.equal(devices[1].accessory.published, true);
+});
+
+test('rejected nested standalone shutdown does not cancel setup publication', { timeout: 1000 }, async (context) => {
+  let device = new HomeKitDevice(undefined, { ...hap, HAPLibraryVersion: () => 'test' }, {
+    ...deviceData('REJECT-SHUTDOWN'), hkUsername: 'AA:BB:CC:DD:EE:FF', hkPairingCode: '123-45-678',
+  });
+  context.after(() => device.remove());
+  device.onAdd = async () => {
+    await assert.rejects(device.shutdown(), /Reentrant lifecycle message/);
+  };
+  // A rejected child dispatch rejects its owning ADD, even when the hook
+  // catches it. Cancellation must not poison a subsequent valid setup.
+  await assert.rejects(device.add({ hapAccessoryName: 'Reject', hapCategory: hap.Categories.SWITCH }), /Reentrant lifecycle message/);
+  delete device.onAdd;
+  assert.equal(await device.add({ hapAccessoryName: 'Retry', hapCategory: hap.Categories.SWITCH }), true);
+  assert.equal(device.accessory.published, true);
+});
+
+test('SIGTERM closes GPIO and exits while standalone publication remains pending', { timeout: 5000 }, async (context) => {
+  // Reuse the protocol mocks in a separate process so actual signal delivery
+  // exercises HomeKitDevice's handlers without altering the test runner.
+  let script = [
+    'import HomeKitDevice from ' + JSON.stringify(new URL('./HomeKitDevice.js', import.meta.url).href) + ';',
+    'import { writeSync } from "node:fs";',
+    'import { setImmediate } from "node:timers/promises";',
+    MockCharacteristic.toString(),
+    'Object.assign(MockCharacteristic, ' + JSON.stringify(Object.fromEntries(Object.entries(MockCharacteristic))) + ');',
+    MockService.toString(),
+    'MockService.AccessoryInformation = ' + JSON.stringify(MockService.AccessoryInformation) + ';',
+    MockInformationService.toString(),
+    MockAccessory.toString(),
+    'let stopping = false;',
+    // Register application exit policy before constructing or awaiting startup.
+    // Delay its await until the library handler has deregistered the device and
+    // entered asynchronous GPIO cleanup, exposing an early-returning broadcast.
+    'process.on("SIGTERM", async () => { stopping = true; await setImmediate();',
+    'await HomeKitDevice.shutdown();',
+    'if (device.hasTimer("cleanup") === true || device.listenerCount("test") !== 0) { process.exit(2); }',
+    'writeSync(1, "shutdown:complete\\n"); process.exit(0); });',
+    'HomeKitDevice.PLUGIN_NAME = "homebridge-example";',
+    'HomeKitDevice.PLATFORM_NAME = "ExamplePlatform";',
+    'MockAccessory.prototype.publish = () => { process.send("publishing"); return new Promise(() => {}); };',
+    'MockAccessory.prototype.unpublish = async () => { writeSync(1, "unpublish\\n"); };',
+    'let api = { Accessory: MockAccessory, Characteristic: MockCharacteristic, Service: MockService,',
+    'Categories: ' + JSON.stringify(hap.Categories) + ', uuid: { generate: (value) => "uuid:" + value },',
+    'HAPLibraryVersion: () => "test" };',
+    'let device = new HomeKitDevice(undefined, api, ' + JSON.stringify({
+      ...deviceData('SIGNAL-PUBLISH'), hkUsername: 'AA:BB:CC:DD:EE:FF', hkPairingCode: '123-45-678',
+    }) + ');',
+    'device.onShutdown = async () => { writeSync(1, "gpio:off\\n"); await setImmediate(); writeSync(1, "gpio:close\\n"); };',
+    'device.addTimer("cleanup", { interval: 1000 }, () => {});',
+    'device.on("test", () => {});',
+    'let added = await device.add({ hapAccessoryName: "Signal", hapCategory: 1 });',
+    'if (added === true && stopping === false) { writeSync(1, "startup:success\\n"); }',
+  ].join('\n');
+  let child = spawn(process.execPath, ['--input-type=module', '-e', script], {
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+  });
+  context.after(() => {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGKILL');
+    }
+  });
+  let output = '';
+  let errors = '';
+  child.stdout.on('data', (data) => { output += data; });
+  child.stderr.on('data', (data) => { errors += data; });
+  child.on('message', (message) => {
+    if (message === 'publishing') {
+      child.kill('SIGTERM');
+    }
+  });
+  let result = await new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', (code, signal) => resolve({ code, signal }));
+  });
+  assert.deepEqual(result, { code: 0, signal: null }, errors);
+  assert.deepEqual(output.trim().split('\n'), ['unpublish', 'gpio:off', 'gpio:close', 'shutdown:complete']);
+  assert.equal(errors, '');
+});
 
 test('REMOVE waits for standalone HAP publication before unpublishing', { timeout: 1000 }, async (context) => {
   let entered = Promise.withResolvers();
