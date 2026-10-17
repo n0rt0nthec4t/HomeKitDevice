@@ -139,7 +139,7 @@ test('generateUUID fails instead of creating a transient accessory identity', ()
   );
 });
 
-test('Homebridge honours the explicit Matter enablement check', () => {
+test('Homebridge honours the explicit Matter enablement check', async (context) => {
   let matterEnabledChecks = 0;
   let cachedMatterAccessory = {
     UUID: 'uuid:homebridge-example_MATTER-DISABLED',
@@ -157,11 +157,13 @@ test('Homebridge honours the explicit Matter enablement check', () => {
   };
 
   let device = new HomeKitDevice(cachedMatterAccessory, api, deviceData('MATTER-DISABLED'));
+  context.after(() => device.remove());
 
   assert.equal(matterEnabledChecks, 1);
   assert.equal(device.matter, undefined);
   assert.equal(device.matterAccessory, undefined);
 
+  await device.remove();
   delete api.isMatterEnabled;
   device = new HomeKitDevice(cachedMatterAccessory, api, deviceData('MATTER-DISABLED'));
 
@@ -169,6 +171,7 @@ test('Homebridge honours the explicit Matter enablement check', () => {
   assert.equal(device.matter, undefined);
   assert.equal(device.matterAccessory, undefined);
 
+  await device.remove();
   api.isMatterEnabled = () => {
     matterEnabledChecks += 1;
     return true;
@@ -236,7 +239,7 @@ test('constructor rejects invalid persisted device data field declarations', () 
   assert.throws(() => new HomeKitDevice(undefined, hap, data, ['setting', 'setting']), TypeError);
 });
 
-test('Homebridge honours the explicit HAP enablement check and legacy default', async () => {
+test('Homebridge honours the explicit HAP enablement check and legacy default', async (context) => {
   let hapEnabledChecks = 0;
   let hapRegistrations = 0;
   let cachedHapAccessory = new MockAccessory('Cached HAP accessory', 'uuid:homebridge-example_HAP-DISABLED');
@@ -255,6 +258,7 @@ test('Homebridge honours the explicit HAP enablement check and legacy default', 
   };
 
   let device = new HomeKitDevice(cachedHapAccessory, api, deviceData('HAP-DISABLED'));
+  context.after(() => device.remove());
 
   assert.equal(device.backend, HomeKitDevice.HOMEBRIDGE);
   assert.equal(hapEnabledChecks, 1);
@@ -263,6 +267,7 @@ test('Homebridge honours the explicit HAP enablement check and legacy default', 
   assert.equal(await device.add({ hapAccessoryName: 'Switch' }), undefined);
   assert.equal(hapRegistrations, 0);
 
+  await device.remove();
   delete api.isHapEnabled;
   device = new HomeKitDevice(cachedHapAccessory, api, deviceData('HAP-DISABLED'));
 
@@ -494,7 +499,7 @@ test('Homebridge exposes HAP and Matter through the existing lifecycle', async (
   assert.equal(device.accessory.category, hap.Categories.SWITCH);
   assert.equal(added, true);
   assert.equal(calls.hapRegistered.length, 1);
-  assert.equal(calls.hapUpdated.length, 0);
+  assert.equal(calls.hapUpdated.length, 1);
   assert.equal(calls.matterRegistered.length, 1);
   assert.equal(calls.matterInformationUpdated.length, 0);
   assert.equal(calls.matterRegistered[0].accessories[0], device.matterAccessory);
@@ -511,12 +516,12 @@ test('Homebridge exposes HAP and Matter through the existing lifecycle', async (
   assert.deepEqual(device.accessory.context.HomeKitDevice, { on: true });
   assert.deepEqual(device.matterAccessory.context.HomeKitDevice, { on: true });
   assert.notEqual(device.accessory.context.HomeKitDevice, device.matterAccessory.context.HomeKitDevice);
-  assert.equal(calls.hapUpdated.length, 1);
+  assert.equal(calls.hapUpdated.length, 2);
   assert.equal(calls.matterInformationUpdated.length, 1);
 
   await device.update({ on: true });
 
-  assert.equal(calls.hapUpdated.length, 1);
+  assert.equal(calls.hapUpdated.length, 2);
   assert.equal(calls.matterInformationUpdated.length, 1);
 
   await device.remove();
@@ -686,6 +691,40 @@ test('Homebridge supports Matter without creating a HAP accessory or AccessoryIn
   assert.equal(calls.matterInformationUpdated.length, 1);
 });
 
+test('setup persists restored bridged HAP metadata after onAdd without requiring another change', async (context) => {
+  let data = deviceData('RESTORED-METADATA');
+  let cached = new MockAccessory(data.description, HomeKitDevice.generateUUID(HomeKitDevice.PLUGIN_NAME, { hap }, data.serialNumber));
+  cached._associatedPlatform = HomeKitDevice.PLATFORM_NAME;
+  let information = cached.getService(hap.Service.AccessoryInformation);
+  let fields = [
+    ['description', hap.Characteristic.Name],
+    ['manufacturer', hap.Characteristic.Manufacturer],
+    ['model', hap.Characteristic.Model],
+    ['serialNumber', hap.Characteristic.SerialNumber],
+    ['softwareVersion', hap.Characteristic.FirmwareRevision],
+  ];
+  fields.forEach(([, type]) => information.updateCharacteristic(type, 'stale'));
+  let added = false;
+  let writes = [];
+  let api = {
+    version: 2.7, hap,
+    async updatePlatformAccessories(accessories) {
+      assert.equal(added, true);
+      assert.equal(accessories[0], cached);
+      writes.push(Object.fromEntries(fields.map(([key, type]) => [key, information.getCharacteristic(type).value])));
+    },
+  };
+  let device = new HomeKitDevice(cached, api, data);
+  context.after(() => device.remove());
+  device.onAdd = async () => {
+    await setImmediate();
+    added = true;
+  };
+
+  assert.equal(await device.add(), true);
+  assert.deepEqual(writes, [data]);
+});
+
 test('Homebridge add without arguments preserves the default HAP representation and persists metadata', async () => {
   let calls = { registered: [], updated: [], unregistered: [], shutdown: 0 };
   let api = {
@@ -715,11 +754,12 @@ test('Homebridge add without arguments preserves the default HAP representation 
   assert.equal(added, true);
   assert.equal(calls.registered.length, 1);
   assert.equal(calls.shutdown, 1);
+  assert.equal(calls.updated.length, 1);
 
   await device.update({ description: 'Renamed HAP accessory' });
 
   assert.equal(device.accessory.displayName, 'Renamed HAP accessory');
-  assert.equal(calls.updated.length, 1);
+  assert.equal(calls.updated.length, 2);
 
   await device.remove();
 
@@ -1099,6 +1139,108 @@ test('initial UPDATE rejection stops external publication and forwards its origi
 });
 
 // Lifecycle hooks must walk every override, retaining the device as the receiver.
+test('comparison preserves undefined types in updates without treating object key order as a change', async (context) => {
+  let transitions = [
+    [undefined, 'undefined'],
+    [{ value: undefined }, { value: 'undefined' }],
+    [{ value: 'undefined' }, { value: undefined }],
+    [[undefined], ['undefined']],
+    [['undefined'], [undefined]],
+  ];
+  for (let [index, [before, after]] of transitions.entries()) {
+    let device = new HomeKitDevice(undefined, { version: 2.7, hap }, { ...deviceData('TYPED-COMPARE-' + index), value: before });
+    context.after(() => device.remove());
+    let calls = 0;
+    device.onUpdate = () => {
+      calls += 1;
+    };
+    await device.update({ value: after });
+    assert.equal(calls, 1);
+    assert.deepEqual(device.deviceData.value, after);
+    await device.update({ value: structuredClone(after) });
+    assert.equal(calls, 1);
+  }
+
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, {
+    ...deviceData('KEY-ORDER-COMPARE'), value: { first: undefined, second: ['undefined', 1] },
+  });
+  context.after(() => device.remove());
+  let calls = 0;
+  device.onUpdate = () => {
+    calls += 1;
+  };
+  await device.update({ value: { second: ['undefined', 1], first: undefined } });
+  assert.equal(calls, 0);
+  await device.update({ value: { second: [1, 'undefined'], first: undefined } });
+  assert.equal(calls, 1);
+});
+
+test('comparison persists undefined type changes to both caches and snapshots independent HAP values', async (context) => {
+  let hapWrites = [];
+  let matterWrites = [];
+  let api = {
+    version: 2.7, hap, platformAccessory: MockAccessory,
+    registerPlatformAccessories(plugin, platform, accessories) {
+      accessories[0]._associatedPlatform = platform;
+    },
+    updatePlatformAccessories(accessories) {
+      hapWrites.push(structuredClone(accessories[0].context.HomeKitDevice));
+    },
+    isMatterEnabled: () => true,
+    matter: {
+      async registerPlatformAccessories() {},
+      async updatePlatformAccessories(accessories) {
+        matterWrites.push(structuredClone(accessories[0].context.HomeKitDevice));
+      },
+    },
+  };
+  let device = new HomeKitDevice(undefined, api, {
+    ...deviceData('TYPED-CACHE'), setting: { value: undefined },
+  }, ['setting']);
+  context.after(() => device.remove());
+  assert.equal(await device.add({ matterDeviceType: {} }), true);
+  hapWrites.length = 0;
+  matterWrites.length = 0;
+
+  for (let value of ['undefined', undefined]) {
+    await device.update({ setting: { value } });
+    assert.deepEqual(hapWrites.at(-1), { setting: { value } });
+    assert.deepEqual(matterWrites.at(-1), { setting: { value } });
+  }
+  assert.equal(hapWrites.length, 2);
+  assert.equal(matterWrites.length, 2);
+
+  // A snapshot must retain the pre-hook value even when a hook mutates context in place.
+  device.onGet = () => {
+    device.accessory.context.HomeKitDevice.setting.value = 'undefined';
+  };
+  await device.get({});
+  assert.equal(hapWrites.length, 3);
+  assert.deepEqual(hapWrites.at(-1), { setting: { value: 'undefined' } });
+});
+
+test('comparison preserves undefined types in nested history while suppressing key-order duplicates', async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('TYPED-HISTORY'));
+  context.after(() => device.remove());
+  let entries = [];
+  device.historyService = {
+    lastHistory: () => entries.at(-1),
+    addHistory(target, entry) {
+      entries.push(structuredClone(entry));
+      return true;
+    },
+  };
+  let target = { UUID: 'history-target' };
+  await device.history(target, { time: 1, state: { value: undefined, samples: [1, 2] } });
+  await device.history(target, { time: 2, state: { value: 'undefined', samples: [1, 2] } });
+  await device.history(target, { time: 3, state: { samples: [1, 2], value: 'undefined' } });
+  assert.equal(entries.length, 2);
+  await device.history(target, { time: 4, state: { value: undefined, samples: [1, 2] } });
+  assert.equal(entries.length, 3);
+  await device.history(target, { time: 5, state: { value: undefined, samples: [2, 1] } });
+  assert.equal(entries.length, 4);
+});
+
 test('overlapping UPDATE routes preserve committed fields and run hooks in submission order', { timeout: 1000 }, async (context) => {
   let device = new HomeKitDevice(undefined, { version: 2.7, hap }, { ...deviceData('OVERLAP'), a: 0, b: 0 });
   context.after(() => device.remove());
@@ -1227,6 +1369,46 @@ for (let type of [HomeKitDevice.GET, HomeKitDevice.TIMER, 'custom']) {
     assert.deepEqual(calls, ['update', type]);
   });
 }
+
+test('history stores finite numeric timestamps and preserves valid times across reload', async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('HISTORY-TIMESTAMPS'));
+  context.after(() => device.remove());
+  let stored = [];
+  let notified = 0;
+  device.historyService = {
+    addHistory(target, entry) {
+      stored.push(structuredClone(entry));
+      return true;
+    },
+  };
+  device.onHistory = (target, entry) => {
+    assert.equal(Number.isFinite(entry.time), true);
+    notified += 1;
+  };
+  let target = { UUID: 'history-target' };
+  let invalidTimes = [undefined, null, '', '1700000000', true, false, NaN, Infinity, -Infinity, {}, [], 1n, Symbol('time')];
+  for (let time of invalidTimes) {
+    let entry = { time, status: 1 };
+    let before = Math.floor(Date.now() / 1000);
+    await device.history(target, entry, { force: true });
+    assert.equal(Number.isFinite(entry.time), true);
+    assert.equal(Number.isInteger(entry.time), true);
+    assert.ok(entry.time >= before && entry.time <= Math.floor(Date.now() / 1000));
+  }
+  for (let time of [0, 1700000000, 1700000000.25, -1]) {
+    let entry = { time, status: 1 };
+    // Direct HISTORY delivery must use the same timestamp contract as the wrapper.
+    await device.message(HomeKitDevice.HISTORY, target, entry, { force: true });
+    assert.equal(entry.time, time);
+    assert.equal(stored.at(-1).time, time);
+  }
+
+  // JSON persistence and reload must retain numeric timestamps for every accepted record.
+  let reloaded = JSON.parse(JSON.stringify(stored));
+  assert.equal(reloaded.length, invalidTimes.length + 4);
+  assert.equal(notified, reloaded.length);
+  assert.equal(reloaded.every((entry) => Number.isFinite(entry.time)), true);
+});
 
 test('onUpdate can await history with validation, duplicate filtering and all handlers', async (context) => {
   let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('OWNED-HISTORY'));
@@ -1546,6 +1728,42 @@ test('inherited context from a finished child rejoins the active owner in submis
   assert.deepEqual(calls, [[1, 0], 'set', [2, 3]]);
 });
 
+for (let nested of [false, true]) {
+  test('SET does not commit after ignored nested failures, nested SET: ' + nested, async (context) => {
+    let calls = [];
+    class ParentDevice extends HomeKitDevice {
+      onSet() {
+        calls.push('parent');
+      }
+    }
+    let device = new ParentDevice(undefined, { version: 2.7, hap }, {
+      ...deviceData('SET-CHILD-FAILURE-' + nested), enabled: false,
+    });
+    context.after(() => device.remove());
+    let failure = new Error('Nested read failed');
+    device.onGet = () => {
+      throw failure;
+    };
+    device.onSet = () => {
+      calls.push('instance');
+      device.get({});
+      // A later successful sibling must not hide the earlier failure.
+      device.message('success');
+    };
+    device.onMessage = (type) => type === 'command' ? device.set({ enabled: true }) : undefined;
+    await HomeKitDevice.message(device.uuid, HomeKitDevice.SET, () => calls.push('listener'));
+
+    let operation = nested === true ? device.message('command') : device.set({ enabled: true });
+    await assert.rejects(operation, (error) => error === failure);
+    assert.equal(device.deviceData.enabled, false);
+    assert.deepEqual(calls, ['instance', 'parent', 'listener']);
+
+    delete device.onSet;
+    await device.set({ enabled: true });
+    assert.equal(device.deviceData.enabled, true);
+  });
+}
+
 test('SET ownership protects its delayed commit from a nested UPDATE', async (context) => {
   let device = new HomeKitDevice(undefined, { version: 2.7, hap }, { ...deviceData('SET-STATE-OWNER'), a: 0, b: 0 });
   context.after(() => device.remove());
@@ -1664,12 +1882,16 @@ test('overlapping runtime and direct shutdown calls await cleanup and invoke hoo
   let during = new HomeKitDevice(undefined, api, deviceData('RUNTIME-SHUTDOWN-DURING'));
   context.after(() => during.remove());
   let duringCalls = 0;
-  during.onShutdown = () => { duringCalls += 1; };
+  during.onShutdown = () => {
+    duringCalls += 1;
+  };
   let overlapping = shutdown();
   let direct = HomeKitDevice.shutdown();
   let finished = [false, false, false];
   [initial, overlapping, direct].forEach((pending, index) => {
-    pending.then(() => { finished[index] = true; });
+    pending.then(() => {
+      finished[index] = true;
+    });
   });
   await setImmediate();
   assert.deepEqual(finished, [false, false, false]);
@@ -1682,7 +1904,9 @@ test('overlapping runtime and direct shutdown calls await cleanup and invoke hoo
   let later = new HomeKitDevice(undefined, api, deviceData('RUNTIME-SHUTDOWN-LATER'));
   context.after(() => later.remove());
   let laterCalls = 0;
-  later.onShutdown = () => { laterCalls += 1; };
+  later.onShutdown = () => {
+    laterCalls += 1;
+  };
   await HomeKitDevice.shutdown();
   assert.equal(laterCalls, 1);
 });
@@ -1702,7 +1926,9 @@ test('global shutdown awaits an independently started instance shutdown', { time
   let instance = device.shutdown();
   await entered.promise;
   let finished = false;
-  let global = HomeKitDevice.shutdown().then(() => { finished = true; });
+  let global = HomeKitDevice.shutdown().then(() => {
+    finished = true;
+  });
   await setImmediate();
   assert.equal(finished, false);
   release.resolve();
@@ -1725,7 +1951,9 @@ test('global shutdown from a finished child still recognises its active hook par
   let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('CHILD-GLOBAL-SHUTDOWN'));
   context.after(() => device.remove());
   let resume;
-  device.onGet = () => { resume = AsyncLocalStorage.snapshot(); };
+  device.onGet = () => {
+    resume = AsyncLocalStorage.snapshot();
+  };
   device.onShutdown = async () => {
     await device.get({});
     // The GET context has finished, but its owning SHUTDOWN is still awaiting us.
@@ -2001,7 +2229,9 @@ test('publication rejection concurrent with shutdown still unpublishes the captu
   class FailingAccessory extends MockAccessory {
     publish() {
       this.published = true;
-      queueMicrotask(() => external(() => { void device.shutdown(); }));
+      queueMicrotask(() => external(() => {
+        void device.shutdown();
+      }));
       return Promise.reject(new Error('Publication failed during shutdown'));
     }
 
@@ -2129,8 +2359,12 @@ test('SIGTERM closes GPIO and exits while standalone publication remains pending
   });
   let output = '';
   let errors = '';
-  child.stdout.on('data', (data) => { output += data; });
-  child.stderr.on('data', (data) => { errors += data; });
+  child.stdout.on('data', (data) => {
+    output += data;
+  });
+  child.stderr.on('data', (data) => {
+    errors += data;
+  });
   child.on('message', (message) => {
     if (message === 'publishing') {
       child.kill('SIGTERM');
@@ -2393,6 +2627,173 @@ test('prototype traversal deduplicates shared function identities', async (conte
   assert.equal(calls, 1);
 });
 
+test('constructor rejects duplicate UUIDs without replacing routing or listeners', async (context) => {
+  let api = { version: 2.7, hap };
+  let data = deviceData('DUPLICATE-UUID');
+  let original = new HomeKitDevice(undefined, api, data);
+  context.after(() => original.remove());
+  let uuid = original.uuid;
+  original.onGet = () => ({ original: true });
+  await HomeKitDevice.message(uuid, HomeKitDevice.GET, () => ({ listener: true }));
+  class AnotherDevice extends HomeKitDevice {}
+
+  // UUID generation folds serial-number case; subclasses share the same registry.
+  assert.throws(() => new AnotherDevice(undefined, api, { ...data, serialNumber: data.serialNumber.toLowerCase() }), {
+    name: 'Error', message: 'Device UUID is already registered: ' + uuid,
+  });
+  assert.deepEqual(await HomeKitDevice.message(uuid, HomeKitDevice.GET, {}), { original: true, listener: true });
+
+  let shutdowns = 0;
+  original.onShutdown = () => {
+    shutdowns += 1;
+  };
+  original.addTimer('poll', { interval: 10000 }, () => {});
+  await HomeKitDevice.shutdown();
+  assert.equal(shutdowns, 1);
+  assert.equal(original.hasTimer('poll'), false);
+});
+
+test('constructor allows a UUID again after removal and normal protocol cleanup still works', async (context) => {
+  let calls = [];
+  let api = {
+    version: 2.7, hap,
+    isMatterEnabled: () => true,
+    unregisterPlatformAccessories(plugin, platform, accessories) {
+      calls.push({ protocol: 'hap', accessory: accessories[0] });
+    },
+    matter: {
+      async unregisterPlatformAccessories(plugin, platform, accessories) {
+        calls.push({ protocol: 'matter', accessory: accessories[0] });
+      },
+    },
+  };
+  let data = deviceData('UUID-REUSE');
+  let uuid = HomeKitDevice.generateUUID(HomeKitDevice.PLUGIN_NAME, api, data.serialNumber);
+  let hapAccessory = new MockAccessory(data.description, uuid);
+  hapAccessory._associatedPlatform = HomeKitDevice.PLATFORM_NAME;
+  let matterAccessory = { UUID: uuid, deviceType: {} };
+  let original = new HomeKitDevice([hapAccessory, matterAccessory], api, data);
+  context.after(() => original.remove());
+  original.addTimer('poll', { interval: 10000 }, () => {});
+  original.on('probe', () => {});
+
+  await original.remove();
+  assert.equal(original.hasTimer('poll'), false);
+  assert.equal(original.listenerCount('probe'), 0);
+  assert.equal(original.uuid, undefined);
+  assert.deepEqual(calls, [
+    { protocol: 'hap', accessory: hapAccessory },
+    { protocol: 'matter', accessory: matterAccessory },
+  ]);
+
+  let next = new HomeKitDevice([hapAccessory, matterAccessory], api, data);
+  context.after(() => next.remove());
+  assert.equal(next.uuid, uuid);
+  next.onGet = () => 'next instance';
+  assert.equal(await HomeKitDevice.message(uuid, HomeKitDevice.GET, {}), 'next instance');
+  // Shutdown releases routing; REMOVE afterward still unregisters the protocols.
+  await next.shutdown();
+  await next.remove();
+  assert.equal(calls.length, 4);
+});
+
+test('inherited static messaging shares registration and delivery with the base class', async (context) => {
+  class ParentDevice extends HomeKitDevice {}
+  class ChildDevice extends ParentDevice {}
+  let device = new ChildDevice(undefined, { version: 2.7, hap }, deviceData('INHERITED-STATIC'));
+  context.after(() => device.remove());
+  let uuid = device.uuid;
+  let calls = 0;
+  let listener = () => {
+    calls += 1;
+    return { registered: true };
+  };
+  await ChildDevice.message(uuid, HomeKitDevice.GET, listener);
+  await HomeKitDevice.message(uuid, HomeKitDevice.GET, listener);
+  assert.deepEqual(await ParentDevice.message(uuid, HomeKitDevice.GET, {}), { registered: true });
+  assert.deepEqual(await HomeKitDevice.message(uuid, HomeKitDevice.GET, {}), { registered: true });
+  assert.equal(calls, 2);
+
+  class ObjectListener {
+    onProbe(value) {
+      assert.equal(this, objectListener);
+      return value;
+    }
+  }
+  let objectListener = new ObjectListener();
+  await ParentDevice.message(uuid, 'test.onProbe', objectListener);
+  assert.equal(await ChildDevice.message(uuid, 'test.onProbe', 'payload'), 'payload');
+
+  let failure = new Error('Inherited delivery failed');
+  await ChildDevice.message(uuid, 'failure', () => {
+    throw failure;
+  });
+  await assert.rejects(ChildDevice.message(uuid, 'failure', {}), (error) => error === failure);
+  await device.remove();
+  assert.equal(await ChildDevice.message(uuid, HomeKitDevice.GET, {}), undefined);
+});
+
+test('reserved listener UUIDs cannot write to Object.prototype', async (context) => {
+  let type = 'homekitDeviceReservedUuidProbe';
+  assert.equal(Object.hasOwn(Object.prototype, type), false);
+  let api = { version: 2.7, hap: { ...hap, uuid: { generate: () => '__proto__' } } };
+  let device = new HomeKitDevice(undefined, api, deviceData('RESERVED-UUID'));
+  context.after(async () => {
+    delete Object.prototype[type];
+    await device.remove();
+  });
+
+  await HomeKitDevice.message(device.uuid, type, () => 'listener result');
+
+  assert.equal(Object.hasOwn(Object.prototype, type), false);
+  assert.equal(await HomeKitDevice.message(device.uuid, type, {}), 'listener result');
+});
+
+test('reserved message types use only explicitly registered listeners', async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('RESERVED-TYPES'));
+  context.after(() => device.remove());
+  // Allocate the per-device dictionary before looking up names inherited by ordinary objects.
+  await HomeKitDevice.message(device.uuid, 'registered', () => {});
+  device.onMessage = (type) => ({ fallback: type });
+
+  for (let type of ['constructor', 'toString', '__proto__']) {
+    assert.deepEqual(await device.message(type, {}), { fallback: type });
+    await HomeKitDevice.message(device.uuid, type, () => ({ listener: type }));
+    assert.deepEqual(await device.message(type, {}), { listener: type });
+  }
+});
+
+for (let method of ['remove', 'shutdown']) {
+  test(method + ' clears registered listeners before the UUID is used again', async (context) => {
+    let api = { version: 2.7, hap };
+    let data = deviceData('LISTENER-CLEANUP-' + method);
+    let original = new HomeKitDevice(undefined, api, data);
+    context.after(() => original.remove());
+    await HomeKitDevice.message(original.uuid, HomeKitDevice.GET, () => 'original listener');
+    assert.equal(await original.get({}), 'original listener');
+
+    await original[method]();
+    let next = new HomeKitDevice(undefined, api, data);
+    context.after(() => next.remove());
+    assert.equal(await next.get({}), undefined);
+  });
+}
+
+test('remove clears listeners registered after shutdown before the UUID is used again', async (context) => {
+  let api = { version: 2.7, hap };
+  let data = deviceData('POST-SHUTDOWN-LISTENERS');
+  let original = new HomeKitDevice(undefined, api, data);
+  context.after(() => original.remove());
+  let uuid = original.uuid;
+  await original.shutdown();
+  await HomeKitDevice.message(uuid, HomeKitDevice.GET, () => 'late listener');
+
+  await original.remove();
+  let next = new HomeKitDevice(undefined, api, data);
+  context.after(() => next.remove());
+  assert.equal(await next.get({}), undefined);
+});
+
 test('registered object handlers traverse prototypes and retain distinct contexts', async (context) => {
   let calls = [];
   class BaseListener {
@@ -2586,6 +2987,22 @@ test('set forwards dispatch failures and waits for asynchronous handlers', async
   assert.equal(calls, 3);
 });
 
+test('set detaches committed objects and arrays from caller-owned values', async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, {
+    ...deviceData('SET-SNAPSHOT'), settings: { enabled: false }, samples: [],
+  });
+  context.after(() => device.remove());
+  let values = { settings: { nested: { enabled: true } }, samples: [{ value: 1 }] };
+  await device.set(values);
+
+  values.settings.nested.enabled = false;
+  values.samples[0].value = 2;
+  values.samples.push({ value: 3 });
+
+  assert.deepEqual(device.deviceData.settings, { nested: { enabled: true } });
+  assert.deepEqual(device.deviceData.samples, [{ value: 1 }]);
+});
+
 test('set preserves the undefined result after a successful asynchronous hook', async (context) => {
   let device = new HomeKitDevice(undefined, { version: 2.7, hap }, { ...deviceData('SET-SUCCESS'), requested: false });
   context.after(() => device.remove());
@@ -2620,6 +3037,56 @@ test('named hooks and registered handlers preserve scalar results', async (conte
   registeredResult = false;
   assert.equal(await device.get({}), false);
 });
+
+for (let method of ['shutdown', 'remove']) {
+  test(method + ' rejects timers during hooks and from callbacks resuming after teardown', { timeout: 1000 }, async (context) => {
+    let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('LATE-TIMER-' + method));
+    let entered = Promise.withResolvers();
+    let release = Promise.withResolvers();
+    let finished = Promise.withResolvers();
+    let resumed;
+    let during;
+    let reset;
+    let cleanup;
+    context.after(async () => {
+      release.resolve();
+      await finished.promise;
+      for (let handle of ['suspended', 'existing', 'during', 'late', 'after']) {
+        device.removeTimer(handle);
+      }
+      await device.remove();
+    });
+    device.addTimer('suspended', { delay: 1 }, async () => {
+      entered.resolve();
+      await release.promise;
+      resumed = device.addTimer('late', { interval: 10000 }, () => {});
+      finished.resolve();
+    });
+    device.addTimer('existing', { interval: 10000 }, () => {});
+    device[method === 'shutdown' ? 'onShutdown' : 'onRemove'] = () => {
+      during = device.addTimer('during', { interval: 10000 }, () => {});
+      reset = device.addTimer('existing', { interval: 10000, reset: true }, () => {});
+      cleanup = device.removeTimer('existing');
+    };
+
+    await entered.promise;
+    await device[method]();
+    release.resolve();
+    await finished.promise;
+
+    assert.equal(during, false);
+    assert.equal(reset, false);
+    assert.equal(cleanup, true);
+    assert.equal(resumed, false);
+    assert.equal(device.hasTimer('late'), false);
+    for (let options of [{ delay: 10000 }, { interval: 10000 }, { delay: 10000, interval: 10000 }]) {
+      assert.equal(device.addTimer('after', options, () => {}), false);
+      assert.equal(device.hasTimer('after'), false);
+    }
+    await device[method]();
+    assert.equal(device.hasTimer('late'), false);
+  });
+}
 
 test('timer message rejection is handled and the one-shot timer is removed', { timeout: 1000 }, async (context) => {
   let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('TIMER-DISPATCH-REJECTION'));
@@ -2744,4 +3211,571 @@ test('standalone HAP-NodeJS remains HAP-only', async () => {
   await device.remove();
 
   assert.equal(accessory.unpublished, true);
+});
+
+test('wrappers and direct messages ignore invalid payloads before hooks or state changes', async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('DISPATCH-VALIDATION'));
+  context.after(() => device.remove());
+  let initial = structuredClone(device.deviceData);
+  let calls = [];
+  device.onSet = () => calls.push('set');
+  device.onUpdate = () => calls.push('update');
+  device.onHistory = () => calls.push('history');
+  device.historyService = { addHistory: () => calls.push('store') };
+  for (let type of [HomeKitDevice.SET, HomeKitDevice.UPDATE, HomeKitDevice.HISTORY]) {
+    await HomeKitDevice.message(device.uuid, type, () => calls.push('listener'));
+  }
+
+  for (let payload of [undefined, null, false, 'invalid', [], new Date()]) {
+    assert.equal(await device.set(payload), undefined);
+    assert.equal(await device.message(HomeKitDevice.SET, payload), undefined);
+    assert.equal(await device.update(payload), undefined);
+    assert.equal(await device.message(HomeKitDevice.UPDATE, payload), undefined);
+  }
+  for (let payload of [{ manufacturer: '' }, { model: 123 }]) {
+    await device.update(payload);
+    await device.message(HomeKitDevice.UPDATE, payload);
+  }
+  for (let args of [
+    [null, { status: 1 }],
+    [{ UUID: '' }, { status: 1 }],
+    [{ UUID: 'history-target' }, null],
+    [{ UUID: 'history-target' }, { status: 1 }, null],
+  ]) {
+    assert.equal(await device.history(...args), undefined);
+    assert.equal(await device.message(HomeKitDevice.HISTORY, ...args), undefined);
+  }
+  assert.deepEqual(calls, []);
+  assert.deepEqual(device.deviceData, initial);
+
+  await device.set({ description: 'Validated SET' });
+  await device.update({ description: 'Validated UPDATE' });
+  await device.history({ UUID: 'history-target' }, { status: 1 });
+  assert.deepEqual(calls, ['set', 'listener', 'update', 'listener', 'store', 'history', 'listener']);
+  assert.equal(device.deviceData.description, 'Validated UPDATE');
+});
+
+test('service helpers create and reuse primary and subtype services and remove by instance or type', async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('SERVICE-API'));
+  context.after(() => device.remove());
+  let type = { UUID: 'switch-service' };
+  assert.equal(device.addService(type), undefined);
+  assert.equal(device.removeService(type), false);
+  device.accessory = new MockAccessory('Services', device.uuid);
+  assert.equal(device.addService(undefined), undefined);
+  let primary = device.addService(type, 'Primary');
+  assert.equal(primary.displayName, 'Primary');
+  assert.equal(device.addService(type, 'Ignored'), primary);
+  let secondary = device.addService(type, 'Secondary', 'second', { enabled: true });
+  assert.notEqual(secondary, primary);
+  assert.equal(device.addService(type, 'Ignored', 'second'), secondary);
+  assert.equal(device.accessory.services.length, 3);
+  assert.equal(device.removeService(type, 'missing'), false);
+  assert.equal(device.removeService(undefined), false);
+  assert.equal(device.removeService(type, 'second'), true);
+  assert.equal(device.removeService(type), true);
+  assert.equal(device.removeService(type), false);
+
+  let instance = new MockService();
+  device.accessory.services.push(instance);
+  assert.equal(device.removeService(instance), true);
+  assert.equal(device.accessory.services.includes(instance), false);
+  device.accessory = {};
+  assert.equal(device.addService(type), undefined);
+  assert.equal(device.removeService(type), false);
+});
+
+test('characteristic helpers create required and optional characteristics and apply configuration', async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('CHARACTERISTIC-API'));
+  context.after(() => device.remove());
+  let required = { UUID: 'required' };
+  let optional = { UUID: 'optional' };
+  let operations = [];
+  let service = {
+    characteristics: [],
+    optionalCharacteristics: [optional],
+    testCharacteristic(type) {
+      return this.characteristics.some((entry) => entry.UUID === type.UUID);
+    },
+    getCharacteristic(type) {
+      return this.characteristics.find((entry) => entry.UUID === type.UUID);
+    },
+    addCharacteristic(type) {
+      let characteristic = Object.assign(new MockCharacteristic(), {
+        UUID: type.UUID,
+        onSet(handler) {
+          this.setter = handler;
+        },
+        onGet(handler) {
+          this.getter = handler;
+        },
+        setProps(props) {
+          this.props = props;
+        },
+      });
+      this.characteristics.push(characteristic);
+      operations.push('required');
+    },
+    addOptionalCharacteristic(type) {
+      this.addCharacteristic(type);
+      operations[operations.length - 1] = 'optional';
+    },
+    updateCharacteristic(type, value) {
+      this.getCharacteristic(type).value = value;
+    },
+    removeCharacteristic(characteristic) {
+      this.characteristics = this.characteristics.filter((entry) => entry !== characteristic);
+    },
+  };
+  assert.equal(device.addCharacteristic(undefined, required), undefined);
+  assert.equal(device.addCharacteristic(service, undefined), undefined);
+  let setter = (value) => value;
+  let getter = () => false;
+  let characteristic = device.addCharacteristic(service, required, {
+    props: { minValue: 0, maxValue: 100 }, onSet: setter, onGet: getter, initialValue: 0,
+  });
+  assert.equal(characteristic.setter, setter);
+  assert.equal(characteristic.getter, getter);
+  assert.deepEqual(characteristic.props, { minValue: 0, maxValue: 100 });
+  assert.equal(characteristic.value, 0);
+  assert.equal(device.addCharacteristic(service, required, { props: null, initialValue: false }), characteristic);
+  assert.equal(characteristic.value, false);
+  let optionalCharacteristic = device.addCharacteristic(service, optional);
+  assert.deepEqual(operations, ['required', 'optional']);
+  assert.equal(device.removeCharacteristic(service, characteristic), true);
+  assert.equal(service.characteristics.includes(characteristic), false);
+  assert.equal(device.removeCharacteristic(service, optional), true);
+  assert.equal(service.characteristics.includes(optionalCharacteristic), false);
+  // Removal must never call HAP's potentially creating lookup.
+  service.getCharacteristic = () => {
+    throw new Error('Unexpected creating lookup');
+  };
+  assert.equal(device.removeCharacteristic(service, optional), false);
+  assert.equal(device.removeCharacteristic(service, undefined), false);
+  assert.equal(device.removeCharacteristic({}, required), false);
+  assert.equal(device.removeCharacteristic({ removeCharacteristic() {} }, required), false);
+});
+
+test('characteristic helpers accept minimal HAP metadata and absent optional configuration', async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('CHARACTERISTIC-MINIMAL'));
+  context.after(() => device.remove());
+  let characteristic = { UUID: 'minimal' };
+  let service = {
+    characteristics: [characteristic],
+    testCharacteristic: () => true,
+    getCharacteristic: () => characteristic,
+    addCharacteristic() {},
+    addOptionalCharacteristic() {},
+    removeCharacteristic() {},
+  };
+  assert.equal(device.addCharacteristic(service, characteristic, { props: {}, initialValue: 1 }), characteristic);
+  device.hap = undefined;
+  assert.equal(device.removeCharacteristic(service, characteristic), true);
+  assert.equal(device.removeService({ UUID: 'absent' }), false);
+});
+
+test('HomeKit names preserve Unicode and internal punctuation and strip invalid boundaries', () => {
+  for (let [input, expected] of [
+    ['Kitchen Light', 'Kitchen Light'],
+    ['  --Café 温度 2!! ', 'Café 温度 2'],
+    ['Mark’s & Jane\'s (Room): 2', 'Mark’s & Jane\'s (Room): 2'],
+    ['😀Kitchen\nLight😀', 'KitchenLight'],
+    ['\'Light’', 'Light'],
+    ['', 'Unknown Device'],
+    ['!😀\n', 'Unknown Device'],
+  ]) {
+    assert.equal(HomeKitDevice.makeValidHKName(input), expected);
+  }
+  for (let value of [undefined, null, 0, false, {}, []]) {
+    assert.equal(HomeKitDevice.makeValidHKName(value), value);
+  }
+});
+
+test('timer validation, duplicate preservation and reset follow the public contract', { timeout: 1000 }, async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('TIMER-CONTRACT'));
+  context.after(() => device.remove());
+  let calls = [];
+  for (let handle of [undefined, null, '', 1]) {
+    assert.equal(device.addTimer(handle, { delay: 10 }), false);
+    assert.equal(device.hasTimer(handle), false);
+    assert.equal(device.removeTimer(handle), false);
+  }
+  for (let options of [undefined, null, [], 'invalid', {}, { delay: -1 }, { interval: Infinity }]) {
+    assert.equal(device.addTimer('invalid', options), false);
+  }
+  assert.equal(device.addTimer(
+    'reset', { delay: '1000', message: { value: 1 } }, (handle, message) => calls.push([handle, message]),
+  ), true);
+  assert.equal(device.hasTimer('reset'), true);
+  assert.equal(device.addTimer('reset', { delay: 1 }, () => calls.push('duplicate')), true);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.deepEqual(calls, []);
+  let fired = Promise.withResolvers();
+  assert.equal(device.addTimer('reset', { delay: 10, reset: true, message: null }, (handle, message) => {
+    calls.push([handle, message]);
+    fired.resolve();
+  }), true);
+  await fired.promise;
+  await setImmediate();
+  assert.deepEqual(calls, [['reset', {}]]);
+  assert.equal(device.hasTimer('reset'), false);
+  assert.equal(device.removeTimer('reset'), true);
+});
+
+test('delayed repeating timers skip overlapping asynchronous executions', { timeout: 1000 }, async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('DELAYED-TIMER-CONTRACT'));
+  context.after(() => device.remove());
+  let calls = 0;
+  let release;
+  let notify;
+  let fired = new Promise((resolve) => {
+    notify = resolve;
+  });
+  device.addTimer('poll', { delay: 10, interval: 5 }, async () => {
+    calls += 1;
+    notify();
+    await new Promise((resolve) => {
+      release = resolve;
+    });
+  });
+  assert.equal(calls, 0);
+  await fired;
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(calls, 1);
+  fired = new Promise((resolve) => {
+    notify = resolve;
+  });
+  release();
+  await fired;
+  assert.equal(calls, 2);
+  device.removeTimer('poll');
+  release();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(calls, 2);
+  assert.equal(device.hasTimer('poll'), false);
+});
+
+test('constructor validates every required metadata field and standalone pairing formats', async (context) => {
+  let api = { version: 2.7, hap };
+  for (let key of ['serialNumber', 'softwareVersion', 'description', 'model', 'manufacturer']) {
+    for (let value of [undefined, null, '', 1, false]) {
+      assert.throws(() => new HomeKitDevice(undefined, api, { ...deviceData('BAD-METADATA'), [key]: value }), TypeError);
+    }
+  }
+  for (let data of [null, false, [], new Date()]) {
+    assert.throws(() => new HomeKitDevice(undefined, api, data), TypeError);
+  }
+  let standalone = { ...hap, HAPLibraryVersion: () => 'test' };
+  for (let [index, pin] of ['123-45-678', '1234-5678'].entries()) {
+    let device = new HomeKitDevice(undefined, standalone, {
+      ...deviceData('PAIRING-' + index), hkUsername: 'AA:BB:CC:DD:EE:FF', hkPairingCode: pin,
+    });
+    context.after(() => device.remove());
+    let initial = structuredClone(device.deviceData);
+    for (let data of [{ hkPairingCode: '' }, { hkPairingCode: 12345678 }, { hkUsername: 'invalid' }, { hkUsername: null }]) {
+      await device.update(data);
+      assert.deepEqual(device.deviceData, initial);
+    }
+    await device.update({ hkPairingCode: '8765-4321' });
+    assert.equal(device.deviceData.hkPairingCode, '8765-4321');
+    await device.update({ hkUsername: '11:22:33:44:55:66' });
+    assert.equal(device.deviceData.hkUsername, '11:22:33:44:55:66');
+  }
+  for (let data of [
+    {}, { hkPairingCode: 'invalid', hkUsername: 'AA:BB:CC:DD:EE:FF' },
+    { hkPairingCode: '123-45-678', hkUsername: 'invalid' },
+  ]) {
+    assert.throws(() => new HomeKitDevice(undefined, standalone, { ...deviceData('BAD-PAIRING'), ...data }), TypeError);
+  }
+  assert.throws(() => new HomeKitDevice(undefined, api, deviceData('DUPLICATE-PERSISTED'), ['value', 'value']), TypeError);
+});
+
+test('setup rejects invalid options without calling hooks or creating representations', async (context) => {
+  let device = new HomeKitDevice(undefined, {
+    version: 2.7, hap, platformAccessory: MockAccessory, registerPlatformAccessories() {},
+  }, deviceData('INVALID-SETUP-OPTIONS'));
+  context.after(() => device.remove());
+  let calls = 0;
+  device.onAdd = () => {
+    calls += 1;
+  };
+  for (let options of [null, [], 'invalid', { enableHistory: 1 }, { externalPublish: 'true' }]) {
+    assert.equal(await device.add(options), undefined);
+  }
+  let pluginName = HomeKitDevice.PLUGIN_NAME;
+  let platformName = HomeKitDevice.PLATFORM_NAME;
+  try {
+    HomeKitDevice.PLUGIN_NAME = '';
+    assert.equal(await device.add(), undefined);
+    HomeKitDevice.PLUGIN_NAME = pluginName;
+    HomeKitDevice.PLATFORM_NAME = '';
+    assert.equal(await device.add(), undefined);
+  } finally {
+    HomeKitDevice.PLUGIN_NAME = pluginName;
+    HomeKitDevice.PLATFORM_NAME = platformName;
+  }
+  assert.equal(calls, 0);
+  assert.equal(device.accessory, undefined);
+  assert.equal(await device.message(null), undefined);
+  assert.equal(await device.message(''), undefined);
+  assert.equal(await HomeKitDevice.message('', HomeKitDevice.GET), undefined);
+  assert.equal(await HomeKitDevice.message(device.uuid, null), undefined);
+  assert.equal(await HomeKitDevice.message('missing-uuid', HomeKitDevice.GET), undefined);
+});
+
+test('standalone setup requires an accessory name and known category', async (context) => {
+  let device = new HomeKitDevice(undefined, { ...hap, HAPLibraryVersion: () => 'test' }, {
+    ...deviceData('STANDALONE-OPTIONS'), hkUsername: 'AA:BB:CC:DD:EE:FF', hkPairingCode: '123-45-678',
+  });
+  context.after(() => device.remove());
+  for (let options of [{}, { hapAccessoryName: '' }, { hapAccessoryName: 'Switch', hapCategory: 'UNKNOWN' }]) {
+    assert.equal(await device.add(options), undefined);
+    assert.equal(device.accessory, undefined);
+  }
+  assert.equal(await device.add({ hapAccessoryName: 'Switch', hapCategory: 1 }), true);
+});
+
+test('setup summary preserves formatting, levels, fallback and clears consumed details', async (context) => {
+  let device = new HomeKitDevice(undefined, {
+    version: 2.7, hap, platformAccessory: MockAccessory, registerPlatformAccessories() {},
+  }, deviceData('SUMMARY-API'));
+  context.after(() => device.remove());
+  let calls = [];
+  device.log = Object.fromEntries(['info', 'success', 'warn', 'error'].map((level) => [level, (...args) => calls.push([level, ...args])]));
+  for (let invalid of [null, undefined, '', 1, {}]) {
+    device.postSetupDetail(invalid);
+  }
+  device.postSetupDetail('Plain detail');
+  device.postSetupDetail('Formatted %s %d', 'value', 2, 'WaRn');
+  device.postSetupDetail('Fallback %s', 'value', 'DEBUG');
+  device.postSetupDetail('Unrecognised %s', 'trace');
+  device.postSetupDetail('Error detail', 'error');
+  device.postSetupDetail('Success detail', 'success');
+  assert.equal(await device.add(), true);
+  assert.deepEqual(calls.filter((call) => /detail|Formatted|Fallback|Unrecognised/.test(call[1])), [
+    ['info', '  += Plain detail'],
+    ['warn', '  += Formatted %s %d', 'value', 2],
+    ['info', '  += Fallback %s', 'value'],
+    ['info', '  += Unrecognised %s', 'trace'],
+    ['error', '  += Error detail'],
+    ['success', '  += Success detail'],
+  ]);
+  calls.length = 0;
+  assert.equal(await device.add(), true);
+  assert.equal(calls.some((call) => call[1] === '  += Plain detail'), false);
+});
+
+test('Eve setup links annotated services after onAdd and removes temporary configuration', async (context) => {
+  let originalEve = HomeKitDevice.EVEHOME;
+  let linked = [];
+  let historyArgs;
+  class History {
+    static EVE_OPTIONS = Symbol('eve-options');
+    EveHome = { evetype: 'switch' };
+    constructor(...args) {
+      historyArgs = args;
+    }
+
+    linkToEveHome(service, options) {
+      linked.push([service, options]);
+    }
+  }
+  HomeKitDevice.EVEHOME = History;
+  let device;
+  context.after(async () => {
+    try {
+      await device?.remove();
+    } finally {
+      HomeKitDevice.EVEHOME = originalEve;
+    }
+  });
+  device = new HomeKitDevice(undefined, {
+    version: 2.7, hap, platformAccessory: MockAccessory, registerPlatformAccessories() {},
+  }, { ...deviceData('EVE-LINK'), eveHistory: true });
+  let service;
+  let options = { description: 'Switch history' };
+  device.onAdd = () => {
+    service = device.addService({ UUID: 'eve-switch' }, 'Switch', undefined, options);
+    assert.equal(linked.length, 0);
+  };
+  assert.equal(await device.add({ enableHistory: true }), true);
+  assert.equal(historyArgs[0], device.accessory);
+  assert.equal(historyArgs[1], hap);
+  assert.deepEqual(linked, [[service, options]]);
+  assert.equal(Object.hasOwn(service, History.EVE_OPTIONS), false);
+});
+
+test('disabled Eve setup removes all Eve characteristics and history services without skipping neighbours', async (context) => {
+  class Service extends MockService {}
+  Service.EveHomeHistory = { UUID: 'eve-history-service' };
+  let device = new HomeKitDevice(undefined, {
+    version: 2.7, hap: { ...hap, Service }, platformAccessory: MockAccessory, registerPlatformAccessories() {},
+  }, { ...deviceData('EVE-UNLINK'), eveHistory: false });
+  context.after(() => device.remove());
+  let service;
+  device.onAdd = () => {
+    service = device.addService({ UUID: 'switch' });
+    service.characteristics = [{ UUID: 'E863F101' }, { UUID: 'E863F102' }, { UUID: 'keep' }];
+    service.removeCharacteristic = (characteristic) => {
+      service.characteristics.splice(service.characteristics.indexOf(characteristic), 1);
+    };
+    device.addService(Service.EveHomeHistory, 'History', 'first');
+    device.addService(Service.EveHomeHistory, 'History', 'second');
+  };
+  assert.equal(await device.add(), true);
+  assert.deepEqual(service.characteristics, [{ UUID: 'keep' }]);
+  assert.equal(device.accessory.services.some((entry) => entry.UUID === Service.EveHomeHistory.UUID), false);
+});
+
+test('metadata updates remove legacy firmware characteristics and order online notifications before commit', async (context) => {
+  let device = new HomeKitDevice(undefined, {
+    version: 2.7, hap, platformAccessory: MockAccessory, registerPlatformAccessories() {},
+  }, { ...deviceData('METADATA-API'), online: true });
+  context.after(() => device.remove());
+  assert.equal(await device.add(), true);
+  let information = device.accessory.getService(hap.Service.AccessoryInformation);
+  information.updateCharacteristic(hap.Characteristic.SoftwareRevision, 'legacy');
+  let calls = [];
+  device.log = { warn: (...args) => calls.push(['warn', ...args]), success() {} };
+  await HomeKitDevice.message(device.uuid, HomeKitDevice.OFFLINE, () => calls.push(['offline', device.deviceData.online]));
+  await HomeKitDevice.message(device.uuid, HomeKitDevice.ONLINE, () => calls.push(['online', device.deviceData.online]));
+  await device.update({ online: false, serialNumber: 'METADATA-RENAMED' });
+  assert.equal(information.testCharacteristic(hap.Characteristic.SoftwareRevision), false);
+  assert.equal(device.deviceData.online, false);
+  assert.equal(calls.some((call) => call[0] === 'warn' && call[1].startsWith('Serial number')), true);
+  assert.deepEqual(calls.filter((call) => call[0] === 'offline'), [['offline', true]]);
+  await device.update({ online: true });
+  assert.deepEqual(calls.filter((call) => call[0] === 'online'), [['online', false]]);
+  device.accessory.services = [];
+  device.log.error = (...args) => calls.push(['error', ...args]);
+  await device.update({ model: 'New model' });
+  assert.equal(calls.some((call) => call[0] === 'error'), true);
+});
+
+test('setup rejects a HAP representation without AccessoryInformation before calling onAdd', async (context) => {
+  class IncompleteAccessory extends MockAccessory {
+    getService() {
+      return undefined;
+    }
+  }
+  let device = new HomeKitDevice(undefined, {
+    version: 2.7, hap, platformAccessory: IncompleteAccessory, registerPlatformAccessories() {},
+  }, deviceData('MISSING-INFORMATION'));
+  context.after(() => device.remove());
+  let calls = [];
+  device.log = { error: (...args) => calls.push(args) };
+  device.onAdd = () => assert.fail('Invalid representation reached onAdd');
+  assert.equal(await device.add(), false);
+  assert.equal(device.accessory, undefined);
+  assert.equal(device.historyService, undefined);
+  assert.equal(calls[0][0].startsWith('AccessoryInformation'), true);
+});
+
+test('setup fails cleanly when its only Matter representation cannot be registered after onAdd', async (context) => {
+  let api = {
+    version: 2.7, hap, isHapEnabled: () => false, isMatterEnabled: () => true,
+    matter: { registerPlatformAccessories() {} },
+  };
+  let device = new HomeKitDevice(undefined, api, deviceData('MATTER-REGISTRATION-UNAVAILABLE'));
+  context.after(() => device.remove());
+  device.onAdd = () => {
+    api.matter.registerPlatformAccessories = undefined;
+  };
+  assert.equal(await device.add({ matterDeviceType: { name: 'Switch' } }), false);
+  assert.equal(device.matterAccessory, undefined);
+});
+
+test('failed Matter metadata persistence restores an incomplete cached descriptor without adding properties', async (context) => {
+  let descriptor = { UUID: 'uuid:homebridge-example_MATTER-INCOMPLETE', deviceType: { name: 'Switch' } };
+  let writes = 0;
+  let device = new HomeKitDevice(descriptor, {
+    version: 2.7, hap, isHapEnabled: () => false, isMatterEnabled: () => true,
+    matter: {
+      updatePlatformAccessories() {
+        writes += 1;
+        throw new Error('Cache unavailable');
+      },
+    },
+  }, { ...deviceData('MATTER-INCOMPLETE'), setting: 1 }, ['setting']);
+  context.after(() => device.remove());
+  let original = structuredClone(descriptor);
+  await device.update({ description: 'Changed name' });
+  assert.equal(writes, 1);
+  assert.deepEqual(descriptor, original);
+  assert.equal(device.deviceData.description, 'Changed name');
+});
+
+test('standalone unpublish failures are logged during cancellation, late completion and removal', { timeout: 1000 }, async (context) => {
+  let entered = Promise.withResolvers();
+  let release = Promise.withResolvers();
+  let unpublishes = 0;
+  class FailingCleanupAccessory extends MockAccessory {
+    async publish() {
+      entered.resolve();
+      await release.promise;
+    }
+
+    unpublish() {
+      unpublishes += 1;
+      throw new Error('Unpublish failed');
+    }
+  }
+  let device = new HomeKitDevice(undefined, {
+    ...hap, Accessory: FailingCleanupAccessory, HAPLibraryVersion: () => 'test',
+  }, { ...deviceData('UNPUBLISH-FAILURES'), hkUsername: 'AA:BB:CC:DD:EE:FF', hkPairingCode: '123-45-678' });
+  context.after(async () => {
+    release.resolve();
+    await device.remove();
+  });
+  let warnings = [];
+  device.log = { warn: (...args) => warnings.push(args) };
+  let adding = device.add({ hapAccessoryName: 'Switch', hapCategory: 1 });
+  await entered.promise;
+  await device.shutdown();
+  assert.equal(await adding, undefined);
+  assert.equal(unpublishes, 1);
+  release.resolve();
+  await setImmediate();
+  assert.equal(unpublishes, 2);
+  await device.remove();
+  assert.equal(unpublishes, 3);
+  assert.equal(device.accessory, undefined);
+  assert.equal(warnings.filter((args) => args[0].startsWith('Failed to unpublish')).length, 3);
+});
+
+test('multiple outstanding requests to another device settle independently and release queue waits', async (context) => {
+  let first = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('PARALLEL-CALLER'));
+  let second = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('PARALLEL-TARGET'));
+  context.after(async () => {
+    await first.remove(); await second.remove();
+  });
+  second.onGet = (query) => query;
+  first.onGet = async () => {
+    assert.deepEqual(await Promise.all([second.get(1), second.get(2)]), [1, 2]);
+    return true;
+  };
+  assert.equal(await first.get(), true);
+  assert.equal(await second.get(3), 3);
+});
+
+test('invalid nested writes are ignored before state ownership and strict merged validation rejects corrupt state', async (context) => {
+  let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('INVALID-NESTED-WRITES'));
+  context.after(() => device.remove());
+  let calls = 0;
+  device.onSet = async () => {
+    await device.update({ manufacturer: '' });
+    await device.update(null);
+    calls += 1;
+  };
+  device.onUpdate = async () => {
+    await device.set(null);
+    calls += 1;
+  };
+  await device.set({ description: 'Set name' });
+  await device.update({ description: 'Updated name' });
+  assert.equal(calls, 2);
+  device.deviceData.manufacturer = '';
+  await device.update({ model: 'Rejected model' });
+  assert.equal(calls, 2);
+  assert.equal(device.deviceData.model, 'Switch');
 });

@@ -4,7 +4,7 @@
 
 `HomeKitDevice` is a shared base class for accessory implementations. It sits between application-owned device data and either the standalone HAP-NodeJS runtime or the Homebridge runtime, giving each device type a common lifecycle, message bus, accessory helper layer, timer system, and optional EveHome history integration. Homebridge may expose HAP, Matter, or both.
 
-**Version:** 2026.10.10
+**Version:** 2026.10.17
 **Primary module:** `HomeKitDevice.js`  
 **Consumers:** subclasses and host applications
 
@@ -130,7 +130,7 @@ When HAP UUID generation is available, the generated value is based on:
 PLUGIN_NAME + '_' + serialNumber.toUpperCase()
 ```
 
-The instance is then registered in a static registry:
+The constructor rejects an already-registered UUID before adding the instance to the static registry. This enforces one registered instance per device identity rather than silently replacing a live owner:
 
 ```js
 #deviceRegistry = Map<uuid, HomeKitDevice>
@@ -174,6 +174,7 @@ device.add({ hapAccessoryName, hapCategory, externalPublish, matterDeviceType, e
         ├─ dispatch HomeKitDevice.ADD
         │    ├─ subclass completes HAP services and Matter clusters/handlers
         │    └─ link/unlink EveHome characteristics
+        ├─ persist bridged HAP metadata after onAdd()
         ├─ register the completed Matter accessory descriptor
         ├─ dispatch forced HomeKitDevice.UPDATE
         ├─ publish external Homebridge or standalone HAP-NodeJS accessory
@@ -198,8 +199,9 @@ Lifecycle hooks are shared across protocols and are not called once per represen
 host application sends HomeKitDevice.UPDATE
         │
         ▼
-merge incoming partial data with stored deviceData
+validate supplied fields, then claim state ownership
         │
+        ├─ merge incoming partial data with stored deviceData
         ├─ validate merged data
         ├─ update AccessoryInformation when a HAP representation exists
         ├─ update changed Matter metadata when a Matter representation exists
@@ -209,7 +211,7 @@ merge incoming partial data with stored deviceData
         └─ clone merged data into this.deviceData
 ```
 
-The stored `deviceData` is a cloned snapshot, not a linked reference to caller-owned data.
+The stored `deviceData` is a cloned snapshot, not a linked reference to caller-owned data. UPDATE commits valid incoming state even when an update hook or its nested work fails; its promise still rejects with the failure. SET instead skips its automatic commit after a handler or nested-operation failure.
 
 ### Remove
 
@@ -266,6 +268,8 @@ The context becomes inactive on completion so asynchronous work created by a hoo
 
 ### Static Message API
 
+Private listener storage uses a Map keyed by UUID, containing a Map keyed by message type. Each type retains an ordered array of handler/context pairs; registration deduplicates those pairs, and REMOVE or SHUTDOWN deletes the device's listener Map.
+
 ```js
 HomeKitDevice.message(uuid, type, message, ...args)
 ```
@@ -303,7 +307,7 @@ Dispatch order is:
 
 For lifecycle hook methods, `HomeKitDevice` walks the prototype chain. This allows both a subclass and a parent class to implement `onUpdate()` without requiring each subclass to call `super.onUpdate()`.
 
-Handlers signal failure by throwing or rejecting. Each handler error is logged, remaining hooks and listeners run, and required REMOVE or SHUTDOWN cleanup completes before dispatch rejects with the first handler error. Errors in dispatch processing also reject. Instance messages, UUID delivery, and public wrappers forward the rejection; callers must use `try/catch` or promise rejection handling. GET results such as `false` remain valid successful values. SET ignores handler return values and skips its automatic data update after a handler failure.
+Handlers signal failure by throwing or rejecting. Each handler error is logged, remaining hooks and listeners run, and required REMOVE or SHUTDOWN cleanup completes before dispatch rejects with the first handler error. Errors in dispatch processing also reject. Instance messages, UUID delivery, and public wrappers forward the rejection; callers must use `try/catch` or promise rejection handling. GET results such as `false` remain valid successful values. Hook completion collects failures from its nested operations, including ignored submissions, before any parent commit. SET ignores handler return values and skips its automatic data update after a handler or nested-operation failure. UPDATE retains its existing commit-after-hook-failure behaviour.
 
 Timer execution catches dispatch rejections to retain cleanup and repeat scheduling. Global shutdown dispatches notifications independently and waits for all results to settle, so a stalled queue or logged rejection cannot delay cleanup of other devices.
 
@@ -325,7 +329,9 @@ Timer execution catches dispatch rejections to retain cleanup and repeat schedul
 | `OFFLINE` | device online state changed to false |
 | custom | routed to matching `on<Type>()` or `onMessage()` |
 
-Payload shape is not universal. `ADD`, `UPDATE`, `REMOVE`, and `SET` normalise missing payloads to `{}`. Other events may pass `undefined`, primitives, or structured objects.
+Payload shape is not universal. ADD and REMOVE normalise only missing or null payloads to `{}`. UPDATE and SET require plain objects and ignore invalid payloads. Other events may pass `undefined`, primitives, or structured objects.
+
+The `update()`, `set()`, and `history()` wrappers return their instance-message promise directly; they do not add async wrappers or validate before submission. UPDATE and SET validate in their dispatch branches before claiming state ownership or invoking hooks. HISTORY validates in its own branch before storage and hook invocation. Direct instance messages use the same validation. Invalid payloads resolve to `undefined` when dispatched, while queue admission can reject recursive or cyclic requests before payload validation.
 
 ---
 
@@ -339,7 +345,7 @@ If the snapshot changed, it calls:
 platform.updatePlatformAccessories([accessory])
 ```
 
-This allows subclasses to add or remove optional services and characteristics during lifecycle handling without manually notifying Homebridge, and persists changes to declared `context` fields.
+This allows subclasses to add or remove optional services and characteristics during lifecycle handling without manually notifying Homebridge, and persists changes to declared `context` fields. A failed cache write is retried once within the same dispatch; a second failure rejects the message. Live HAP mutations are not rolled back. Setup also persists bridged HAP metadata after onAdd(), because its initial metadata changes precede the ADD cache snapshot.
 
 The snapshot tracks the display name, AccessoryInformation values, service UUIDs and subtypes, characteristic UUIDs, and the namespace selected by `PERSISTENCE_NAMESPACE`. Operational characteristic values remain owned by subclass code and are not part of this cache comparison.
 
@@ -398,7 +404,7 @@ For HAP-NodeJS standalone usage, full data also requires:
 - `hkPairingCode`
 - `hkUsername`
 
-Partial updates are allowed. Incoming updates are merged over the stored snapshot before validation:
+Partial updates are allowed. UPDATE validates the supplied fields, merges them over the stored snapshot, then strictly validates the complete result. Fields supplied as `undefined` retain their stored value:
 
 ```js
 merged = {
@@ -407,7 +413,7 @@ merged = {
 }
 ```
 
-Change detection normalises nested objects before comparison so object key order does not cause false updates. Undefined values are converted to a placeholder before JSON comparison.
+Change detection uses Node.js's built-in deep strict equality to preserve value types, distinguish undefined from the string 'undefined', and ignore object key order while preserving array order. HAP cache snapshots clone context and characteristic values so later mutations cannot change the earlier snapshot.
 
 Declared persisted fields are copied into the namespace selected by `PERSISTENCE_NAMESPACE`. Constructor values override cached values; HAP is the first restore source for a missing field and Matter is the fallback. `UPDATE` keeps available HAP and Matter contexts synchronised without sharing object references. A failed Matter cache update restores its previous descriptor context so a later update can retry.
 
@@ -446,7 +452,7 @@ Timer entries track:
 
 The `running` flag prevents overlapping executions for the same timer. The `cancelled` flag lets in-flight async work finish without rescheduling a removed timer.
 
-All timers are cleared on `REMOVE` and `SHUTDOWN`.
+Creation and reset return `false` once REMOVE or SHUTDOWN starts, including during teardown hooks and resumed callbacks. Existing timers are cleared after teardown hooks finish. Delay-only and delayed repeating timers share the initial timeout path; interval-only timers start directly. All schedules share registry insertion, and delayed repetition checks cancellation and registry ownership before starting its interval.
 
 ---
 
@@ -469,10 +475,11 @@ await device.history(targetService, entry, options)
 `HomeKitDevice.HISTORY` processing:
 
 - validates the target service, entry, and options
-- adds a timestamp if one is missing
+- replaces a timestamp that is not a finite number with the current epoch time in seconds
 - compares with last history unless `options.force === true`
 - skips duplicate entries when no meaningful fields changed
-- calls `onHistory()` and registered history handlers
+- awaits the history writer with a finite numeric time gap when supplied
+- calls `onHistory()` and registered history handlers unless the writer returns `false` (legacy `undefined` results are treated as accepted)
 
 EveHome service linking is deferred until after `onAdd()` so subclasses can declare Eve options while building services.
 
@@ -502,5 +509,5 @@ When adding or refining subclasses:
 - Bridged HAP structure, metadata, and declared context changes during message handling are automatically pushed to Homebridge.
 - `SET` updates matching keys in `deviceData` after all hooks and registered handlers complete without throwing or rejecting. A trapped handler failure skips this automatic update.
 - `UPDATE` only invokes `onUpdate()` when data changed or `{ force: true }` is supplied.
-- `ONLINE` and `OFFLINE` are derived from `deviceData.online` transitions during AccessoryInformation updates.
+- `ONLINE` and `OFFLINE` are derived from `deviceData.online` transitions during shared metadata updates, including Matter-only devices.
 - `REMOVE` clears HomeKitDevice state aggressively so stale instances can be garbage collected.

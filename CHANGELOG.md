@@ -2,6 +2,30 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2026.10.17
+
+### Changed
+
+- Expanded regression tests to exercise every public method, including HAP helpers, names, timer contracts, setup summaries, Eve integration, and cleanup failures
+- Centralised UPDATE, SET, and HISTORY payload validation in dispatch so wrappers and direct messages follow the same rules
+- Consolidated timer scheduling while preserving one-shot, repeating, and delayed repeating behavior
+- Consolidated full and partial device-data validation while preserving required fields and standalone pairing checks
+- Consolidated message ownership checks, hook/listener invocation, and teardown timer cleanup while preserving message results and lifecycle ordering
+- Stored registered message listeners in nested Maps while preserving handler order, context binding, deduplication, and lifecycle dispatch
+
+### Fixed
+
+- Collected nested message failures before parent hook commits so rejected SET commands do not update stored values, while remaining handlers and cleanup still complete
+- Cleared UUID routing and registered listeners unconditionally during REMOVE, including listeners registered after SHUTDOWN
+- Rejected duplicate UUIDs during construction instead of replacing the existing registered device and losing its lifecycle ownership
+- Rejected timer creation and reset once shutdown or removal starts, including attempts from callbacks resuming after teardown
+- Allowed inherited static message calls on subclasses to use the shared device registry and listeners
+- Isolated listener dictionaries from inherited properties so reserved UUIDs and message types cannot modify Object.prototype or resolve unintended listeners
+- Persisted bridged HAP base metadata after onAdd completes even when setup makes no other cache changes
+- Detached values committed by SET from caller-owned objects and arrays so later caller mutations cannot change stored device data
+- Replaced non-numeric and non-finite history timestamps with the current epoch time so accepted records remain valid on reload
+- Distinguished undefined values from the string 'undefined' when detecting updates, filtering history, and persisting accessory context
+
 ## 2026.10.11
 
 ### Fixed

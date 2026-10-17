@@ -1,7 +1,10 @@
 # HomeKitDevice
 
-Base class for accessories using standalone HAP-NodeJS or Homebridge with HAP and optional Matter.
-Provides internal device tracking, metadata validation, lifecycle management, message routing, and optional EveHome-compatible history logging.
+**Version:** 2026.10.17
+
+`HomeKitDevice` is a shared base class for building accessories with Homebridge or standalone HAP-NodeJS. Homebridge accessories can expose HAP, Matter, or both through the same lifecycle and messaging API.
+
+Subclasses define services, characteristics, Matter clusters, and device behavior. The base class handles identity, lifecycle ordering, message routing, metadata, selected state persistence, timers, and optional Eve-compatible history.
 
 ---
 
@@ -38,6 +41,8 @@ let device = new MyDevice(accessory, api, deviceData, ['configuredName', 'inputS
 ```
 
 The optional `accessory` argument may be a Homebridge cached HAP accessory, a cached Matter accessory, or an array containing both. The `api` argument is the Homebridge platform API or a HAP-NodeJS API object. The `deviceData` object must contain the required fields listed below.
+
+Only one instance may be registered for a generated UUID. Construction throws if that UUID is already registered, preserving the existing instance. Remove the existing instance before creating another for the same device.
 
 The optional `persistedFields` array declares selected `deviceData` fields to store in Homebridge accessory context. It must contain unique, non-empty field names, and persisted values should be JSON-serialisable. The default location is `context.HomeKitDevice`, selected by static `PERSISTENCE_NAMESPACE`. Initial constructor data takes precedence, while absent declared fields are restored from cached HAP and then Matter context. Undeclared cached fields are ignored. New Homebridge representations receive initial values before registration or publication, and later changes are written during `UPDATE`. Bridged HAP and Matter use their respective cache APIs; standalone and externally published HAP do not provide durable context persistence. Subclasses may override `PERSISTENCE_NAMESPACE`, but should keep the value stable so existing cache data remains accessible.
 
@@ -249,10 +254,10 @@ provide Matter's accessory-level `getState(cluster, attribute)` callback directl
 
 Adds a structured entry to Eve-compatible history storage.
 
-- Automatically sets `entry.time` to current epoch if missing
+- Automatically sets `entry.time` to the current epoch time in seconds unless it is a finite number
 - Skips redundant entries unless `options.force === true`
 - Uses `options.timegap` (in seconds) to suppress entries too close together
-- Calls `.onHistory(target, entry, options)` if implemented by the subclass
+- Calls `.onHistory(target, entry, options)` and registered handlers after the history writer completes, unless it returns `false`
 
 ```js
 await this.history(this.myService, {
@@ -266,7 +271,7 @@ await this.history(this.myService, {
 
 ### `set(values, ...args)`
 
-Validates a plain-object payload and dispatches it through the `SET` route to `onSet()` and registered handlers. Matching existing keys in `deviceData` are updated only when every handler completes without throwing or rejecting. Success and invalid input resolve to `undefined`; dispatch failures reject with the original error. SET handler return values are ignored, so handlers must throw or reject to signal a failed write.
+Forwards a write request to dispatch, which validates a plain-object payload before calling `onSet()` and registered handlers. Matching existing keys in `deviceData` receive cloned values only when every handler and its nested messages complete without throwing or rejecting. Success and invalid input resolve to `undefined`; dispatch failures reject with the original error. SET handler return values are ignored, so handlers must throw or reject to signal a failed write.
 
 ### `get(values, ...args)`
 
@@ -289,7 +294,7 @@ For standalone HAP-NodeJS, a shutdown request immediately releases a pending pub
 
 Cancellation, late publication cleanup, and standalone REMOVE unpublish attempts execute in order. Shutdown hooks do not wait for stalled protocol teardown.
 
-All active timers and internal resources are automatically released during shutdown.
+Device timers, EventEmitter listeners, and registered message listeners are cleared during shutdown. Subclasses release their own resources in shutdown hooks.
 
 > **Note:**  
 > `.REMOVE` permanently unregisters the accessory from the platform.  
@@ -301,8 +306,8 @@ All active timers and internal resources are automatically released during shutd
 
 Applies a partial or full update to the device’s internal state.
 
-- Merges incoming data with existing `deviceData`
-- Performs validation on supplied fields
+- Validates supplied fields in queued dispatch
+- Merges incoming data with existing `deviceData` and validates the complete record
 - Triggers `.onUpdate(deviceData)` only if changes are detected  
   (or when `{ force: true }` is passed)
 - Automatically updates shared HAP and Matter metadata
@@ -327,9 +332,11 @@ await HomeKitDevice.message(uuid, HomeKitDevice.SET, value);
 
 Known message types route to their matching lifecycle hook, such as `SET` to `onSet(message)`. Custom types fall back to `onMessage(type, message)`.
 
+`update()`, `set()`, and `history()` return the dispatch promise directly. Their payload validation runs inside the queued dispatcher, so wrapper calls and direct instance messages use the same rules. Invalid payloads resolve to `undefined` when dispatch reaches them; queue admission errors, such as recursive calls, can still reject first.
+
 All externally submitted messages, including GET, TIMER, HISTORY, and custom types, execute in submission order for each device, including their hooks, state commits, and cache writes. The complete `add()` operation holds one queue slot through registration, its initial UPDATE, and publication. Each UPDATE merges against the state committed by preceding operations. A failed operation rejects its caller without blocking later work. After REMOVE or SHUTDOWN begins, subsequent external messages are ignored; REMOVE can still release protocol resources after SHUTDOWN.
 
-Nested messages on the same device use the owning operation regardless of message type. Sibling submissions from a hook are ordered, and the owner waits for all descendant messages before releasing its queue slot, including history submitted without awaiting its promise. `history()` retains entry validation, duplicate filtering, storage and `onHistory` handlers. Nested failures reject the owning operation, even when its hook did not await the child.
+Nested messages on the same device use the owning operation regardless of message type. Sibling submissions from a hook are ordered, and the owner waits for all descendant messages before releasing its queue slot, including history submitted without awaiting its promise. The HISTORY route retains entry validation, duplicate filtering, storage and `onHistory` handlers. Nested failures reject the owning operation, even when its hook did not await the child.
 
 State and resource handlers own their unfinished commit or cleanup. A nested handler cannot claim overlapping ownership; ordinary handlers can submit state changes without message-specific queue rules. Recursive use of a message type already active on that device also rejects. A SET handler that refreshes device state must return before its UPDATE is submitted. HomeKitDevice timer invocations start independently of inherited hook contexts. Different devices have independent ordering. Internal setup dispatch and online/offline notifications execute within their enclosing queue slot. Outstanding submissions from hooks to other devices are tracked conservatively as potential waits; a submission that closes a cycle rejects instead of deadlocking the queues.
 
@@ -350,7 +357,8 @@ Internal timers catch and log rejections while preserving timer cleanup and repe
 > **Important:**  
 > The `message` payload is not guaranteed to be an object.
 >
-> - Lifecycle events (`ADD`, `UPDATE`, `SET`, `REMOVE`) will normalise `message` to an object.
+> - UPDATE and SET require plain-object payloads; dispatch ignores invalid payloads before calling their hooks.
+> - ADD and REMOVE normalise only missing or null payloads to `{}`.
 > - Other messages (e.g. `ONLINE`, `OFFLINE`, custom events) may pass `undefined`, primitives, or structured objects.
 >
 > Handlers should not assume `message` is always an object:
@@ -384,14 +392,14 @@ Timers may either:
 - Execute a direct callback (if provided)
 - Dispatch a `HomeKitDevice.TIMER` lifecycle message (if no callback is provided)
 
-> **Note:** Timer callbacks execute non-blocking. Even if a callback or message handler takes time to complete, it won't delay the next interval firing.
+Timer callbacks execute asynchronously. Interval ticks are skipped while the previous invocation of that timer is still running, so executions do not overlap.
 
 All timers are automatically cleaned up during `.SHUTDOWN` after shutdown hooks complete.
 Timers are device-scoped and are also released during `.REMOVE`.
 
 ### `addTimer(timerHandle, options?, callback?)`
 
-Registers a timer.
+Registers a timer and returns `true` when it exists after the call. Invalid handles or schedules return `false`. An existing timer is retained unless `reset: true` is supplied. Once REMOVE or SHUTDOWN begins, creation and reset return `false`, including calls from teardown hooks or callbacks resuming afterward.
 
 Supported `options`:
 
@@ -516,5 +524,23 @@ Public static configuration and message constants include:
 Each subclass may define a static `VERSION` string for visibility in logs:
 
 ```js
-static VERSION = '2026.10.10';
+static VERSION = '2026.10.17';
 ```
+
+---
+
+## Tests
+
+Run the module suite with Node.js's built-in test runner; no test dependencies need to be installed:
+
+```sh
+node --test HomeKitDevice.test.js
+```
+
+To measure coverage:
+
+```sh
+node --experimental-test-coverage --test HomeKitDevice.test.js
+```
+
+The suite exercises every public method, including messaging, lifecycle ordering, persistence, HAP helpers, Matter clusters, timers, setup logging, names, and Eve history. Tests use isolated runtime mocks; they do not start live Homebridge, HAP, or Matter servers. Public-method coverage does not imply every internal branch is covered. Consumer-specific Nest tests live in the consuming project.

@@ -1,6 +1,7 @@
-// Configure JavaScript syntax, correctness, and formatting checks for this project.
+// Configure lint rules and Node.js globals for the project's ES modules.
 import stylistic from '@stylistic/eslint-plugin';
 import parserTs from '@typescript-eslint/parser';
+import globals from 'globals';
 
 export default [{
   ignores: ['dist'],
@@ -11,10 +12,7 @@ export default [{
     parser: parserTs,
     ecmaVersion: 'latest',
     sourceType: 'module',
-    globals: {
-      AbortController: 'readonly',
-      structuredClone: 'readonly',
-    },
+    globals: globals.nodeBuiltin,
   },
   rules: {
     '@stylistic/semi': ['warn'],
@@ -28,6 +26,13 @@ export default [{
     'prefer-arrow-callback': ['warn'],
     '@stylistic/max-len': ['warn', 140],
     'no-console': ['warn'],
+    'no-restricted-syntax': [
+      'error',
+      {
+        selector: 'TemplateLiteral',
+        message: 'Use explicit string concatenation instead of template-literal strings.',
+      },
+    ],
     '@stylistic/no-non-null-assertion': ['off'],
     '@stylistic/comma-spacing': ['error'],
     '@stylistic/no-multi-spaces': ['warn', {ignoreEOLComments: true}],

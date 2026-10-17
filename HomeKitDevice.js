@@ -102,6 +102,7 @@
 import EventEmitter from 'node:events';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { setInterval, setTimeout, clearInterval, clearTimeout } from 'node:timers';
+import { isDeepStrictEqual } from 'node:util';
 import process from 'node:process';
 
 // Define constants
@@ -220,7 +221,7 @@ export default class HomeKitDevice extends EventEmitter {
   static EVEHOME = undefined; // HomeKitHistory object
   static LOGGER = undefined; // Logging object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.10.11'; // Code version
+  static VERSION = '2026.10.17'; // Code version
 
   // Persistent context namespace for this class. Subclasses may override to isolate their own context.
   static PERSISTENCE_NAMESPACE = 'HomeKitDevice';
@@ -230,7 +231,7 @@ export default class HomeKitDevice extends EventEmitter {
   static HAP_NODEJS = 'hap-nodejs';
 
   // Global internal device and listener registry
-  static #listeners = {};
+  static #listeners = new Map(); // UUID -> message type -> ordered handler/context pairs
   static #deviceRegistry = new Map();
   static #shutdownRegistered = new WeakSet();
   static #lifecycleContext = new AsyncLocalStorage(); // Track active device dispatches without retaining per-device storage instances
@@ -264,6 +265,7 @@ export default class HomeKitDevice extends EventEmitter {
    * @param {HomeKitDeviceData} deviceData Initial device data.
    * @param {string[]} persistedFields Device data fields persisted in accessory context.
    * @throws {TypeError} When device data or persisted fields fail validation.
+   * @throws {Error} When another instance is already registered with the generated UUID.
    */
   constructor(accessory = undefined, api = undefined, deviceData = {}, persistedFields = []) {
     super(); // Setup event emitter for our class ONLY
@@ -342,7 +344,10 @@ export default class HomeKitDevice extends EventEmitter {
     // and Matter representations, so generation must succeed before registration.
     this.#uuid = HomeKitDevice.generateUUID(HomeKitDevice.PLUGIN_NAME, api, this.deviceData.serialNumber);
 
-    // Register this device instance in the static device registry
+    // One registered instance owns this UUID's routing and protocol lifecycle.
+    if (HomeKitDevice.#deviceRegistry.has(this.#uuid) === true) {
+      throw new Error('Device UUID is already registered: ' + this.#uuid);
+    }
     HomeKitDevice.#deviceRegistry.set(this.#uuid, this);
 
     // See if we were passed an existing accessory object or array of accessory objects.
@@ -563,6 +568,10 @@ export default class HomeKitDevice extends EventEmitter {
       // Internal setup dispatches already own the queue slot and must not re-enqueue.
       try {
         await this.#dispatchMessage(HomeKitDevice.ADD);
+        // Persist base metadata updated before the ADD cache snapshot.
+        if (this.accessory?._associatedPlatform !== undefined) {
+          await this.#platform?.updatePlatformAccessories?.([this.accessory]);
+        }
       } catch (error) {
         // These may be cached accessories supplied by Homebridge. Do not
         // unregister them as setup rollback; permanent removal belongs to remove().
@@ -689,15 +698,17 @@ export default class HomeKitDevice extends EventEmitter {
         }
       }
 
-      this?.log?.success?.(...(typeof options?.hapAccessoryName === 'string' && options.hapAccessoryName !== '' ? ['Setup %s as "%s"', options.hapAccessoryName, this.deviceData.description] : ['Setup "%s"', this.deviceData.description]));
+      this?.log?.success?.(
+        ...(typeof options?.hapAccessoryName === 'string' && options.hapAccessoryName !== ''
+          ? ['Setup %s as "%s"', options.hapAccessoryName, this.deviceData.description]
+          : ['Setup "%s"', this.deviceData.description]),
+      );
       this.#postSetupDetails.forEach((entry) => {
         let level =
-          typeof entry === 'object' &&
-          Object.hasOwn(LOG_LEVELS, entry?.level?.toUpperCase?.()) &&
-          typeof this?.log?.[LOG_LEVELS[entry.level.toUpperCase()]] === 'function'
-            ? LOG_LEVELS[entry.level.toUpperCase()]
+          typeof this?.log?.[entry.level] === 'function'
+            ? entry.level
             : LOG_LEVELS.INFO;
-        this?.log?.[level]?.('  += ' + (entry?.message ?? entry), ...(Array.isArray(entry?.args) ? entry.args : []));
+        this?.log?.[level]?.('  += ' + entry.message, ...(entry.args ?? []));
       });
 
       this.#postSetupDetails = []; // Don't need these anymore
@@ -757,15 +768,6 @@ export default class HomeKitDevice extends EventEmitter {
    * @throws {*} When message dispatch throws or a handler rejects.
    */
   update(deviceData, ...args) {
-    if (
-      deviceData === null || // Must not be null
-      typeof deviceData !== 'object' || // Must be an object
-      deviceData.constructor !== Object || // Must be a plain JSON object
-      this.#validDeviceData(deviceData) === false // Partial validation
-    ) {
-      return Promise.resolve();
-    }
-
     // Trigger registered handlers (onUpdate + listeners)
     return this.message(HomeKitDevice.UPDATE, deviceData, ...args);
   }
@@ -773,7 +775,7 @@ export default class HomeKitDevice extends EventEmitter {
   /**
    * Store an Eve-compatible history entry and notify hooks after the service accepts it.
    *
-   * A missing or non-finite `entry.time` is replaced with the current epoch time in seconds.
+   * An `entry.time` that is not a finite number is replaced with the current epoch time in seconds.
    *
    * @param {object} target HAP service associated with the history entry; it must expose a UUID.
    * @param {Object<string, *>} entry History values to store.
@@ -782,27 +784,6 @@ export default class HomeKitDevice extends EventEmitter {
    * @throws {*} When history processing or a handler throws or rejects.
    */
   history(target, entry, options = {}) {
-    if (
-      typeof this.historyService !== 'object' ||
-      this.historyService === null ||
-      typeof this.historyService.addHistory !== 'function' ||
-      // entry must be a plain JSON object
-      entry === null ||
-      typeof entry !== 'object' ||
-      entry.constructor !== Object ||
-      // target must be a valid HomeKit service object
-      typeof target !== 'object' ||
-      target === null ||
-      typeof target.UUID !== 'string' ||
-      target.UUID === '' ||
-      // options must be a plain JSON object
-      options === null ||
-      typeof options !== 'object' ||
-      options.constructor !== Object
-    ) {
-      return Promise.resolve();
-    }
-
     // Trigger registered handlers (onHistory + listeners)
     return this.message(HomeKitDevice.HISTORY, target, entry, options);
   }
@@ -812,18 +793,10 @@ export default class HomeKitDevice extends EventEmitter {
    *
    * @param {Object<string, *>} values Values requested by the caller.
    * @param {...*} args Additional values forwarded to set hooks and registered handlers.
-   * @returns {Promise<void>} Resolves after SET dispatch, or immediately for invalid input.
+   * @returns {Promise<void>} Resolves after SET dispatch; invalid payloads are ignored.
    * @throws {*} When a SET handler or message dispatch throws or rejects.
    */
   set(values, ...args) {
-    if (
-      values === null || // Must not be null
-      typeof values !== 'object' || // Must be an object
-      values.constructor !== Object // Must be a plain JSON object
-    ) {
-      return Promise.resolve();
-    }
-
     // Trigger registered handlers (onSet + listeners)
     return this.message(HomeKitDevice.SET, values, ...args);
   }
@@ -868,12 +841,14 @@ export default class HomeKitDevice extends EventEmitter {
     if (typeof message === 'function' || (typeof message === 'object' && message !== null && message?.constructor !== Object)) {
       // Listener storage is created lazily because most UUID/type pairs have no
       // externally registered handlers.
-      if (this.#listeners?.[uuid] === undefined) {
-        this.#listeners[uuid] = {};
+      if (HomeKitDevice.#listeners.has(uuid) === false) {
+        HomeKitDevice.#listeners.set(uuid, new Map());
       }
-      if (Array.isArray(this.#listeners[uuid][type]) === false) {
-        this.#listeners[uuid][type] = [];
+      let listeners = HomeKitDevice.#listeners.get(uuid);
+      if (listeners.has(type) === false) {
+        listeners.set(type, []);
       }
+      let handlers = listeners.get(type);
 
       let handler, context;
 
@@ -888,8 +863,8 @@ export default class HomeKitDevice extends EventEmitter {
       // Avoid invoking the same handler/context pair more than once when a
       // host application discovers or registers the same device repeatedly.
       if (handler !== undefined) {
-        if (this.#listeners?.[uuid]?.[type]?.find?.((h) => h.handler === handler && h.context === context) === undefined) {
-          this.#listeners[uuid][type].push({ handler, context });
+        if (handlers.find((h) => h.handler === handler && h.context === context) === undefined) {
+          handlers.push({ handler, context });
         }
       }
 
@@ -897,7 +872,7 @@ export default class HomeKitDevice extends EventEmitter {
     }
 
     // Delivery is a no op when the UUID has no currently registered instance.
-    return this.#deviceRegistry.get(uuid)?.message?.(type, message, ...args);
+    return HomeKitDevice.#deviceRegistry.get(uuid)?.message?.(type, message, ...args);
   }
 
   /**
@@ -1022,7 +997,7 @@ export default class HomeKitDevice extends EventEmitter {
             // hooks, descendants, and lifecycle cleanup have all settled.
             if (this.#lifecycleState === HomeKitDevice.SHUTDOWN && HomeKitDevice.#deviceRegistry.get(this.#uuid) === this) {
               HomeKitDevice.#deviceRegistry.delete(this.#uuid);
-              delete HomeKitDevice.#listeners[this.#uuid];
+              HomeKitDevice.#listeners.delete(this.#uuid);
             }
           }
         }
@@ -1044,6 +1019,9 @@ export default class HomeKitDevice extends EventEmitter {
     if (owner !== undefined) {
       owner.tail = settled;
       root.children.push(pending);
+      if (owner !== root) {
+        owner.children.push(pending);
+      }
     } else {
       this.#lifecycleTail = settled;
     }
@@ -1073,7 +1051,7 @@ export default class HomeKitDevice extends EventEmitter {
     }
     if (
       (message === undefined || message === null) &&
-      (type === HomeKitDevice.ADD || type === HomeKitDevice.UPDATE || type === HomeKitDevice.REMOVE || type === HomeKitDevice.SET)
+      (type === HomeKitDevice.ADD || type === HomeKitDevice.REMOVE)
     ) {
       // Normalise undefined or null message to empty object only for lifecycle types that expect object payloads
       message = {};
@@ -1086,70 +1064,72 @@ export default class HomeKitDevice extends EventEmitter {
     let failed = false;
     let failure;
     let handled = false;
-    let handler =
-      Array.isArray(HomeKitDevice.#listeners?.[this.#uuid]?.[type]) === true
-        ? HomeKitDevice.#listeners[this.#uuid][type]
-        : HomeKitDevice.#listeners?.[this.#uuid]?.[type] !== undefined
-          ? [HomeKitDevice.#listeners[this.#uuid][type]]
-          : [];
+    let handler = HomeKitDevice.#listeners.get(this.#uuid)?.get(type) ?? [];
     try {
-      // Dynamically extract the handler method name from the type string (e.g., "HomeKitDevice.onAdd" becomes "onAdd")
-      // This allows consistent routing to instance methods like onAdd, onSet, onUpdate, etc.
+      // Resolve the named hook, such as HomeKitDevice.onAdd -> onAdd.
       let methodName = typeof type === 'string' ? type.match(/\.?(on[A-Z][a-zA-Z0-9]*)$/)?.[1] : undefined;
 
-      // Invoke one hook source with error isolation. Named lifecycle hooks walk the
-      // prototype chain so a subclass and its base classes can all participate.
-      const callLifecycleHook = async (methodOrHandlers, ...params) => {
-        let results = [];
-        // Deduplicate the same function/context pair within this invocation while
-        // retaining distinct overrides declared at different prototype levels.
-        let called = [];
-        let hooks =
-          typeof methodOrHandlers === 'string'
-            ? [{ handler: methodOrHandlers, context: this }]
-            : Array.isArray(methodOrHandlers) === true
-              ? methodOrHandlers[1] || []
-              : [];
+      // Run named hooks before registered listeners, retaining separate results and
+      // deduplication scopes so precedence and inheritance behaviour stay intact.
+      const callLifecycleHooks = async (hookName, params, handlerLabel = 'handler for ' + type) => {
+        let result = { call: undefined, handler: undefined };
+        for (let [source, hooks] of [
+          ['call', typeof hookName === 'string' ? [{ handler: hookName, context: this }] : []],
+          ['handler', handler],
+        ]) {
+          let results = [];
+          let called = [];
+          for (let item of hooks) {
+            let context = item?.context ?? this;
+            let method = item?.handler;
+            let current = context;
+            let seen = new Set();
+            let label =
+              typeof method === 'string'
+                ? (context?.constructor?.name ?? 'handler') + '.' + method
+                : 'registered ' + handlerLabel;
 
-        for (let item of hooks) {
-          let context = item?.context ?? this;
-          let method = item?.handler;
-          let current = context;
-          let seen = new Set();
-          let label =
-            typeof method === 'string'
-              ? (context?.constructor?.name ?? 'handler') + '.' + method
-              : 'registered ' + methodOrHandlers[0];
-
-          // Resolve named methods at each level after the preceding hook completes.
-          // Every override retains the original receiver, including listener objects.
-          while (current !== null && typeof current === 'object' && seen.has(current) === false) {
-            seen.add(current);
-            let fn = typeof method === 'string' ? current[method] : method;
-            if (typeof fn === 'function' && called.some((call) => call.fn === fn && call.context === context) === false) {
-              called.push({ fn, context });
-              try {
-                results.push(await fn.apply(context, params));
-              } catch (error) {
-                if (failed === false) {
-                  failure = error;
+            // Resolve named methods at each level after the preceding hook completes.
+            // Every override retains the original receiver, including listener objects.
+            while (current !== null && typeof current === 'object' && seen.has(current) === false) {
+              seen.add(current);
+              let fn = typeof method === 'string' ? current[method] : method;
+              if (typeof fn === 'function' && called.some((call) => call.fn === fn && call.context === context) === false) {
+                called.push({ fn, context });
+                try {
+                  results.push(await fn.apply(context, params));
+                } catch (error) {
+                  // Keep the first error, but continue with the remaining handlers.
+                  if (failed === false) {
+                    failure = error;
+                  }
+                  failed = true;
+                  this?.log?.warn?.('Error in %s(): %s', label, String(error?.stack || error));
+                } finally {
+                  // Finish work owned by this hook before the next hook, commit or cleanup.
+                  let lifecycle = HomeKitDevice.#lifecycleContext.getStore();
+                  await lifecycle?.tail;
+                  // Include nested messages the hook started without awaiting them.
+                  while (lifecycle.children.length > 0) {
+                    for (let child of await Promise.allSettled(lifecycle.children.splice(0))) {
+                      if (child.status === 'rejected' && failed === false) {
+                        failed = true;
+                        failure = child.reason;
+                      }
+                    }
+                  }
                 }
-                failed = true;
-                this?.log?.warn?.('Error in %s(): %s', label, String(error?.stack || error));
-              } finally {
-                // Finish work owned by this hook before the next hook, commit or cleanup.
-                await HomeKitDevice.#lifecycleContext.getStore()?.tail;
               }
+
+              // Direct functions run once; named hooks continue through the live chain.
+              current = typeof method === 'string' ? Object.getPrototypeOf(current) : undefined;
             }
-
-            // Direct functions run once; named hooks continue through the live chain.
-            current = typeof method === 'string' ? Object.getPrototypeOf(current) : undefined;
           }
-        }
 
-        // An empty hook list contributes no result, preserving scalar responses
-        // from the other source. Multiple hooks retain their ordered result array.
-        return results.length === 0 ? undefined : results.length === 1 ? results[0] : results;
+          // Preserve scalar results and the ordered array returned by multiple hooks.
+          result[source] = results.length === 0 ? undefined : results.length === 1 ? results[0] : results;
+        }
+        return result;
       };
 
       // Snapshot the bridged HAP structure, metadata, and owned context that Homebridge persists
@@ -1158,14 +1138,13 @@ export default class HomeKitDevice extends EventEmitter {
         let information = accessory?.getService?.(this.hap.Service.AccessoryInformation);
         return {
           displayName: accessory?.displayName,
-          context: HomeKitDevice.#normaliseForCompare(
-            accessory?.context?.[this.constructor.PERSISTENCE_NAMESPACE],
-          ),
+          // Retain independent values so hook mutations cannot alter the before snapshot.
+          context: structuredClone(accessory?.context?.[this.constructor.PERSISTENCE_NAMESPACE]),
           information: Array.isArray(information?.characteristics)
             ? information.characteristics
                 .map((characteristic) => ({
                   UUID: characteristic.UUID,
-                  value: HomeKitDevice.#normaliseForCompare(characteristic.value),
+                  value: structuredClone(characteristic.value),
                 }))
                 .sort((a, b) => a.UUID.localeCompare(b.UUID))
             : [],
@@ -1196,19 +1175,44 @@ export default class HomeKitDevice extends EventEmitter {
           ? snapshotAccessoryCache(this.accessory)
           : [];
 
-      // Handle built-in types with special behavior
-      if (type === HomeKitDevice.ADD || type === HomeKitDevice.REMOVE || type === HomeKitDevice.SET) {
+      // These lifecycle routes run hooks before their setup, cleanup, or SET commit.
+      if ([HomeKitDevice.ADD, HomeKitDevice.REMOVE, HomeKitDevice.SET, HomeKitDevice.SHUTDOWN].includes(type) === true) {
+        if (
+          type === HomeKitDevice.SET &&
+          (message === null || typeof message !== 'object' || message.constructor !== Object)
+        ) {
+          return;
+        }
+
+        // Reject overlapping state ownership only after validating the payload.
         if (context.stateOwner?.active === true && context.stateOwner !== context) {
           throw new Error('Reentrant lifecycle message "' + type + '" on the same device');
         }
         context.stateOwner = context;
-        if (type === HomeKitDevice.REMOVE) {
+
+        // Mark teardown before hooks so addTimer() rejects new timers and resets.
+        if (type === HomeKitDevice.REMOVE || type === HomeKitDevice.SHUTDOWN) {
           this.#lifecycleState = type;
         }
-        // Call the dynamic on<Type> method (ie. onAdd, onRemove, onSet) and after
-        // Any static handler registered via HomeKitDevice.message(uuid, type, handler)
-        await callLifecycleHook(methodName, message, ...args);
-        await callLifecycleHook(['handler for ' + type, handler], message, ...args);
+        // Shutdown hooks only run while the device is still registered.
+        let notify = type !== HomeKitDevice.SHUTDOWN || HomeKitDevice.#deviceRegistry.has(this.#uuid);
+        if (notify === true) {
+          if (type === HomeKitDevice.SHUTDOWN) {
+            this?.log?.debug?.('Notifying device "%s" of shutdown', this.deviceData.description);
+          }
+          await callLifecycleHooks(methodName, [message, ...args]);
+          if (type === HomeKitDevice.REMOVE) {
+            this?.log?.warn?.('Notified to remove device "%s"', this.deviceData.description);
+          }
+          if (type === HomeKitDevice.REMOVE || type === HomeKitDevice.SHUTDOWN) {
+            // Hooks finish before timers and instance listeners are cleared.
+            // Snapshot handles because removeTimer() updates the Map.
+            for (let timerHandle of [...this.#timers.keys()]) {
+              this.removeTimer(timerHandle);
+            }
+            this?.removeAllListeners?.();
+          }
+        }
         handled = true;
 
         // Special setup for ADD
@@ -1244,18 +1248,13 @@ export default class HomeKitDevice extends EventEmitter {
 
         // Special teardown for REMOVE
         if (type === HomeKitDevice.REMOVE) {
-          this?.log?.warn?.('Notified to remove device "%s"', this.deviceData.description);
-
-          // Clear any internal timers we have running for this device
-          this.#clearTimers();
-
-          // Cleanup all listeners and references to allow for garbage collection of this instance
-          this?.removeAllListeners?.();
+          // Remove this device's registry entry and registered message listeners.
           HomeKitDevice.#deviceRegistry.delete(this.#uuid);
-          delete HomeKitDevice.#listeners[this.#uuid];
+          HomeKitDevice.#listeners.delete(this.#uuid);
 
           try {
             try {
+              // Unregister protocol representations after instance cleanup.
               if (
                 this.accessory !== undefined &&
                 typeof this.#platform?.unregisterPlatformAccessories === 'function' &&
@@ -1307,62 +1306,52 @@ export default class HomeKitDevice extends EventEmitter {
         // Apply requested values only after every SET hook and listener completes
         // without throwing, so a rejected device command cannot appear accepted.
         if (type === HomeKitDevice.SET) {
-          if (failed === false && message !== null && typeof message === 'object' && message.constructor === Object) {
+          if (failed === false) {
             Object.entries(message).forEach(([key, value]) => {
               if (this.deviceData?.[key] !== undefined) {
-                this.deviceData[key] = value;
+                this.deviceData[key] = structuredClone(value);
               }
             });
           }
         }
-      } else if (type === HomeKitDevice.SHUTDOWN) {
-        if (context.stateOwner?.active === true && context.stateOwner !== context) {
-          throw new Error('Reentrant lifecycle message "' + type + '" on the same device');
-        }
-        context.stateOwner = context;
-        this.#lifecycleState = type;
-        if (HomeKitDevice.#deviceRegistry.has(this.#uuid) === true) {
-          this?.log?.debug?.('Notifying device "%s" of shutdown', this.deviceData.description);
-
-          // Now run shutdown hooks + cleanup
-          await callLifecycleHook(methodName, message, ...args);
-          await callLifecycleHook(['handler for ' + type, handler], message, ...args);
-
-          // Clear any internal timers we have running for this device
-          this.#clearTimers();
-          this?.removeAllListeners?.();
-        }
-        handled = true;
       } else if (type === HomeKitDevice.UPDATE) {
+        if (
+          message === null ||
+          typeof message !== 'object' ||
+          message.constructor !== Object ||
+          this.#validDeviceData(message) === false
+        ) {
+          return;
+        }
+
+        // Reject overlapping state ownership only after validating the payload.
         if (context.stateOwner?.active === true && context.stateOwner !== context) {
           throw new Error('Reentrant lifecycle message "' + type + '" on the same device');
         }
         context.stateOwner = context;
-        if (message !== null && typeof message === 'object' && message.constructor === Object) {
-          let { merged, changed } = this.#mergeDeviceData(message);
 
-          if (this.#validDeviceData(merged, true) !== true) {
-            handled = true;
-            return;
-          }
+        let { merged, changed } = this.#mergeDeviceData(message);
 
-          await this.#updateAccessoryMetadata(merged);
-
-          if (changed === true || (typeof args?.[0] === 'object' && args?.[0]?.force === true)) {
-            // Call the onUpdate method and after any static handler registered via HomeKitDevice.message(uuid, type, handler)
-            await callLifecycleHook('onUpdate', merged, ...args);
-            await callLifecycleHook(['handler for UPDATE', handler], merged, ...args);
-          }
-
-          // Update our internally stored data with the new data
-          this.deviceData = structuredClone(merged);
-
+        if (this.#validDeviceData(merged, true) !== true) {
+          return;
         }
+
+        // Metadata stays in sync even when no update hook needs to run.
+        await this.#updateAccessoryMetadata(merged);
+
+        if (changed === true || (typeof args?.[0] === 'object' && args?.[0]?.force === true)) {
+          await callLifecycleHooks('onUpdate', [merged, ...args], 'handler for UPDATE');
+        }
+
+        // UPDATE retains incoming state even when a hook reports a failure.
+        this.deviceData = structuredClone(merged);
+
         handled = true;
       } else if (type === HomeKitDevice.HISTORY) {
         let [target, entry, options = {}] = [message, args[0], args[1]];
         let skipHistory = false;
 
+        // Validate history payloads here for both wrapper and direct message calls.
         if (
           this.historyService !== null &&
           typeof this.historyService === 'object' &&
@@ -1379,13 +1368,13 @@ export default class HomeKitDevice extends EventEmitter {
           options.constructor === Object
         ) {
           // History expects epoch seconds. Mutate the caller's entry only when it
-          // did not provide a finite timestamp so every accepted entry is dated.
-          if (Number.isFinite(Number(entry?.time)) === false) {
+          // did not provide a finite number; coercion can leave invalid types in persisted history.
+          if (Number.isFinite(entry?.time) === false) {
             entry.time = Math.floor(Date.now() / 1000);
           }
 
           // Unless forced, compare all payload fields except time with the last
-          // entry. Nested values are normalised to avoid key order false positives.
+          // entry. Deep comparison preserves nested value types and ignores object key order.
           if (options?.force !== true && typeof this.historyService?.lastHistory === 'function') {
             let last = this.historyService.lastHistory(target);
             if (typeof last === 'object') {
@@ -1396,8 +1385,7 @@ export default class HomeKitDevice extends EventEmitter {
                 let value = entry[key];
                 let lastValue = last[key];
                 return value !== null && typeof value === 'object'
-                  ? JSON.stringify(HomeKitDevice.#normaliseForCompare(value)) !==
-                      JSON.stringify(HomeKitDevice.#normaliseForCompare(lastValue))
+                  ? isDeepStrictEqual(value, lastValue) === false
                   : value !== lastValue;
               });
               if (changed === false) {
@@ -1417,8 +1405,7 @@ export default class HomeKitDevice extends EventEmitter {
 
             if (historyResult !== false) {
               // Notify hooks only after the entry was accepted by the history service.
-              await callLifecycleHook('onHistory', target, entry, options);
-              await callLifecycleHook(['handler for HISTORY', handler], target, entry, options);
+              await callLifecycleHooks('onHistory', [target, entry, options], 'handler for HISTORY');
             }
           }
         }
@@ -1426,21 +1413,19 @@ export default class HomeKitDevice extends EventEmitter {
         handled = true;
       }
 
-      // Dynamically handle any remaining on<Type> method (e.g., onGet etc that we haven’t handled yet)
-      // Any static handler registered via HomeKitDevice.message(uuid, type, handler)
-      if (handled === false && (typeof this?.[methodName] === 'function' || (Array.isArray(handler) === true && handler.length > 0))) {
-        // Use string method name so we get inheritance merging;
-        result.call = await callLifecycleHook(methodName, message, ...args);
-        result.handler = await callLifecycleHook(['handler for ' + type, handler], message, ...args);
+      // Route GET and custom messages through the same hook/listener sequence.
+      if (handled === false && (typeof this?.[methodName] === 'function' || handler.length > 0)) {
+        result = await callLifecycleHooks(methodName, [message, ...args]);
         handled = true;
       }
 
-      // Call generic handler if present and we haven't handled the message yet
+      // Fall back to onMessage only when no named hook or registered listener matched.
       if (handled === false && typeof this?.onMessage === 'function') {
-        result.call = await callLifecycleHook('onMessage', type, message, ...args);
+        result = await callLifecycleHooks('onMessage', [type, message, ...args]);
         handled = true;
       }
 
+      // Persist bridged HAP changes made by hooks or registered listeners.
       if (
         this.backend === HomeKitDevice.HOMEBRIDGE &&
         this.accessory !== undefined &&
@@ -1448,7 +1433,7 @@ export default class HomeKitDevice extends EventEmitter {
         typeof this.#platform?.updatePlatformAccessories === 'function'
       ) {
         let updatedAccessory = snapshotAccessoryCache(this.accessory);
-        if (JSON.stringify(originalAccessory) !== JSON.stringify(updatedAccessory)) {
+        if (isDeepStrictEqual(originalAccessory, updatedAccessory) === false) {
           try {
             await this.#platform.updatePlatformAccessories([this.accessory]);
           } catch (error) {
@@ -1461,7 +1446,7 @@ export default class HomeKitDevice extends EventEmitter {
       }
 
       // No handler at all, including onMessage().
-      if (handled === false && (Array.isArray(handler) === false || handler.length === 0) && typeof this?.[methodName] !== 'function') {
+      if (handled === false) {
         this?.log?.debug?.('Unhandled message type "%s" for device "%s"', type, this.deviceData.description);
       }
 
@@ -1492,6 +1477,7 @@ export default class HomeKitDevice extends EventEmitter {
    *
    * When no callback is supplied, each invocation dispatches a `TIMER` message
    * containing the timer handle and configured message fields.
+   * Creation and reset return `false` once shutdown or removal starts.
    *
    * @param {string} timerHandle Device-scoped timer name.
    * @param {HomeKitTimerOptions} [options={}] Timer schedule and payload.
@@ -1499,6 +1485,11 @@ export default class HomeKitDevice extends EventEmitter {
    * @returns {boolean} `true` when the timer exists after the call, otherwise `false`.
    */
   addTimer(timerHandle, options = {}, callback = undefined) {
+    // In-flight callbacks must not recreate timers after teardown has started.
+    if (this.#lifecycleState !== undefined) {
+      return false;
+    }
+
     // Register a timer (timeout, interval, or both) that either calls a callback or dispatches via message system
     // Supports three patterns:
     //   - delay only: fires once after delay (e.g., motion cooldown)
@@ -1583,42 +1574,24 @@ export default class HomeKitDevice extends EventEmitter {
         }));
     };
 
-    // delay only => fire once
-    if (delay > 0 && interval === 0) {
+    if (delay > 0) {
+      // Fire after the delay, then repeat only when an interval is configured.
       entry.timeout = setTimeout(() => {
         entry.timeout = undefined;
-        fire(true);
+        fire(interval === 0);
+
+        // Skip repetition if the timer was cancelled or replaced.
+        if (
+          interval > 0 &&
+          entry.cancelled === false &&
+          this.#timers.get(timerHandle) === entry
+        ) {
+          entry.intervalHandle = setInterval(fire, interval);
+        }
       }, delay);
-
-      this.#timers.set(timerHandle, entry);
-      return true;
+    } else {
+      entry.intervalHandle = setInterval(fire, interval);
     }
-
-    // interval only => repeat
-    if (delay === 0 && interval > 0) {
-      entry.intervalHandle = setInterval(() => {
-        fire();
-      }, interval);
-
-      this.#timers.set(timerHandle, entry);
-      return true;
-    }
-
-    // delay + interval => fire once after delay, then repeat
-    entry.timeout = setTimeout(() => {
-      entry.timeout = undefined;
-      fire();
-
-      // A synchronous first callback may remove or replace this timer. Do not
-      // create an interval that is no longer owned by the timer registry.
-      if (entry.cancelled === true || this.#timers.get(timerHandle) !== entry) {
-        return;
-      }
-
-      entry.intervalHandle = setInterval(() => {
-        fire();
-      }, interval);
-    }, delay);
 
     this.#timers.set(timerHandle, entry);
     return true;
@@ -2023,32 +1996,6 @@ export default class HomeKitDevice extends EventEmitter {
   }
 
   /**
-   * Produce a recursively key-sorted value suitable for stable JSON comparison.
-   *
-   * @param {*} value Value to normalise.
-   * @returns {*} Normalised value with array order preserved and `undefined` represented explicitly.
-   * @private
-   */
-  static #normaliseForCompare(value) {
-    // Normalise values before comparison so JSON.stringify is stable:
-    // - object keys are sorted recursively to avoid false positives from key order
-    // - arrays retain their order
-    // - undefined is converted to a string placeholder so it is not dropped
-    return Array.isArray(value) === true
-      ? value.map((entry) => HomeKitDevice.#normaliseForCompare(entry))
-      : typeof value === 'object' && value !== null
-        ? Object.keys(value)
-            .sort()
-            .reduce((result, key) => {
-              result[key] = HomeKitDevice.#normaliseForCompare(value[key] === undefined ? 'undefined' : value[key]);
-              return result;
-            }, {})
-        : value === undefined
-          ? 'undefined'
-          : value;
-  }
-
-  /**
    * Overlay partial updates on current device data and detect semantic changes.
    *
    * @param {Partial<HomeKitDeviceData>} [deviceDataUpdates={}] Validated partial device data.
@@ -2067,11 +2014,9 @@ export default class HomeKitDevice extends EventEmitter {
     });
 
     // Check updated device data with our internally stored data and flag if changes exist.
-    // This compares the full merged view rather than only the incoming partial update.
+    // Compare the full merged view without replacing undefined with a colliding string sentinel.
     let changed = Object.keys(merged).some(
-      (key) =>
-        JSON.stringify(HomeKitDevice.#normaliseForCompare(merged[key])) !==
-        JSON.stringify(HomeKitDevice.#normaliseForCompare(this.deviceData[key])),
+      (key) => isDeepStrictEqual(merged[key], this.deviceData[key]) === false,
     );
 
     return { merged, changed };
@@ -2153,15 +2098,9 @@ export default class HomeKitDevice extends EventEmitter {
           .filter((field) => Object.hasOwn(deviceData, field))
           .map((field) => [field, deviceData[field]]),
       );
-      let persistedState = JSON.stringify(HomeKitDevice.#normaliseForCompare(persistedData));
-
       if (
         this.accessory !== undefined &&
-        JSON.stringify(
-          HomeKitDevice.#normaliseForCompare(
-            this.accessory?.context?.[this.constructor.PERSISTENCE_NAMESPACE],
-          ),
-        ) !== persistedState
+        isDeepStrictEqual(this.accessory?.context?.[this.constructor.PERSISTENCE_NAMESPACE], persistedData) === false
       ) {
         this.accessory.context ??= {};
         this.accessory.context[this.constructor.PERSISTENCE_NAMESPACE] = structuredClone(persistedData);
@@ -2169,11 +2108,7 @@ export default class HomeKitDevice extends EventEmitter {
 
       if (
         this.matterAccessory !== undefined &&
-        JSON.stringify(
-          HomeKitDevice.#normaliseForCompare(
-            this.matterAccessory?.context?.[this.constructor.PERSISTENCE_NAMESPACE],
-          ),
-        ) !== persistedState
+        isDeepStrictEqual(this.matterAccessory?.context?.[this.constructor.PERSISTENCE_NAMESPACE], persistedData) === false
       ) {
         previous.set('context', {
           exists: Object.hasOwn(this.matterAccessory, 'context'),
@@ -2241,75 +2176,37 @@ export default class HomeKitDevice extends EventEmitter {
     // Strict callers require a complete record. A payload containing every core
     // field is also treated as complete; otherwise it is validated as a partial
     // update and only supplied fields are checked.
-    let isFull = strict === true || keys.every((key) => typeof deviceData[key] !== 'undefined');
+    let isFull = strict === true || keys.every((key) => deviceData[key] !== undefined);
 
+    // Full records require every field; partial records validate supplied fields.
     for (let key of keys) {
-      if (isFull === true) {
-        // Full validation: required fields must exist and be valid
-        if (typeof deviceData[key] !== 'string' || deviceData[key] === '') {
-          return false;
-        }
-      }
-
-      if (isFull === false && typeof deviceData[key] !== 'undefined') {
-        // Partial update: only validate fields that are present
-        if (typeof deviceData[key] !== 'string' || deviceData[key] === '') {
-          return false;
-        }
+      if (
+        (isFull === true || deviceData[key] !== undefined) &&
+        (typeof deviceData[key] !== 'string' || deviceData[key] === '')
+      ) {
+        return false;
       }
     }
 
-    // Pairing validation for HAP-NodeJS only, where no Homebridge platform is present.
+    // Standalone devices also require valid pairing details in full records.
     if (this.#platform === undefined) {
-      let hasPairing = typeof deviceData?.hkPairingCode !== 'undefined' || typeof deviceData?.hkUsername !== 'undefined';
-
-      if (isFull === true) {
-        // Full validation: pairing details must be present and valid
-        if (
-          typeof deviceData?.hkPairingCode !== 'string' ||
+      if (
+        (isFull === true || deviceData.hkPairingCode !== undefined) &&
+        (typeof deviceData.hkPairingCode !== 'string' ||
           (HomeKitDevice.HK_PIN_3_2_3.test(deviceData.hkPairingCode) === false &&
-            HomeKitDevice.HK_PIN_4_4.test(deviceData.hkPairingCode) === false) ||
-          typeof deviceData?.hkUsername !== 'string' ||
-          HomeKitDevice.MAC_ADDR.test(deviceData.hkUsername) === false // Must be valid MAC address format (XX:XX:XX:XX:XX:XX)
-        ) {
-          return false;
-        }
+            HomeKitDevice.HK_PIN_4_4.test(deviceData.hkPairingCode) === false))
+      ) {
+        return false;
       }
 
-      if (isFull === false && hasPairing === true) {
-        // Partial update: only validate pairing fields if provided
-        if (
-          typeof deviceData?.hkPairingCode !== 'undefined' &&
-          (typeof deviceData.hkPairingCode !== 'string' ||
-            (HomeKitDevice.HK_PIN_3_2_3.test(deviceData.hkPairingCode) === false &&
-              HomeKitDevice.HK_PIN_4_4.test(deviceData.hkPairingCode) === false))
-        ) {
-          return false;
-        }
-
-        if (
-          typeof deviceData?.hkUsername !== 'undefined' &&
-          (typeof deviceData.hkUsername !== 'string' || HomeKitDevice.MAC_ADDR.test(deviceData.hkUsername) === false) // Validate MAC format if username is supplied
-        ) {
-          return false;
-        }
+      if (
+        (isFull === true || deviceData.hkUsername !== undefined) &&
+        (typeof deviceData.hkUsername !== 'string' || HomeKitDevice.MAC_ADDR.test(deviceData.hkUsername) === false)
+      ) {
+        return false;
       }
     }
 
     return true;
-  }
-
-  /**
-   * Cancel every timer owned by this device.
-   *
-   * @returns {void}
-   * @private
-   */
-  #clearTimers() {
-    // Clear all internal timers for this device
-    // Snapshot keys first to avoid mutating the Map while iterating
-    for (let timerHandle of [...this.#timers.keys()]) {
-      this.removeTimer(timerHandle);
-    }
   }
 }
