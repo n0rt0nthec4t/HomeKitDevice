@@ -4,7 +4,7 @@
 
 `HomeKitDevice` is a shared base class for accessory implementations. It sits between application-owned device data and either the standalone HAP-NodeJS runtime or the Homebridge runtime, giving each device type a common lifecycle, message bus, accessory helper layer, timer system, and optional EveHome history integration. Homebridge may expose HAP, Matter, or both.
 
-**Version:** 2026.10.17
+**Version:** 2026.10.18
 **Primary module:** `HomeKitDevice.js`  
 **Consumers:** subclasses and host applications
 
@@ -371,6 +371,7 @@ Ensures a characteristic exists and optionally applies:
 - `initialValue`
 
 The helper respects optional characteristics and avoids adding duplicates.
+For finite numeric initial values, the helper temporarily clears the owned instance's current value during `setProps()`, restoring it in `finally` before the normal service update. HAP therefore validates the initial value against final props without first clamping the construction default. Change events retain the previous value; validation remains owned by HAP. Other calls retain existing behavior, and shared prototypes remain untouched.
 
 ### `removeCharacteristic(service, characteristicOrType)`
 

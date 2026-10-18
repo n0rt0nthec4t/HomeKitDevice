@@ -3356,6 +3356,129 @@ test('characteristic helpers create required and optional characteristics and ap
   assert.equal(device.removeCharacteristic({ removeCharacteristic() {} }, required), false);
 });
 
+test('characteristic setup defers current-value validation until final props are installed', () => {
+  for (let [value, previousProps, props, initialValue] of [
+    [0, { minValue: 0, maxValue: 25 }, { minValue: 9, maxValue: 32, minStep: 0.5 }, 9],
+    [10, { minValue: 10, maxValue: 38 }, { minValue: 45, maxValue: 80, minStep: 0.5 }, 55],
+    [55, { minValue: 45, maxValue: 80 }, { minValue: 1, maxValue: 5, minStep: 0.5 }, 3.5],
+    [0, { minValue: 0, maxValue: 3 }, { validValues: [1] }, 1],
+    [1, { minValue: 0, maxValue: 2, validValues: [1] }, { validValues: [2] }, 2],
+  ]) {
+    previousProps = { format: 'float', ...previousProps };
+    let originalProps = { ...previousProps };
+    let operations = [];
+    let validate = (nextValue, constraints) => {
+      if (nextValue === null) {
+        return;
+      }
+      if (Number.isFinite(constraints.minValue) === true) {
+        assert.ok(nextValue >= constraints.minValue);
+      }
+      if (Number.isFinite(constraints.maxValue) === true) {
+        assert.ok(nextValue <= constraints.maxValue);
+      }
+      if (Array.isArray(constraints.validValues) === true) {
+        assert.ok(constraints.validValues.includes(nextValue));
+      }
+    };
+    let characteristic = {
+      value,
+      props: { ...previousProps },
+      setProps(nextProps) {
+        this.props = { ...this.props, ...nextProps };
+        validate(this.value, this.props);
+        operations.push('props');
+      },
+      onSet() { throw new Error('Unexpected handler replacement'); },
+    };
+    let service = {
+      testCharacteristic: () => true,
+      getCharacteristic: () => characteristic,
+      addCharacteristic() { throw new Error('Unexpected characteristic creation'); },
+      addOptionalCharacteristic() { throw new Error('Unexpected optional creation'); },
+      updateCharacteristic(type, nextValue) {
+        assert.equal(characteristic.value, value);
+        validate(nextValue, characteristic.props);
+        characteristic.value = nextValue;
+        operations.push('value');
+      },
+    };
+    let requestedProps = structuredClone(props);
+    let resolved = HomeKitDevice.prototype.addCharacteristic.call({}, service, {}, { props, initialValue });
+    assert.equal(resolved, characteristic);
+    assert.equal(characteristic.value, initialValue);
+    assert.deepEqual(characteristic.props, { ...previousProps, ...props });
+    assert.deepEqual(operations, ['props', 'value']);
+    assert.deepEqual(previousProps, originalProps);
+    assert.deepEqual(props, requestedProps);
+  }
+});
+
+test('characteristic setup restores the previous value if props validation throws', () => {
+  let failure = new Error('Invalid props');
+  let characteristic = { value: 10, setProps() {
+    assert.equal(this.value, null);
+    throw failure;
+  } };
+  let service = {
+    testCharacteristic: () => true,
+    getCharacteristic: () => characteristic,
+    addCharacteristic() {},
+    addOptionalCharacteristic() {},
+    updateCharacteristic() { throw new Error('Unexpected update after invalid props'); },
+  };
+  assert.throws(() => HomeKitDevice.prototype.addCharacteristic.call({}, service, {}, {
+    props: { minValue: 80, maxValue: 45 }, initialValue: 55,
+  }), (error) => error === failure);
+  assert.equal(characteristic.value, 10);
+});
+
+test('characteristic setup preserves props-first behaviour without a finite numeric initial value', () => {
+  for (let initialValue of [undefined, null, false, '10', NaN]) {
+    let operations = [];
+    let characteristic = { props: {}, setProps() { operations.push('props'); } };
+    let service = {
+      testCharacteristic: () => true,
+      getCharacteristic: () => characteristic,
+      addCharacteristic() {},
+      addOptionalCharacteristic() {},
+      updateCharacteristic() { operations.push('value'); },
+    };
+    HomeKitDevice.prototype.addCharacteristic.call({}, service, {}, { props: { minValue: 9 }, initialValue });
+    assert.deepEqual(operations, initialValue === undefined ? ['props'] : ['props', 'value']);
+  }
+});
+
+test('format changes and initial values outside final constraints retain props-first validation', () => {
+  for (let [previousProps, props, initialValue] of [
+    [{ format: 'uint8', minValue: 0, maxValue: 255 }, { format: 'uint16', maxValue: 65535 }, 500],
+    [{ format: 'float', minValue: 10, maxValue: 38 }, { minValue: 45, maxValue: 80 }, 90],
+    [{ format: 'uint8', minValue: 0, maxValue: 3 }, { validValues: [1] }, 2],
+    [{ format: 'float', minValue: 0, maxValue: 100 }, { validValueRanges: [45, 80] }, 90],
+    [{ format: 'float', minValue: 0, maxValue: 100 }, { minStep: 1 }, 55.5],
+  ]) {
+    let operations = [];
+    let characteristic = { props: previousProps, setProps(nextProps) {
+      assert.deepEqual(nextProps, props);
+      this.props = { ...this.props, ...nextProps };
+      operations.push('props');
+    } };
+    let service = {
+      testCharacteristic: () => true,
+      getCharacteristic: () => characteristic,
+      addCharacteristic() {},
+      addOptionalCharacteristic() {},
+      updateCharacteristic(type, value) {
+        assert.deepEqual(characteristic.props, { ...previousProps, ...props });
+        assert.equal(value, initialValue);
+        operations.push('value');
+      },
+    };
+    HomeKitDevice.prototype.addCharacteristic.call({}, service, {}, { props, initialValue });
+    assert.deepEqual(operations, ['props', 'value']);
+  }
+});
+
 test('characteristic helpers accept minimal HAP metadata and absent optional configuration', async (context) => {
   let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('CHARACTERISTIC-MINIMAL'));
   context.after(() => device.remove());

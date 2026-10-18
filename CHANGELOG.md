@@ -2,6 +2,13 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2026.10.18
+
+### Fixed
+
+- Deferred current-value validation while applying characteristic props with a finite numeric initial value, avoiding construction-default clamping diagnostics without shared HAP prototype overrides
+- Kept initial-value validation in HAP against final props, preserving format changes and preventing emission of out-of-range initial values
+
 ## 2026.10.17
 
 ### Changed

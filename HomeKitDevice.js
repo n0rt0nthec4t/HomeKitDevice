@@ -176,6 +176,7 @@ const LOG_LEVELS = {
  * @property {Function} [onSet] Handler invoked for a HomeKit write.
  * @property {Function} [onGet] Handler invoked for a HomeKit read.
  * @property {*} [initialValue] Value applied through the service without invoking `onSet`.
+ *   For finite numeric values, current-value validation is deferred until final props are installed.
  */
 
 /**
@@ -221,7 +222,7 @@ export default class HomeKitDevice extends EventEmitter {
   static EVEHOME = undefined; // HomeKitHistory object
   static LOGGER = undefined; // Logging object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.10.17'; // Code version
+  static VERSION = '2026.10.18'; // Code version
 
   // Persistent context namespace for this class. Subclasses may override to isolate their own context.
   static PERSISTENCE_NAMESPACE = 'HomeKitDevice';
@@ -1789,7 +1790,21 @@ export default class HomeKitDevice extends EventEmitter {
       // Characteristic constraints such as range, step, unit, and valid values
       // belong to the characteristic instance rather than the containing service.
       if (props !== null && typeof props === 'object' && props.constructor === Object && typeof characteristic.setProps === 'function') {
-        characteristic.setProps(props);
+        // HAP validates the current value during setProps(). When initialising,
+        // defer value validation until final props are installed. Restore the old
+        // value even on failure, and before updateCharacteristic() emits changes.
+        let previousValue = characteristic.value;
+        let deferValidation = Number.isFinite(initialValue) === true && typeof service.updateCharacteristic === 'function';
+        try {
+          if (deferValidation === true) {
+            characteristic.value = null;
+          }
+          characteristic.setProps(props);
+        } finally {
+          if (deferValidation === true) {
+            characteristic.value = previousValue;
+          }
+        }
       }
 
       // Initialise through the service API so HAP updates its characteristic value

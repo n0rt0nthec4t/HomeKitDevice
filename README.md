@@ -1,6 +1,6 @@
 # HomeKitDevice
 
-**Version:** 2026.10.17
+**Version:** 2026.10.18
 
 `HomeKitDevice` is a shared base class for building accessories with Homebridge or standalone HAP-NodeJS. Homebridge accessories can expose HAP, Matter, or both through the same lifecycle and messaging API.
 
@@ -214,6 +214,8 @@ Supported `options`:
 - `onGet()` – Called when HomeKit reads the characteristic value
 - `props` – Defines characteristic metadata (`minStep`, `unit`, `minValue`, `maxValue`, `validValues`, etc.)
 - `initialValue` – Value to initialise immediately
+
+When a finite numeric `initialValue` is supplied, the helper temporarily sets the owned characteristic's current value to `null` while applying `props`, then restores it before updating the value through HAP. This prevents validation of a construction default against device-specific bounds. HAP validates the initial value against the final props, including format, bounds and enum restrictions, and change events retain the actual previous value. The previous value is also restored if applying props throws. Calls without a finite numeric initial value retain existing behavior. Shared HAP prototypes are untouched.
 
 ---
 
@@ -524,7 +526,7 @@ Public static configuration and message constants include:
 Each subclass may define a static `VERSION` string for visibility in logs:
 
 ```js
-static VERSION = '2026.10.17';
+static VERSION = '2026.10.18';
 ```
 
 ---
