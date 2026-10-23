@@ -2,6 +2,12 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2026.10.24
+
+### Changed
+
+- Made shutdown regression tests portable to Windows through IPC-triggered handlers while retaining native SIGTERM delivery on POSIX systems
+
 ## 2026.10.18
 
 ### Fixed

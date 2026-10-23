@@ -2312,72 +2312,81 @@ test('rejected nested standalone shutdown does not cancel setup publication', { 
   assert.equal(device.accessory.published, true);
 });
 
-test('SIGTERM closes GPIO and exits while standalone publication remains pending', { timeout: 5000 }, async (context) => {
-  // Reuse the protocol mocks in a separate process so actual signal delivery
-  // exercises HomeKitDevice's handlers without altering the test runner.
-  let script = [
-    'import HomeKitDevice from ' + JSON.stringify(new URL('./HomeKitDevice.js', import.meta.url).href) + ';',
-    'import { writeSync } from "node:fs";',
-    'import { setImmediate } from "node:timers/promises";',
-    MockCharacteristic.toString(),
-    'Object.assign(MockCharacteristic, ' + JSON.stringify(Object.fromEntries(Object.entries(MockCharacteristic))) + ');',
-    MockService.toString(),
-    'MockService.AccessoryInformation = ' + JSON.stringify(MockService.AccessoryInformation) + ';',
-    MockInformationService.toString(),
-    MockAccessory.toString(),
-    'let stopping = false;',
-    // Register application exit policy before constructing or awaiting startup.
-    // Delay its await until the library handler has deregistered the device and
-    // entered asynchronous GPIO cleanup, exposing an early-returning broadcast.
-    'process.on("SIGTERM", async () => { stopping = true; await setImmediate();',
-    'await HomeKitDevice.shutdown();',
-    'if (device.hasTimer("cleanup") === true || device.listenerCount("test") !== 0) { process.exit(2); }',
-    'writeSync(1, "shutdown:complete\\n"); process.exit(0); });',
-    'HomeKitDevice.PLUGIN_NAME = "homebridge-example";',
-    'HomeKitDevice.PLATFORM_NAME = "ExamplePlatform";',
-    'MockAccessory.prototype.publish = () => { process.send("publishing"); return new Promise(() => {}); };',
-    'MockAccessory.prototype.unpublish = async () => { writeSync(1, "unpublish\\n"); };',
-    'let api = { Accessory: MockAccessory, Characteristic: MockCharacteristic, Service: MockService,',
-    'Categories: ' + JSON.stringify(hap.Categories) + ', uuid: { generate: (value) => "uuid:" + value },',
-    'HAPLibraryVersion: () => "test" };',
-    'let device = new HomeKitDevice(undefined, api, ' + JSON.stringify({
-      ...deviceData('SIGNAL-PUBLISH'), hkUsername: 'AA:BB:CC:DD:EE:FF', hkPairingCode: '123-45-678',
-    }) + ');',
-    'device.onShutdown = async () => { writeSync(1, "gpio:off\\n"); await setImmediate(); writeSync(1, "gpio:close\\n"); };',
-    'device.addTimer("cleanup", { interval: 1000 }, () => {});',
-    'device.on("test", () => {});',
-    'let added = await device.add({ hapAccessoryName: "Signal", hapCategory: 1 });',
-    'if (added === true && stopping === false) { writeSync(1, "startup:success\\n"); }',
-  ].join('\n');
-  let child = spawn(process.execPath, ['--input-type=module', '-e', script], {
-    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+for (let delivery of process.platform === 'win32' ? ['ipc'] : ['signal', 'ipc']) {
+  test('SIGTERM handler closes GPIO and exits during pending publication via ' + delivery, { timeout: 5000 }, async (context) => {
+    // Reuse protocol mocks in a child process to exercise shutdown handlers
+    // through real POSIX signals or Windows-compatible IPC delivery.
+    let script = [
+      'import HomeKitDevice from ' + JSON.stringify(new URL('./HomeKitDevice.js', import.meta.url).href) + ';',
+      'import { writeSync } from "node:fs";',
+      'import { setImmediate } from "node:timers/promises";',
+      MockCharacteristic.toString(),
+      'Object.assign(MockCharacteristic, ' + JSON.stringify(Object.fromEntries(Object.entries(MockCharacteristic))) + ');',
+      MockService.toString(),
+      'MockService.AccessoryInformation = ' + JSON.stringify(MockService.AccessoryInformation) + ';',
+      MockInformationService.toString(),
+      MockAccessory.toString(),
+      'let stopping = false;',
+      // Register application exit policy before constructing or awaiting startup.
+      // Delay its await until the library handler has deregistered the device and
+      // entered asynchronous GPIO cleanup, exposing an early-returning broadcast.
+      'process.on("SIGTERM", async () => { stopping = true; await setImmediate();',
+      'await HomeKitDevice.shutdown();',
+      'if (device.hasTimer("cleanup") === true || device.listenerCount("test") !== 0) { process.exit(2); }',
+      'writeSync(1, "shutdown:complete\\n"); process.exit(0); });',
+      'process.on("message", (message) => { if (message === "shutdown") { process.emit("SIGTERM"); } });',
+      'HomeKitDevice.PLUGIN_NAME = "homebridge-example";',
+      'HomeKitDevice.PLATFORM_NAME = "ExamplePlatform";',
+      'MockAccessory.prototype.publish = () => { process.send("publishing"); return new Promise(() => {}); };',
+      'MockAccessory.prototype.unpublish = async () => { writeSync(1, "unpublish\\n"); };',
+      'let api = { Accessory: MockAccessory, Characteristic: MockCharacteristic, Service: MockService,',
+      'Categories: ' + JSON.stringify(hap.Categories) + ', uuid: { generate: (value) => "uuid:" + value },',
+      'HAPLibraryVersion: () => "test" };',
+      'let device = new HomeKitDevice(undefined, api, ' + JSON.stringify({
+        ...deviceData('SIGNAL-PUBLISH'), hkUsername: 'AA:BB:CC:DD:EE:FF', hkPairingCode: '123-45-678',
+      }) + ');',
+      'device.onShutdown = async () => { writeSync(1, "gpio:off\\n"); await setImmediate(); writeSync(1, "gpio:close\\n"); };',
+      'device.addTimer("cleanup", { interval: 1000 }, () => {});',
+      'device.on("test", () => {});',
+      'let added = await device.add({ hapAccessoryName: "Signal", hapCategory: 1 });',
+      'if (added === true && stopping === false) { writeSync(1, "startup:success\\n"); }',
+    ].join('\n');
+    let child = spawn(process.execPath, ['--input-type=module', '-e', script], {
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    context.after(() => {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGKILL');
+      }
+    });
+    let output = '';
+    let errors = '';
+    child.stdout.on('data', (data) => {
+      output += data;
+    });
+    child.stderr.on('data', (data) => {
+      errors += data;
+    });
+    child.on('message', (message) => {
+      if (message === 'publishing') {
+        // Windows kill(SIGTERM) forcibly terminates the child. Use IPC to invoke
+        // the same registered handlers there; POSIX retains real signal delivery.
+        if (delivery === 'ipc') {
+          child.send('shutdown');
+        } else {
+          child.kill('SIGTERM');
+        }
+      }
+    });
+    let result = await new Promise((resolve, reject) => {
+      child.once('error', reject);
+      child.once('close', (code, signal) => resolve({ code, signal }));
+    });
+    assert.deepEqual(result, { code: 0, signal: null }, errors);
+    assert.deepEqual(output.trim().split('\n'), ['unpublish', 'gpio:off', 'gpio:close', 'shutdown:complete']);
+    assert.equal(errors, '');
   });
-  context.after(() => {
-    if (child.exitCode === null && child.signalCode === null) {
-      child.kill('SIGKILL');
-    }
-  });
-  let output = '';
-  let errors = '';
-  child.stdout.on('data', (data) => {
-    output += data;
-  });
-  child.stderr.on('data', (data) => {
-    errors += data;
-  });
-  child.on('message', (message) => {
-    if (message === 'publishing') {
-      child.kill('SIGTERM');
-    }
-  });
-  let result = await new Promise((resolve, reject) => {
-    child.once('error', reject);
-    child.once('close', (code, signal) => resolve({ code, signal }));
-  });
-  assert.deepEqual(result, { code: 0, signal: null }, errors);
-  assert.deepEqual(output.trim().split('\n'), ['unpublish', 'gpio:off', 'gpio:close', 'shutdown:complete']);
-  assert.equal(errors, '');
-});
+}
 
 test('REMOVE waits for standalone HAP publication before unpublishing', { timeout: 1000 }, async (context) => {
   let entered = Promise.withResolvers();
