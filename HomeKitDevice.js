@@ -1760,7 +1760,7 @@ export default class HomeKitDevice extends EventEmitter {
    * @param {HomeKitCharacteristicOptions} [options={}] Characteristic behavior and metadata.
    * @returns {object|undefined} Resolved HAP characteristic.
    * @throws {TypeError} When static values overwrite constructor properties.
-   * @throws {Error} When its registry name or UUID already identifies a different type.
+   * @throws {Error} When its registry name or UUID conflicts, or the service resolves a different UUID.
    */
   addCharacteristic(service, characteristicType, { props, onSet, onGet, initialValue } = {}) {
     let characteristic = undefined;
@@ -1850,8 +1850,16 @@ export default class HomeKitDevice extends EventEmitter {
 
       // Resolve the single existing or new instance before attaching any behavior.
       characteristic = service.getCharacteristic(characteristicType);
+      // Cached instances may have a generic constructor; UUID is their identity.
+      // Reject a bad service result before registering the type or changing its handlers/value.
+      if (
+        typeof characteristic?.UUID !== 'string' || typeof characteristicType.UUID !== 'string' ||
+        characteristic.UUID.toUpperCase() !== characteristicType.UUID.toUpperCase()
+      ) {
+        throw new Error('HAP service returned a characteristic with an unexpected UUID');
+      }
 
-      // Failed construction must leave the name available for a corrected definition.
+      // Register the new type after HAP has attached it and its UUID has been checked.
       if (customName !== undefined) {
         this.hap.Characteristic[customName] = characteristicType;
       }

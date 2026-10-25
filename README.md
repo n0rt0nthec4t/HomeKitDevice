@@ -225,7 +225,7 @@ The custom definition requires `name`, a valid `uuid`, and default `props`; stat
 
 The first registration supplies the type's defaults and constants. Later definitions with the same registry name and UUID reuse that type, and existing service characteristics are reused by UUID, including cached instances. Instance-specific overrides still belong in `options.props`. Definitions are scoped to the current HAP runtime; conflicting names and UUIDs registered under another name throw without replacing registered types. UUID comparisons ignore letter case, and the UUID check includes standard HAP types. Static `values` cannot overwrite constructor properties such as `UUID`, `name`, or `prototype`. Definitions are developer-owned constants: keep their properties stable after registration. HAP handles construction and property validation. A new type is registered only after successful attachment and resolution; if construction fails, a corrected definition can be retried without restarting.
 
-The method returns the resolved characteristic instance. Calls without a usable HAP service return `undefined`; custom definitions also return `undefined` when HAP is unavailable, including Matter-only devices.
+The method checks that the resolved instance has the requested UUID before registering a new type or applying handlers, props and initial values. Missing or mismatched UUIDs throw; matching cached instances are accepted regardless of their constructor or UUID letter case. The method returns the resolved characteristic instance. Calls without a usable HAP service return `undefined`; custom definitions also return `undefined` when HAP is unavailable, including Matter-only devices.
 
 Supported `options`:
 

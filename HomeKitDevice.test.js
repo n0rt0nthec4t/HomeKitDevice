@@ -3535,6 +3535,39 @@ test('custom static values cannot overwrite constructor properties', () => {
   assert.equal(add(service, definition).UUID, definition.uuid);
 });
 
+test('characteristic resolution rejects missing or mismatched UUIDs before configuration', () => {
+  for (let custom of [true, false]) {
+    for (let result of [undefined, null, {}, { UUID: 42 }, { UUID: 'different' }]) {
+      let { runtime, service, definition } = customCharacteristicFixture();
+      let changes = [];
+      let characteristic = result === undefined || result === null ? result : {
+        ...result,
+        onGet: () => changes.push('get'),
+        onSet: () => changes.push('set'),
+        setProps: () => changes.push('props'),
+      };
+      service.testCharacteristic = () => true;
+      service.getCharacteristic = () => characteristic;
+      service.updateCharacteristic = () => changes.push('value');
+      let type = custom === true ? definition : { UUID: definition.uuid };
+      assert.throws(() => HomeKitDevice.prototype.addCharacteristic.call({ hap: runtime }, service, type, {
+        onGet: () => 1, onSet: () => {}, props: { minValue: 0 }, initialValue: 1,
+      }), /unexpected UUID/);
+      assert.deepEqual(changes, []);
+      assert.equal(Object.hasOwn(runtime.Characteristic, 'CustomState'), false);
+    }
+  }
+});
+
+test('characteristic resolution accepts matching UUID case on a generic cached instance', () => {
+  let { runtime, service, definition } = customCharacteristicFixture();
+  let cached = { UUID: definition.uuid.toLowerCase(), value: 1 };
+  service.testCharacteristic = () => true;
+  service.getCharacteristic = () => cached;
+  assert.equal(HomeKitDevice.prototype.addCharacteristic.call({ hap: runtime }, service, definition), cached);
+  assert.equal(runtime.Characteristic.CustomState.UUID, definition.uuid);
+});
+
 test('characteristic setup defers current-value validation until final props are installed', () => {
   for (let [value, previousProps, props, initialValue] of [
     [0, { minValue: 0, maxValue: 25 }, { minValue: 9, maxValue: 32, minStep: 0.5 }, 9],
@@ -3561,6 +3594,7 @@ test('characteristic setup defers current-value validation until final props are
       }
     };
     let characteristic = {
+      UUID: 'fixture',
       value,
       props: { ...previousProps },
       setProps(nextProps) {
@@ -3583,7 +3617,7 @@ test('characteristic setup defers current-value validation until final props are
       },
     };
     let requestedProps = structuredClone(props);
-    let resolved = HomeKitDevice.prototype.addCharacteristic.call({}, service, {}, { props, initialValue });
+    let resolved = HomeKitDevice.prototype.addCharacteristic.call({}, service, { UUID: characteristic.UUID }, { props, initialValue });
     assert.equal(resolved, characteristic);
     assert.equal(characteristic.value, initialValue);
     assert.deepEqual(characteristic.props, { ...previousProps, ...props });
@@ -3595,7 +3629,7 @@ test('characteristic setup defers current-value validation until final props are
 
 test('characteristic setup restores the previous value if props validation throws', () => {
   let failure = new Error('Invalid props');
-  let characteristic = { value: 10, setProps() {
+  let characteristic = { UUID: 'fixture', value: 10, setProps() {
     assert.equal(this.value, null);
     throw failure;
   } };
@@ -3606,7 +3640,7 @@ test('characteristic setup restores the previous value if props validation throw
     addOptionalCharacteristic() {},
     updateCharacteristic() { throw new Error('Unexpected update after invalid props'); },
   };
-  assert.throws(() => HomeKitDevice.prototype.addCharacteristic.call({}, service, {}, {
+  assert.throws(() => HomeKitDevice.prototype.addCharacteristic.call({}, service, { UUID: characteristic.UUID }, {
     props: { minValue: 80, maxValue: 45 }, initialValue: 55,
   }), (error) => error === failure);
   assert.equal(characteristic.value, 10);
@@ -3615,7 +3649,7 @@ test('characteristic setup restores the previous value if props validation throw
 test('characteristic setup preserves props-first behaviour without a finite numeric initial value', () => {
   for (let initialValue of [undefined, null, false, '10', NaN]) {
     let operations = [];
-    let characteristic = { props: {}, setProps() { operations.push('props'); } };
+    let characteristic = { UUID: 'fixture', props: {}, setProps() { operations.push('props'); } };
     let service = {
       testCharacteristic: () => true,
       getCharacteristic: () => characteristic,
@@ -3623,7 +3657,7 @@ test('characteristic setup preserves props-first behaviour without a finite nume
       addOptionalCharacteristic() {},
       updateCharacteristic() { operations.push('value'); },
     };
-    HomeKitDevice.prototype.addCharacteristic.call({}, service, {}, { props: { minValue: 9 }, initialValue });
+    HomeKitDevice.prototype.addCharacteristic.call({}, service, { UUID: characteristic.UUID }, { props: { minValue: 9 }, initialValue });
     assert.deepEqual(operations, initialValue === undefined ? ['props'] : ['props', 'value']);
   }
 });
@@ -3637,7 +3671,7 @@ test('format changes and initial values outside final constraints retain props-f
     [{ format: 'float', minValue: 0, maxValue: 100 }, { minStep: 1 }, 55.5],
   ]) {
     let operations = [];
-    let characteristic = { props: previousProps, setProps(nextProps) {
+    let characteristic = { UUID: 'fixture', props: previousProps, setProps(nextProps) {
       assert.deepEqual(nextProps, props);
       this.props = { ...this.props, ...nextProps };
       operations.push('props');
@@ -3653,7 +3687,7 @@ test('format changes and initial values outside final constraints retain props-f
         operations.push('value');
       },
     };
-    HomeKitDevice.prototype.addCharacteristic.call({}, service, {}, { props, initialValue });
+    HomeKitDevice.prototype.addCharacteristic.call({}, service, { UUID: characteristic.UUID }, { props, initialValue });
     assert.deepEqual(operations, ['props', 'value']);
   }
 });

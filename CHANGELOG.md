@@ -11,6 +11,8 @@ All notable changes to the `HomeKitDevice` module are documented in this file.
 
 ### Fixed
 
+- Rejected missing or mismatched characteristic UUIDs returned by a service before type registration, handler binding, property changes or initial-value updates, while accepting cached instances by UUID
+
 - Left custom type names unregistered when characteristic construction fails, allowing corrected definitions to retry without restarting
 
 - Rejected custom definitions that reuse a registered UUID under another name, including standard HAP UUIDs and differences in letter case, before changing the service
