@@ -3365,6 +3365,176 @@ test('characteristic helpers create required and optional characteristics and ap
   assert.equal(device.removeCharacteristic({ removeCharacteristic() {} }, required), false);
 });
 
+// A small HAP boundary fixture keeps this shared module's tests standalone.
+function customCharacteristicFixture() {
+  class Characteristic {
+    constructor(name, uuid, props) {
+      if (props.format === 'invalid') {
+        throw new Error('Fixture invalid format');
+      }
+      this.displayName = name;
+      this.UUID = uuid;
+      this.props = { ...props };
+    }
+
+    getDefaultValue() {
+      return this.props.format === 'string' ? '' : 0;
+    }
+
+    onGet(handler) {
+      this.getter = handler;
+    }
+
+    onSet(handler) {
+      this.setter = handler;
+    }
+
+    setProps(props) {
+      Object.assign(this.props, props);
+    }
+  }
+  let runtime = { Characteristic };
+  let service = {
+    characteristics: [],
+    optionalCharacteristics: [],
+    testCharacteristic(type) {
+      return this.characteristics.some((item) => item.UUID === type.UUID);
+    },
+    getCharacteristic(type) {
+      return this.characteristics.find((item) => item.UUID === type.UUID);
+    },
+    addCharacteristic(type) {
+      this.characteristics.push(new type());
+    },
+    addOptionalCharacteristic(type) {
+      this.addCharacteristic(type);
+    },
+    updateCharacteristic(type, value) {
+      this.getCharacteristic(type).value = value;
+    },
+  };
+  let definition = {
+    name: 'Custom State',
+    uuid: 'ACCF0001-DEF9-480F-A6F5-933AD9D682FE',
+    props: { format: 'uint8', perms: ['pr'], validValues: [0, 1] },
+    values: { OFF: 0, ON: 1 },
+  };
+  return { runtime, service, definition };
+}
+
+test('custom definitions register a named type and reuse cached characteristics with existing options', () => {
+  let { runtime, service, definition } = customCharacteristicFixture();
+  let add = HomeKitDevice.prototype.addCharacteristic.bind({ hap: runtime });
+  let getter = () => 1;
+  let setter = () => {};
+  let characteristic = add(service, definition, { onGet: getter, onSet: setter, initialValue: 1, props: { minStep: 1 } });
+  let type = runtime.Characteristic.CustomState;
+  assert.equal(type.name, 'CustomState');
+  assert.equal(type.UUID, definition.uuid);
+  assert.equal(type.OFF, 0);
+  assert.equal(type.ON, 1);
+  assert.equal(characteristic.getter, getter);
+  assert.equal(characteristic.setter, setter);
+  assert.equal(characteristic.value, 1);
+  assert.equal(characteristic.props.minStep, 1);
+  assert.equal(add(service, definition), characteristic);
+  assert.equal(add(service, type), characteristic);
+  assert.equal(service.characteristics.length, 1);
+
+  // Even a deserialized instance with a generic constructor is resolved by UUID.
+  let cached = { UUID: definition.uuid, value: 1 };
+  let cachedService = { ...service, characteristics: [cached] };
+  assert.equal(add(cachedService, definition), cached);
+  assert.equal(cachedService.characteristics.length, 1);
+});
+
+test('custom types stay scoped to their HAP runtime and absent HAP/services remain no-ops', () => {
+  let first = customCharacteristicFixture();
+  let second = customCharacteristicFixture();
+  for (let fixture of [first, second]) {
+    HomeKitDevice.prototype.addCharacteristic.call({ hap: fixture.runtime }, fixture.service, fixture.definition);
+  }
+  assert.notEqual(first.runtime.Characteristic.CustomState, second.runtime.Characteristic.CustomState);
+  assert.equal(HomeKitDevice.prototype.addCharacteristic.call({}, first.service, first.definition), undefined);
+  assert.equal(HomeKitDevice.prototype.addCharacteristic.call({ hap: first.runtime }, undefined, first.definition), undefined);
+});
+
+test('custom registry name collisions leave existing types and services intact', () => {
+  let { runtime, service, definition } = customCharacteristicFixture();
+  let add = HomeKitDevice.prototype.addCharacteristic.bind({ hap: runtime });
+  let characteristic = add(service, definition);
+  let originalType = runtime.Characteristic.CustomState;
+  assert.throws(() => add(service, { ...definition, uuid: 'ACCF0002-DEF9-480F-A6F5-933AD9D682FE' }), /already registered/);
+  assert.equal(runtime.Characteristic.CustomState, originalType);
+  assert.equal(service.characteristics[0], characteristic);
+  for (let name of ['constructor', '__proto__', 'prototype', 'name']) {
+    assert.throws(() => add(service, { ...definition, name }), /already registered/);
+  }
+  assert.equal(service.characteristics.length, 1);
+});
+
+test('custom definitions reject a registered UUID under another name before changing the service', () => {
+  let { runtime, service, definition } = customCharacteristicFixture();
+  let add = HomeKitDevice.prototype.addCharacteristic.bind({ hap: runtime });
+  let getter = () => 1;
+  let characteristic = add(service, definition, { onGet: getter });
+  let originalType = runtime.Characteristic.CustomState;
+
+  for (let uuid of [definition.uuid, definition.uuid.toLowerCase()]) {
+    for (let target of [service, { ...service, characteristics: [] }]) {
+      let originalCount = target.characteristics.length;
+      assert.throws(() => add(target, { ...definition, name: 'Other State', uuid }, {
+        onGet: () => 99, initialValue: 99,
+      }), /UUID already registered as: CustomState/);
+      assert.equal(target.characteristics.length, originalCount);
+      assert.equal(Object.hasOwn(runtime.Characteristic, 'OtherState'), false);
+      assert.equal(characteristic.getter, getter);
+      assert.equal(characteristic.value, 0);
+    }
+  }
+  assert.equal(runtime.Characteristic.CustomState, originalType);
+  assert.equal(add(service, definition), characteristic);
+  assert.equal(add({ ...service, characteristics: [] }, definition).constructor, originalType);
+});
+
+test('custom definitions cannot register a standard HAP UUID under another name', () => {
+  let { runtime, service, definition } = customCharacteristicFixture();
+  runtime.Characteristic.On = class extends runtime.Characteristic {
+    static UUID = '00000025-0000-1000-8000-0026BB765291';
+  };
+  let standardType = runtime.Characteristic.On;
+  assert.throws(() => HomeKitDevice.prototype.addCharacteristic.call({ hap: runtime }, service, {
+    ...definition, uuid: standardType.UUID.toLowerCase(),
+  }), /UUID already registered as: On/);
+  assert.equal(runtime.Characteristic.On, standardType);
+  assert.equal(Object.hasOwn(runtime.Characteristic, 'CustomState'), false);
+  assert.equal(service.characteristics.length, 0);
+});
+
+test('failed custom construction permits a corrected definition without restarting', () => {
+  let { runtime, service, definition } = customCharacteristicFixture();
+  let add = HomeKitDevice.prototype.addCharacteristic.bind({ hap: runtime });
+  assert.throws(() => add(service, { ...definition, props: { format: 'invalid' } }), /Fixture invalid format/);
+  assert.equal(Object.hasOwn(runtime.Characteristic, 'CustomState'), false);
+  assert.equal(service.characteristics.length, 0);
+
+  let characteristic = add(service, definition);
+  assert.equal(characteristic.props.format, 'uint8');
+  assert.equal(characteristic.constructor, runtime.Characteristic.CustomState);
+  assert.equal(add(service, definition), characteristic);
+  assert.equal(service.characteristics.length, 1);
+});
+
+test('custom static values cannot overwrite constructor properties', () => {
+  let { runtime, service, definition } = customCharacteristicFixture();
+  let add = HomeKitDevice.prototype.addCharacteristic.bind({ hap: runtime });
+  for (let key of ['UUID', 'name', 'prototype', '__proto__']) {
+    assert.throws(() => add(service, { ...definition, values: { [key]: 'invalid' } }), /cannot overwrite/);
+    assert.equal(Object.hasOwn(runtime.Characteristic, 'CustomState'), false);
+  }
+  assert.equal(add(service, definition).UUID, definition.uuid);
+});
+
 test('characteristic setup defers current-value validation until final props are installed', () => {
   for (let [value, previousProps, props, initialValue] of [
     [0, { minValue: 0, maxValue: 25 }, { minValue: 9, maxValue: 32, minStep: 0.5 }, 9],

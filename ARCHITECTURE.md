@@ -4,7 +4,7 @@
 
 `HomeKitDevice` is a shared base class for accessory implementations. It sits between application-owned device data and either the standalone HAP-NodeJS runtime or the Homebridge runtime, giving each device type a common lifecycle, message bus, accessory helper layer, timer system, and optional EveHome history integration. Homebridge may expose HAP, Matter, or both.
 
-**Version:** 2026.10.18
+**Version:** 2026.10.25
 **Primary module:** `HomeKitDevice.js`  
 **Consumers:** subclasses and host applications
 
@@ -371,6 +371,13 @@ Ensures a characteristic exists and optionally applies:
 - `initialValue`
 
 The helper respects optional characteristics and avoids adding duplicates.
+
+`characteristicType` also accepts a custom definition containing `name`, `uuid`, default `props`, and optional static `values`. It creates a HAP characteristic subclass using the current runtime's `Characteristic` constructor. Removing whitespace from the display name gives its registry key: `Custom State` becomes `this.hap.Characteristic.CustomState`. Registration remains local to that HAP runtime; HomeKitDevice does not maintain a separate global type registry or allocate UUIDs.
+
+The first registration owns the type defaults and static constants. Repeated definitions with the same name and UUID reuse the constructor; existing service characteristics are resolved by UUID, preserving cached instance identity. Definition properties are passed directly to HAP, while `options.props` applies instance-specific overrides. Definitions remain developer-owned constants; HAP handles construction and property validation. Conflicting names, UUIDs registered under another name, and static values that overwrite constructor properties are rejected. New registrations check existing runtime types, including standard HAP characteristics, for a matching UUID regardless of letter case; repeated same-name setup avoids this scan. New types are registered only after successful characteristic attachment and resolution, so failed construction leaves the registry name available for a corrected definition. Device-specific state interpretation remains in the subclass's handlers.
+
+The return value is the resolved characteristic instance, or `undefined` when no usable service is supplied. Custom definitions also return `undefined` when HAP is unavailable, including Matter-only devices. Existing constructor-based calls retain their behavior.
+
 For finite numeric initial values, the helper temporarily clears the owned instance's current value during `setProps()`, restoring it in `finally` before the normal service update. HAP therefore validates the initial value against final props without first clamping the construction default. Change events retain the previous value; validation remains owned by HAP. Other calls retain existing behavior, and shared prototypes remain untouched.
 
 ### `removeCharacteristic(service, characteristicOrType)`

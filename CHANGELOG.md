@@ -2,9 +2,22 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
-## 2026.10.24
+## 2026.10.25
+
+### Added
+
+- Accepted custom characteristic definitions in `addCharacteristic()`, registering named types within the current HAP runtime while reusing existing service characteristics by UUID
+- Retained constructor-based calls and rejected conflicting names without replacing registered types
+
+### Fixed
+
+- Left custom type names unregistered when characteristic construction fails, allowing corrected definitions to retry without restarting
+
+- Rejected custom definitions that reuse a registered UUID under another name, including standard HAP UUIDs and differences in letter case, before changing the service
 
 ### Changed
+
+- Kept custom characteristic registration close to the existing constructor pattern, leaving property validation to HAP without deep cloning developer-owned definitions
 
 - Made shutdown regression tests portable to Windows through IPC-triggered handlers while retaining native SIGTERM delivery on POSIX systems
 

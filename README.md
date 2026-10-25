@@ -1,6 +1,6 @@
 # HomeKitDevice
 
-**Version:** 2026.10.18
+**Version:** 2026.10.25
 
 `HomeKitDevice` is a shared base class for building accessories with Homebridge or standalone HAP-NodeJS. Homebridge accessories can expose HAP, Matter, or both through the same lifecycle and messaging API.
 
@@ -207,6 +207,25 @@ Accepts either an existing service instance or a HAP service type with an option
 ### `addCharacteristic(service, characteristic, options)`
 
 Binds a characteristic to the given service with handler and property options.
+
+Pass an existing HAP characteristic type, or define a custom type inline:
+
+```js
+this.addCharacteristic(service, {
+  name: 'Custom State',
+  uuid: '12345678-1234-4123-8123-123456789ABC', // Use your project's allocated UUID.
+  props: { format: this.hap.Formats.UINT8, perms: [this.hap.Perms.PAIRED_READ] },
+  values: { OFF: 0, ON: 1 },
+}, {
+  onGet: () => this.deviceData.customState,
+});
+```
+
+The custom definition requires `name`, a valid `uuid`, and default `props`; static named `values` are optional. Whitespace is removed from the name to form the runtime registry key, so this example registers `this.hap.Characteristic.CustomState`, including its `OFF` and `ON` constants. Allocate a permanent UUID for each custom type; the example UUID is illustrative.
+
+The first registration supplies the type's defaults and constants. Later definitions with the same registry name and UUID reuse that type, and existing service characteristics are reused by UUID, including cached instances. Instance-specific overrides still belong in `options.props`. Definitions are scoped to the current HAP runtime; conflicting names and UUIDs registered under another name throw without replacing registered types. UUID comparisons ignore letter case, and the UUID check includes standard HAP types. Static `values` cannot overwrite constructor properties such as `UUID`, `name`, or `prototype`. Definitions are developer-owned constants: keep their properties stable after registration. HAP handles construction and property validation. A new type is registered only after successful attachment and resolution; if construction fails, a corrected definition can be retried without restarting.
+
+The method returns the resolved characteristic instance. Calls without a usable HAP service return `undefined`; custom definitions also return `undefined` when HAP is unavailable, including Matter-only devices.
 
 Supported `options`:
 
@@ -526,7 +545,7 @@ Public static configuration and message constants include:
 Each subclass may define a static `VERSION` string for visibility in logs:
 
 ```js
-static VERSION = '2026.10.18';
+static VERSION = '2026.10.25';
 ```
 
 ---

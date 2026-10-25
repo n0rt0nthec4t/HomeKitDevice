@@ -169,6 +169,16 @@ const LOG_LEVELS = {
  */
 
 /**
+ * Definition of a custom HAP characteristic type registered on the current runtime.
+ *
+ * @typedef {object} HomeKitCustomCharacteristic
+ * @property {string} name Display name; removing whitespace gives its Characteristic registry key.
+ * @property {string} uuid Permanent HAP UUID for the type.
+ * @property {Object<string, *>} props Default HAP properties, including format and permissions.
+ * @property {Object<string, *>} [values] Static named values; existing constructor properties cannot be overwritten.
+ */
+
+/**
  * Options applied while resolving a HAP characteristic.
  *
  * @typedef {object} HomeKitCharacteristicOptions
@@ -222,7 +232,7 @@ export default class HomeKitDevice extends EventEmitter {
   static EVEHOME = undefined; // HomeKitHistory object
   static LOGGER = undefined; // Logging object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.10.18'; // Code version
+  static VERSION = '2026.10.25'; // Code version
 
   // Persistent context namespace for this class. Subclasses may override to isolate their own context.
   static PERSISTENCE_NAMESPACE = 'HomeKitDevice';
@@ -1746,12 +1756,15 @@ export default class HomeKitDevice extends EventEmitter {
    * Resolve or add a HAP characteristic, then apply its handlers, properties, and initial value.
    *
    * @param {object} service HAP service receiving the characteristic.
-   * @param {Function|object} characteristicType HAP characteristic constructor or type.
+   * @param {Function|object|HomeKitCustomCharacteristic} characteristicType HAP type or custom definition.
    * @param {HomeKitCharacteristicOptions} [options={}] Characteristic behavior and metadata.
    * @returns {object|undefined} Resolved HAP characteristic.
+   * @throws {TypeError} When static values overwrite constructor properties.
+   * @throws {Error} When its registry name or UUID already identifies a different type.
    */
   addCharacteristic(service, characteristicType, { props, onSet, onGet, initialValue } = {}) {
     let characteristic = undefined;
+    let customName = undefined;
 
     // Work only with a HAP service like object exposing the complete surface this
     // helper needs. Returning undefined keeps the method safe for absent HAP
@@ -1763,6 +1776,65 @@ export default class HomeKitDevice extends EventEmitter {
       typeof service?.addCharacteristic === 'function' &&
       typeof service?.addOptionalCharacteristic === 'function'
     ) {
+      // Custom definitions use lowercase name/uuid fields. Existing HAP types
+      // pass through unchanged and use the same attachment code below.
+      if (
+        typeof characteristicType === 'object' && characteristicType !== null &&
+        (Object.hasOwn(characteristicType, 'uuid') === true || Object.hasOwn(characteristicType, 'name') === true)
+      ) {
+        // Matter-only devices do not register HAP types, even if handed a service stub.
+        if (typeof this.hap?.Characteristic !== 'function') {
+          return undefined;
+        }
+
+        let { name, uuid, props: definitionProps, values } = characteristicType;
+        // Keep the display name, but remove spaces for registry access:
+        // 'Custom State' becomes this.hap.Characteristic.CustomState.
+        let className = name.replace(/\s/g, '');
+        let type = this.hap.Characteristic[className];
+        if (type !== undefined) {
+          // The first registration owns the defaults and static values. Later
+          // calls reuse that class only when its UUID still matches this name.
+          if (typeof type !== 'function' || typeof type.UUID !== 'string' || type.UUID.toUpperCase() !== uuid.toUpperCase()) {
+            throw new Error('HAP characteristic name already registered: ' + className);
+          }
+        } else {
+          // A UUID owns one registered name, including standard HAP types.
+          // Check only new registrations; repeated setup keeps its existing type.
+          for (let [registeredName, registeredType] of Object.entries(this.hap.Characteristic)) {
+            if (typeof registeredType?.UUID === 'string' && registeredType.UUID.toUpperCase() === uuid.toUpperCase()) {
+              throw new Error('HAP characteristic UUID already registered as: ' + registeredName);
+            }
+          }
+
+          // Give the subclass its registry name and let HAP initialise each
+          // instance from the definition's props and format-specific default value.
+          type = {
+            [className]: class extends this.hap.Characteristic {
+              static UUID = uuid;
+
+              constructor() {
+                super(name, uuid, definitionProps);
+                this.value = this.getDefaultValue();
+              }
+            },
+          }[className];
+
+          // Attach named constants to the class, e.g. CustomState.OFF = 0.
+          // These are separate from props.validValues, which constrains instance values.
+          for (let [key, value] of Object.entries(values ?? {})) {
+            // Preserve constructor fields such as UUID, name and prototype.
+            if (key in type) {
+              throw new TypeError('Custom HAP value cannot overwrite constructor property: ' + key);
+            }
+            type[key] = value;
+          }
+          // Remember the pending name; publish it only after HAP attaches the instance.
+          customName = className;
+        }
+        characteristicType = type;
+      }
+
       // Reuse an existing characteristic. If it is merely advertised as optional,
       // use HAP's optional path so the service creates it with the correct metadata.
       if (service.testCharacteristic(characteristicType) === false) {
@@ -1778,6 +1850,11 @@ export default class HomeKitDevice extends EventEmitter {
 
       // Resolve the single existing or new instance before attaching any behavior.
       characteristic = service.getCharacteristic(characteristicType);
+
+      // Failed construction must leave the name available for a corrected definition.
+      if (customName !== undefined) {
+        this.hap.Characteristic[customName] = characteristicType;
+      }
 
       // Bind HomeKit writes and reads only when the caller supplied handlers.
       if (typeof onSet === 'function') {
