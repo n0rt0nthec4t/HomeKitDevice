@@ -3275,7 +3275,7 @@ test('service helpers create and reuse primary and subtype services and remove b
   let primary = device.addService(type, 'Primary');
   assert.equal(primary.displayName, 'Primary');
   assert.equal(device.addService(type, 'Ignored'), primary);
-  let secondary = device.addService(type, 'Secondary', 'second', { enabled: true });
+  let secondary = device.addService(type, 'Secondary', 'second', { history: { enabled: true } });
   assert.notEqual(secondary, primary);
   assert.equal(device.addService(type, 'Ignored', 'second'), secondary);
   assert.equal(device.accessory.services.length, 3);
@@ -3292,6 +3292,152 @@ test('service helpers create and reuse primary and subtype services and remove b
   device.accessory = {};
   assert.equal(device.addService(type), undefined);
   assert.equal(device.removeService(type), false);
+});
+
+// Keep service construction separate from accessory lookup so failed creation
+// and incompatible accessory results exercise the public registration boundary.
+function customServiceFixture() {
+  class Service {
+    constructor(displayName, UUID, subtype) {
+      this.displayName = displayName;
+      this.UUID = UUID;
+      this.subtype = subtype;
+      this.characteristics = [];
+      this.optionalCharacteristics = [];
+    }
+
+    testCharacteristic(type) {
+      return this.characteristics.some((item) => item.UUID === type.UUID);
+    }
+
+    addCharacteristic(type) {
+      this.characteristics.push(new type());
+    }
+
+    addOptionalCharacteristic(type) {
+      this.optionalCharacteristics.push(new type());
+    }
+  }
+  class Required {
+    static UUID = 'required';
+    UUID = Required.UUID;
+  }
+  class Optional {
+    static UUID = 'optional';
+    UUID = Optional.UUID;
+  }
+  let runtime = { Service };
+  let accessory = {
+    services: [],
+    getService(type) {
+      return this.services.find((item) => item.UUID === type.UUID);
+    },
+    getServiceById(type, subtype) {
+      return this.services.find((item) => item.UUID === type.UUID && item.subtype === subtype);
+    },
+    addService(type, name, subtype) {
+      let service = new type(name, subtype);
+      this.services.push(service);
+      return service;
+    },
+  };
+  let definition = {
+    name: 'Custom Sensor', uuid: '12345678-1234-4123-8123-123456789ABC',
+    required: [Required], optional: [Optional],
+  };
+  return { runtime, accessory, definition };
+}
+
+test('custom services register named types, populate characteristics and preserve subtype/cache identity', () => {
+  let { runtime, accessory, definition } = customServiceFixture();
+  let add = HomeKitDevice.prototype.addService.bind({ hap: runtime, accessory });
+  let eveOptions = { enabled: true };
+  let first = add(definition, 'First', 'first', { history: eveOptions });
+  let type = runtime.Service.CustomSensor;
+  assert.equal(type.name, 'CustomSensor');
+  assert.equal(type.UUID, definition.uuid);
+  assert.equal(first.displayName, 'First');
+  assert.equal(first.subtype, 'first');
+  assert.equal(Object.getOwnPropertySymbols(first).some((key) => first[key]?.history === eveOptions), true);
+  assert.deepEqual(first.characteristics.map((item) => item.UUID), ['required']);
+  assert.deepEqual(first.optionalCharacteristics.map((item) => item.UUID), ['optional']);
+  assert.equal(add(definition, 'Ignored', 'first'), first);
+  assert.equal(add(type), first);
+  let second = add({ ...definition, required: [], optional: [] }, 'Second', 'second');
+  assert.equal(second.constructor, type);
+  assert.deepEqual(second.characteristics.map((item) => item.UUID), ['required']);
+  assert.equal(accessory.services.length, 2);
+
+  // Cache restoration need not retain the original subclass constructor.
+  let cached = { UUID: definition.uuid.toLowerCase(), subtype: 'cached' };
+  accessory.getServiceById = () => cached;
+  assert.equal(add(definition, 'Cached', 'cached'), cached);
+});
+
+test('custom service registrations stay runtime-local and support omitted characteristic lists and absent HAP', () => {
+  let first = customServiceFixture();
+  let second = customServiceFixture();
+  for (let fixture of [first, second]) {
+    let definition = { name: fixture.definition.name, uuid: fixture.definition.uuid };
+    let service = HomeKitDevice.prototype.addService.call({ hap: fixture.runtime, accessory: fixture.accessory }, definition);
+    assert.deepEqual(service.characteristics, []);
+    assert.deepEqual(service.optionalCharacteristics, []);
+  }
+  assert.notEqual(first.runtime.Service.CustomSensor, second.runtime.Service.CustomSensor);
+  assert.equal(HomeKitDevice.prototype.addService.call({ accessory: first.accessory }, first.definition), undefined);
+  assert.equal(HomeKitDevice.prototype.addService.call({ hap: first.runtime }, first.definition), undefined);
+});
+
+test('custom service name and UUID conflicts preserve existing registrations', () => {
+  let { runtime, accessory, definition } = customServiceFixture();
+  let add = HomeKitDevice.prototype.addService.bind({ hap: runtime, accessory });
+  let service = add(definition);
+  let type = runtime.Service.CustomSensor;
+  assert.throws(() => add({ ...definition, uuid: '12345678-1234-4123-8123-123456789ABD' }), /name already registered/);
+  for (let uuid of [definition.uuid, definition.uuid.toLowerCase()]) {
+    assert.throws(() => add({ ...definition, name: 'Other Sensor', uuid }), /UUID already registered/);
+  }
+  runtime.Service.Switch = class {
+    static UUID = '00000049-0000-1000-8000-0026BB765291';
+  };
+  assert.throws(
+    () => add({ ...definition, name: 'Other Sensor', uuid: runtime.Service.Switch.UUID.toLowerCase() }),
+    /UUID already registered/,
+  );
+  assert.equal(runtime.Service.CustomSensor, type);
+  assert.equal(Object.hasOwn(runtime.Service, 'OtherSensor'), false);
+  assert.deepEqual(accessory.services, [service]);
+});
+
+test('failed custom service construction leaves its name available for correction', () => {
+  let { runtime, accessory, definition } = customServiceFixture();
+  let add = HomeKitDevice.prototype.addService.bind({ hap: runtime, accessory });
+  assert.throws(() => add({ ...definition, required: [undefined] }), TypeError);
+  assert.equal(Object.hasOwn(runtime.Service, 'CustomSensor'), false);
+  assert.deepEqual(accessory.services, []);
+  assert.equal(add(definition).constructor, runtime.Service.CustomSensor);
+});
+
+test('service identity checks reject incompatible accessory results before registration or Eve configuration', () => {
+  for (let custom of [true, false]) {
+    for (let returned of [
+      undefined, null, {}, { UUID: 42 }, { UUID: 'wrong' },
+      { UUID: '12345678-1234-4123-8123-123456789ABC', subtype: 'wrong' },
+    ]) {
+      let { runtime, accessory, definition } = customServiceFixture();
+      accessory.getServiceById = () => returned;
+      accessory.addService = () => returned;
+      let type = custom === true ? definition : { UUID: definition.uuid };
+      assert.throws(
+        () => HomeKitDevice.prototype.addService.call({ hap: runtime, accessory }, type, '', 'expected', { enabled: true }),
+        /unexpected UUID or subtype/,
+      );
+      assert.equal(Object.hasOwn(runtime.Service, 'CustomSensor'), false);
+      if (returned !== null && typeof returned === 'object') {
+        assert.equal(Object.getOwnPropertySymbols(returned).length, 0);
+      }
+    }
+  }
 });
 
 test('characteristic helpers create required and optional characteristics and apply configuration', async (context) => {
@@ -3901,45 +4047,52 @@ test('setup summary preserves formatting, levels, fallback and clears consumed d
   assert.equal(calls.some((call) => call[1] === '  += Plain detail'), false);
 });
 
-test('Eve setup links annotated services after onAdd and removes temporary configuration', async (context) => {
-  let originalEve = HomeKitDevice.EVEHOME;
-  let linked = [];
-  let historyArgs;
-  class History {
-    static EVE_OPTIONS = Symbol('eve-options');
-    EveHome = { evetype: 'switch' };
-    constructor(...args) {
-      historyArgs = args;
-    }
+for (let form of ['service', 'empty-service']) {
+  test('Eve setup links history after onAdd and consumes temporary configuration: ' + form, async (context) => {
+    let originalEve = HomeKitDevice.EVEHOME;
+    let linked = [];
+    let historyArgs;
+    class History {
+      EveHome = { evetype: 'switch' };
 
-    linkToEveHome(service, options) {
-      linked.push([service, options]);
+      constructor(...args) {
+        historyArgs = args;
+      }
+
+      linkToEveHome(service, options) {
+        linked.push([service, options]);
+      }
     }
-  }
-  HomeKitDevice.EVEHOME = History;
-  let device;
-  context.after(async () => {
-    try {
-      await device?.remove();
-    } finally {
-      HomeKitDevice.EVEHOME = originalEve;
-    }
+    HomeKitDevice.EVEHOME = History;
+    let device;
+    context.after(async () => {
+      try {
+        await device?.remove();
+      } finally {
+        HomeKitDevice.EVEHOME = originalEve;
+      }
+    });
+    device = new HomeKitDevice(undefined, {
+      version: 2.7, hap, platformAccessory: MockAccessory, registerPlatformAccessories() {},
+    }, { ...deviceData('EVE-LINK'), eveHistory: true });
+    let service;
+    let options = form.startsWith('empty') === true ? {} : { description: 'Switch history', messages: () => {} };
+    device.onAdd = () => {
+      service = device.addService({ UUID: 'eve-switch' }, 'Switch', undefined,
+        { history: options });
+      assert.equal(linked.length, 0);
+      assert.equal(Object.getOwnPropertySymbols(service).some((key) => service[key]?.history === options), true);
+    };
+    assert.equal(await device.add({ enableHistory: true }), true);
+    assert.equal(historyArgs[0], device.accessory);
+    assert.equal(historyArgs[1], hap);
+    assert.deepEqual(linked, [[service, options]]);
+    assert.equal(Object.getOwnPropertySymbols(service).length, 0);
+    device.onAdd = () => {};
+    await device.add({ enableHistory: true });
+    assert.equal(linked.length, 1, 'history options are consumed only once');
   });
-  device = new HomeKitDevice(undefined, {
-    version: 2.7, hap, platformAccessory: MockAccessory, registerPlatformAccessories() {},
-  }, { ...deviceData('EVE-LINK'), eveHistory: true });
-  let service;
-  let options = { description: 'Switch history' };
-  device.onAdd = () => {
-    service = device.addService({ UUID: 'eve-switch' }, 'Switch', undefined, options);
-    assert.equal(linked.length, 0);
-  };
-  assert.equal(await device.add({ enableHistory: true }), true);
-  assert.equal(historyArgs[0], device.accessory);
-  assert.equal(historyArgs[1], hap);
-  assert.deepEqual(linked, [[service, options]]);
-  assert.equal(Object.hasOwn(service, History.EVE_OPTIONS), false);
-});
+}
 
 test('disabled Eve setup removes all Eve characteristics and history services without skipping neighbours', async (context) => {
   class Service extends MockService {}
@@ -3950,7 +4103,8 @@ test('disabled Eve setup removes all Eve characteristics and history services wi
   context.after(() => device.remove());
   let service;
   device.onAdd = () => {
-    service = device.addService({ UUID: 'switch' });
+    service = device.addService({ UUID: 'switch' }, '', undefined, { history: {} });
+    assert.equal(Object.getOwnPropertySymbols(service).length, 1);
     service.characteristics = [{ UUID: 'E863F101' }, { UUID: 'E863F102' }, { UUID: 'keep' }];
     service.removeCharacteristic = (characteristic) => {
       service.characteristics.splice(service.characteristics.indexOf(characteristic), 1);
@@ -3960,6 +4114,7 @@ test('disabled Eve setup removes all Eve characteristics and history services wi
   };
   assert.equal(await device.add(), true);
   assert.deepEqual(service.characteristics, [{ UUID: 'keep' }]);
+  assert.equal(Object.getOwnPropertySymbols(service).length, 0);
   assert.equal(device.accessory.services.some((entry) => entry.UUID === Service.EveHomeHistory.UUID), false);
 });
 

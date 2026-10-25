@@ -4,7 +4,7 @@
 
 `HomeKitDevice` is a shared base class for accessory implementations. It sits between application-owned device data and either the standalone HAP-NodeJS runtime or the Homebridge runtime, giving each device type a common lifecycle, message bus, accessory helper layer, timer system, and optional EveHome history integration. Homebridge may expose HAP, Matter, or both.
 
-**Version:** 2026.10.25
+**Version:** 2026.10.26
 **Primary module:** `HomeKitDevice.js`  
 **Consumers:** subclasses and host applications
 
@@ -353,9 +353,26 @@ The snapshot tracks the display name, AccessoryInformation values, service UUIDs
 
 ## HAP Service/Characteristic And Matter Cluster Helpers
 
-### `addService(serviceType, name, subType, eveOptions)`
+### `addService(serviceType, name, subType, options)`
 
-Finds or creates a service on the accessory. If `eveOptions` are supplied, they are temporarily attached to the service and linked to EveHome after `onAdd()` completes.
+Finds or creates a service on the accessory. The fourth argument contains optional `primary`, `hidden` and `history` fields. Explicit boolean flags are applied through HAP on both new and cached services; omitted flags retain existing state. Service options containing `history` are temporarily annotated using a module-private symbol owned by HomeKitDevice. After `onAdd()` completes, the annotation is consumed and removed, and only its nested `history` payload is forwarded to HomeKitHistory when Eve history is enabled. This also removes pending annotations when history is disabled. HomeKitDevice no longer depends on a HomeKitHistory-owned storage key, and no separate pending-options registry is needed.
+
+History payloads previously passed directly as the fourth argument must now be nested under `history`, including empty payloads (`{ history: {} }`). Flags-only and empty service options do not request history linking.
+
+The first argument also accepts `{ name, uuid, required, optional }`. Required and
+optional lists contain registered characteristic constructors and default to empty
+arrays. The generated class extends the current runtime's Service, preserving the
+instance display name and subtype arguments. New instances attach required
+characteristics without duplicating those supplied by HAP and advertise optional
+characteristics. Cached instances retain their existing characteristic lists.
+
+Custom service types follow the characteristic registration contract: runtime-local
+named classes, case-insensitive UUID conflict checks, and registration only after
+successful attachment and identity verification. The resolved UUID and explicitly
+requested subtype must match before service flags or history metadata are applied. Constructor identity
+is not required for cached services. Missing HAP representations remain safe no-ops;
+UUID generation stays with the consuming project.
+
 
 ### `removeService(serviceOrType, subType)`
 

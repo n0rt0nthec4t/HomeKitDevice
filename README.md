@@ -1,6 +1,6 @@
 # HomeKitDevice
 
-**Version:** 2026.10.25
+**Version:** 2026.10.26
 
 `HomeKitDevice` is a shared base class for building accessories with Homebridge or standalone HAP-NodeJS. Homebridge accessories can expose HAP, Matter, or both through the same lifecycle and messaging API.
 
@@ -190,10 +190,63 @@ await device.add({
 
 ---
 
-### `addService(service, name?, subtype?, eveOptions?)`
+### `addService(service, name?, subtype?, options?)`
 
 Adds the specified HAP service to the accessory if not already present.  
 Returns the existing or newly created service instance.
+
+Pass an existing HAP service type, or a custom definition:
+
+```js
+this.sensorService = this.addService({
+  name: 'Custom Sensor',
+  uuid: '12345678-1234-4123-8123-123456789ABC', // Use your project's permanent service UUID.
+  required: [this.hap.Characteristic.StatusActive],
+  optional: [this.hap.Characteristic.StatusFault],
+}, this.deviceData.description, 'sensor');
+```
+
+The definition's `name` identifies the type; removing whitespace gives its registry
+key (`this.hap.Service.CustomSensor`). The separate `name` argument names the
+service instance, and `subtype` distinguishes multiple instances of that type.
+`required` and `optional` are optional arrays of already-registered characteristic
+constructors. Required characteristics are attached to new instances; optional
+ones are advertised for later attachment. Required characteristics already added
+by HAP, such as Name, are reused.
+
+The first registration owns the characteristic lists. Keep definitions stable
+after registration. Existing cached services are reused by UUID and requested
+subtype without replacing their characteristics; use `addCharacteristic()` to
+configure or extend those instances. Registry-name and UUID conflicts are rejected,
+including attempts to reuse a standard service UUID under a new name. UUID
+comparisons ignore letter case.
+
+The resolved service's UUID and any explicitly requested subtype are checked
+before registering a new type or applying service options. Construction or identity
+failures throw and leave the new type name unregistered, allowing a corrected
+definition to retry. Calls without a usable HAP accessory return `undefined`;
+custom definitions also return `undefined` when the HAP Service API is unavailable.
+Existing constructor-based calls and deferred Eve configuration remain supported.
+
+The fourth argument accepts:
+
+- `primary` — Explicit `true` or `false` sets or clears the primary service flag.
+- `hidden` — Explicit `true` or `false` sets or clears the hidden service flag.
+- `history` — HomeKitHistory options forwarded after `onAdd()` finishes. Use `{}` to request linking with default history options.
+
+```js
+this.sensorService = this.addService(this.hap.Service.TemperatureSensor, '', 1, {
+  primary: true,
+  hidden: false,
+  history: { messages: this.message.bind(this) },
+});
+```
+
+Flags apply to both new and cached services. Omitted flags leave the existing state
+unchanged; omitted `history` does not request linking. Pending service options use
+a module-private symbol owned by HomeKitDevice. After setup, only `history` is
+forwarded to HomeKitHistory and the temporary annotation is deleted. HomeKitHistory
+does not need to expose an options-storage key.
 
 ---
 
@@ -545,7 +598,7 @@ Public static configuration and message constants include:
 Each subclass may define a static `VERSION` string for visibility in logs:
 
 ```js
-static VERSION = '2026.10.25';
+static VERSION = '2026.10.26';
 ```
 
 ---

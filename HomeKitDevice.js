@@ -106,6 +106,7 @@ import { isDeepStrictEqual } from 'node:util';
 import process from 'node:process';
 
 // Define constants
+const SERVICE_OPTIONS = Symbol('serviceOptions'); // Temporary service setup options owned by HomeKitDevice
 const LOG_LEVELS = {
   INFO: 'info',
   SUCCESS: 'success',
@@ -166,6 +167,25 @@ const LOG_LEVELS = {
  * @param {string} timerHandle Name of the timer that fired.
  * @param {Object<string, *>} message Timer payload.
  * @returns {*|Promise<*>} Optional callback result; timer execution does not consume it.
+ */
+
+/**
+ * Definition of a custom HAP service type registered on the current runtime.
+ *
+ * @typedef {object} HomeKitCustomService
+ * @property {string} name Type name; removing whitespace gives its Service registry key.
+ * @property {string} uuid Permanent HAP UUID for the service type.
+ * @property {Function[]} [required] Registered characteristic types added to new service instances.
+ * @property {Function[]} [optional] Registered characteristic types advertised as optional on new instances.
+ */
+
+/**
+ * Options applied to a resolved HAP service.
+ *
+ * @typedef {object} HomeKitServiceOptions
+ * @property {boolean} [primary] Set or clear the primary flag; omission preserves the current flag.
+ * @property {boolean} [hidden] Set or clear the hidden flag; omission preserves the current flag.
+ * @property {Object<string, *>} [history] HomeKitHistory options linked after onAdd completes.
  */
 
 /**
@@ -232,7 +252,7 @@ export default class HomeKitDevice extends EventEmitter {
   static EVEHOME = undefined; // HomeKitHistory object
   static LOGGER = undefined; // Logging object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.10.25'; // Code version
+  static VERSION = '2026.10.26'; // Code version
 
   // Persistent context namespace for this class. Subclasses may override to isolate their own context.
   static PERSISTENCE_NAMESPACE = 'HomeKitDevice';
@@ -1230,14 +1250,12 @@ export default class HomeKitDevice extends EventEmitter {
         if (type === HomeKitDevice.ADD) {
           // After the accessory is initialised and onAdd has run, link or unlink any EveHome services
           for (let service of [...(this.accessory?.services || [])]) {
-            let options = service?.[HomeKitDevice?.EVEHOME?.EVE_OPTIONS];
-            if (options !== undefined) {
-              delete service[HomeKitDevice?.EVEHOME?.EVE_OPTIONS];
-            }
+            let options = service?.[SERVICE_OPTIONS];
+            delete service?.[SERVICE_OPTIONS];
 
-            // Link to EveHome if eveHistory is enabled.
-            if (this.deviceData?.eveHistory === true && options !== undefined) {
-              this?.historyService?.linkToEveHome?.(service, options);
+            // Link configured history after service setup.
+            if (this.deviceData?.eveHistory === true && options?.history !== undefined) {
+              this.historyService?.linkToEveHome?.(service, options.history);
             }
 
             // Otherwise unlink in case it was previously enabled and has now been disabled.
@@ -1662,16 +1680,18 @@ export default class HomeKitDevice extends EventEmitter {
   }
 
   /**
-   * Resolve or create a HAP service and optionally defer its Eve configuration.
+   * Resolve or create a HAP service, apply service flags and defer its history configuration.
    *
-   * @param {Function|object} serviceType HAP service constructor or service type accepted by the runtime.
+   * @param {Function|object|HomeKitCustomService} serviceType HAP service type or custom definition.
    * @param {string} [name=''] Display name used when a service is created.
    * @param {string} [subType] Stable subtype used to distinguish services of the same type.
-   * @param {Object<string, *>} [eveOptions] Options passed to the Eve history integration after setup.
+   * @param {HomeKitServiceOptions} [options] Service flags and optional HomeKitHistory configuration.
    * @returns {object|undefined} Existing or newly created HAP service.
+   * @throws {Error} When its registry name or UUID conflicts, or the resolved UUID/subtype differs.
    */
-  addService(serviceType, name = '', subType = undefined, eveOptions = undefined) {
+  addService(serviceType, name = '', subType = undefined, options = undefined) {
     let service = undefined;
+    let customName = undefined;
 
     // Work only with a HAP accessory exposing every lookup and creation method
     // needed by this helper. Matter-only devices therefore return undefined
@@ -1682,6 +1702,57 @@ export default class HomeKitDevice extends EventEmitter {
       typeof this?.accessory?.getServiceById === 'function' &&
       typeof this?.accessory?.addService === 'function'
     ) {
+      // Custom definitions follow the same registration pattern as characteristics.
+      // Existing service constructors pass through unchanged.
+      if (
+        typeof serviceType === 'object' && serviceType !== null &&
+        (Object.hasOwn(serviceType, 'uuid') === true || Object.hasOwn(serviceType, 'name') === true)
+      ) {
+        if (typeof this.hap?.Service !== 'function') {
+          return undefined;
+        }
+
+        let { name: typeName, uuid, required = [], optional = [] } = serviceType;
+        // The type name is distinct from each instance's display name and subtype.
+        let className = typeName.replace(/\s/g, '');
+        let type = this.hap.Service[className];
+        if (type !== undefined) {
+          // Repeated definitions reuse the first class, including its characteristic lists.
+          if (typeof type !== 'function' || typeof type.UUID !== 'string' || type.UUID.toUpperCase() !== uuid.toUpperCase()) {
+            throw new Error('HAP service name already registered: ' + className);
+          }
+        } else {
+          // A service UUID must not acquire another registry name, including standard types.
+          for (let [registeredName, registeredType] of Object.entries(this.hap.Service)) {
+            if (typeof registeredType?.UUID === 'string' && registeredType.UUID.toUpperCase() === uuid.toUpperCase()) {
+              throw new Error('HAP service UUID already registered as: ' + registeredName);
+            }
+          }
+
+          type = {
+            [className]: class extends this.hap.Service {
+              static UUID = uuid;
+
+              constructor(displayName, subtype) {
+                super(displayName, uuid, subtype);
+
+                // Populate new instances. Cached instances keep their existing characteristics.
+                for (let characteristic of required) {
+                  if (this.testCharacteristic(characteristic) === false) {
+                    this.addCharacteristic(characteristic);
+                  }
+                }
+                for (let characteristic of optional) {
+                  this.addOptionalCharacteristic(characteristic);
+                }
+              }
+            },
+          }[className];
+          customName = className;
+        }
+        serviceType = type;
+      }
+
       // A subtype identifies one of several services with the same type. Without
       // one, reuse the accessory's primary service of that type.
       if (subType !== undefined) {
@@ -1695,10 +1766,36 @@ export default class HomeKitDevice extends EventEmitter {
         service = this.accessory.addService(serviceType, name, subType);
       }
 
-      // Retain Eve configuration on the resolved service. add() links it only
-      // after onAdd() has finished building the complete HAP representation.
-      if (service !== undefined && eveOptions !== null && typeof eveOptions === 'object' && eveOptions.constructor === Object) {
-        service[HomeKitDevice?.EVEHOME?.EVE_OPTIONS] = eveOptions;
+      // Cached services can have a generic constructor. UUID and the requested
+      // subtype identify the instance before registration or Eve configuration.
+      if (
+        typeof service?.UUID !== 'string' || typeof serviceType.UUID !== 'string' ||
+        service.UUID.toUpperCase() !== serviceType.UUID.toUpperCase() ||
+        (subType !== undefined && service.subtype !== subType)
+      ) {
+        throw new Error('HAP accessory returned a service with an unexpected UUID or subtype');
+      }
+
+      // Failed construction or resolution leaves this name available for a corrected definition.
+      if (customName !== undefined) {
+        this.hap.Service[customName] = serviceType;
+      }
+
+      if (options !== null && typeof options === 'object' && options.constructor === Object) {
+        // Explicit booleans update both new and cached services. Omitted flags
+        // leave the current state unchanged, while false clears a flag.
+        if (typeof options.primary === 'boolean') {
+          service.setPrimaryService(options.primary);
+        }
+        if (typeof options.hidden === 'boolean') {
+          service.setHiddenService(options.hidden);
+        }
+
+        if (options.history !== null && typeof options.history === 'object' && options.history.constructor === Object) {
+          // Retain setup options under our own key. ADD consumes history only
+          // after onAdd has finished building all services and characteristics.
+          service[SERVICE_OPTIONS] = options;
+        }
       }
     }
 

@@ -2,6 +2,24 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2026.10.26
+
+### Added
+
+- Added primary and hidden flags to service setup options, applying explicit booleans to new and cached services while preserving omitted flags
+
+- Accepted custom service definitions in `addService()` with required and optional characteristic types, runtime-local registration, name/UUID conflict checks and retry after failed construction
+
+### Fixed
+
+- Checked resolved service UUIDs and requested subtypes before registration or Eve configuration, retaining cached service identity without requiring the original constructor
+
+### Changed
+
+- Owned temporary service options through a private symbol instead of HomeKitHistory.EVE_OPTIONS, retaining deferred history linking and removing the annotation after setup
+
+- Moved HomeKitHistory configuration into the fourth argument's `history` field; callers must wrap former direct history payloads in `{ history: options }`, including `{ history: {} }` for defaults
+
 ## 2026.10.25
 
 ### Added
