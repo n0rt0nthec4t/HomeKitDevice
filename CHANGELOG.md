@@ -2,6 +2,13 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2026.10.29
+
+### Fixed
+
+- Translated ordinary HAP read/write callback failures and Matter command failures into the registering protocol's error status, retaining original causes and explicit protocol errors without changing internal lifecycle dispatch
+- Preserved callback receivers, arguments, results and cached registration behaviour while applying protocol error handling
+
 ## 2026.10.26
 
 ### Added

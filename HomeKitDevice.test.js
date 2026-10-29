@@ -3568,6 +3568,128 @@ function customCharacteristicFixture() {
   return { runtime, service, definition };
 }
 
+for (let method of ['onGet', 'onSet']) {
+  for (let asynchronous of [false, true]) {
+    test('HAP ' + method + ' translates callback failure, asynchronous=' + asynchronous, async () => {
+      let { runtime, service, definition } = customCharacteristicFixture();
+      runtime.HapStatusError = class extends Error {
+        constructor(status) {
+          super('HAP status ' + status);
+          this.hapStatus = status;
+        }
+      };
+      runtime.HAPStatus = { SERVICE_COMMUNICATION_FAILURE: -70402 };
+      let failure = new Error('Fixture communication failure');
+      let receiver = {};
+      let args = [false, { source: 'fixture' }, { connection: 'fixture' }];
+      let callback = function (...received) {
+        assert.equal(this, receiver);
+        assert.deepEqual(received, args);
+        if (asynchronous === true) {
+          return Promise.reject(failure);
+        }
+        throw failure;
+      };
+      let characteristic = HomeKitDevice.prototype.addCharacteristic.call({ hap: runtime }, service, definition, { [method]: callback });
+      let handler = characteristic[method === 'onGet' ? 'getter' : 'setter'];
+      for (let error of [failure, 'Fixture primitive failure']) {
+        failure = error;
+        await assert.rejects(handler.apply(receiver, args), (error) =>
+          error instanceof runtime.HapStatusError && error.hapStatus === -70402 && error.cause === failure,
+        );
+      }
+      for (let error of [new runtime.HapStatusError(-70403), -70403]) {
+        failure = error;
+        await assert.rejects(handler.apply(receiver, args), (rejected) => rejected === error);
+      }
+    });
+  }
+
+  test('HAP ' + method + ' retains callback results and replacement on cached characteristics', async () => {
+    let { runtime, service, definition } = customCharacteristicFixture();
+    runtime.HapStatusError = class extends Error {};
+    runtime.HAPStatus = { SERVICE_COMMUNICATION_FAILURE: -70402 };
+    let add = HomeKitDevice.prototype.addCharacteristic.bind({ hap: runtime });
+    let characteristic;
+    let receiver = {};
+    let args = [{ fixture: true }];
+    for (let result of [false, 0, null, undefined, { value: 1 }]) {
+      let callback = function (...received) {
+        assert.equal(this, receiver);
+        assert.deepEqual(received, args);
+        return result;
+      };
+      let resolved = add(service, definition, { [method]: callback });
+      characteristic ??= resolved;
+      assert.equal(resolved, characteristic);
+      let handler = characteristic[method === 'onGet' ? 'getter' : 'setter'];
+      assert.equal(await handler.apply(receiver, args), result);
+    }
+  });
+}
+
+test('Matter callback errors use the Matter runtime even when HAP is also available', async () => {
+  class MatterProtocolError extends Error {}
+  class Failure extends MatterProtocolError {}
+  let status = { Failure, isMatterProtocolError: (error) => error instanceof MatterProtocolError };
+  let device = { hap: {}, matter: { status }, matterAccessory: {} };
+  let add = HomeKitDevice.prototype.addMatterCluster.bind(device);
+  let receiver = {};
+  let args = [{ level: 50 }, { connection: 'fixture' }];
+  for (let asynchronous of [false, true]) {
+    let failure;
+    let callback = function (...received) {
+      assert.equal(this, receiver);
+      assert.deepEqual(received, args);
+      if (asynchronous === true) {
+        return Promise.reject(failure);
+      }
+      throw failure;
+    };
+    add('levelControl', { handlers: { moveToLevel: callback } });
+    let handler = device.matterAccessory.handlers.levelControl.moveToLevel;
+    for (let error of [new Error('Fixture communication failure'), 'Fixture primitive failure']) {
+      failure = error;
+      await assert.rejects(handler.apply(receiver, args), (rejected) => rejected instanceof Failure && rejected.cause === error);
+    }
+    failure = new MatterProtocolError('Fixture explicit status');
+    await assert.rejects(handler.apply(receiver, args), (rejected) => rejected === failure);
+  }
+});
+
+test('Matter callbacks retain results, descriptor merging and callers without a status API', async () => {
+  class Failure extends Error {}
+  let device = { matter: { status: { Failure, isMatterProtocolError: (error) => error instanceof Failure } }, matterAccessory: {} };
+  let add = HomeKitDevice.prototype.addMatterCluster.bind(device);
+  let receiver = {};
+  let args = [false, { request: 'fixture' }];
+  for (let result of [false, 0, null, undefined, { value: 1 }]) {
+    let callback = function (...received) {
+      assert.equal(this, receiver);
+      assert.deepEqual(received, args);
+      return result;
+    };
+    let handlers = { on: callback, unavailable: undefined };
+    add('onOff', { initialState: { onOff: false }, handlers });
+    assert.equal(handlers.on, callback, 'Registration must not mutate the caller handler map');
+    let on = device.matterAccessory.handlers.onOff.on;
+    add('onOff', { initialState: { retained: true }, handlers: { off: () => false } });
+    assert.equal(device.matterAccessory.handlers.onOff.on, on);
+    assert.equal(await on.apply(receiver, args), result);
+    assert.equal(await device.matterAccessory.handlers.onOff.off(), false);
+    assert.equal(device.matterAccessory.handlers.onOff.unavailable, undefined);
+    assert.deepEqual(device.matterAccessory.clusters.onOff, { onOff: false, retained: true });
+  }
+  delete device.matter.status;
+  let failure = new Error('Fixture legacy runtime failure');
+  let callback = () => {
+    throw failure;
+  };
+  add('onOff', { handlers: { on: callback } });
+  assert.equal(device.matterAccessory.handlers.onOff.on, callback);
+  assert.throws(callback, (error) => error === failure);
+});
+
 test('custom definitions register a named type and reuse cached characteristics with existing options', () => {
   let { runtime, service, definition } = customCharacteristicFixture();
   let add = HomeKitDevice.prototype.addCharacteristic.bind({ hap: runtime });

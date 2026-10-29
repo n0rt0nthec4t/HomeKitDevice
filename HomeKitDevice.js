@@ -203,8 +203,8 @@ const LOG_LEVELS = {
  *
  * @typedef {object} HomeKitCharacteristicOptions
  * @property {Object<string, *>} [props] HAP characteristic constraints and metadata.
- * @property {Function} [onSet] Handler invoked for a HomeKit write.
- * @property {Function} [onGet] Handler invoked for a HomeKit read.
+ * @property {Function} [onSet] Handler invoked for a HomeKit write; ordinary failures become HAP communication errors.
+ * @property {Function} [onGet] Handler invoked for a HomeKit read; ordinary failures become HAP communication errors.
  * @property {*} [initialValue] Value applied through the service without invoking `onSet`.
  *   For finite numeric values, current-value validation is deferred until final props are installed.
  */
@@ -214,7 +214,7 @@ const LOG_LEVELS = {
  *
  * @typedef {object} HomeKitMatterClusterOptions
  * @property {Object<string, *>} [initialState] Initial cluster attribute values.
- * @property {Object<string, Function>} [handlers] Command names mapped to their handlers.
+ * @property {Object<string, Function>} [handlers] Command names mapped to their handlers; ordinary failures become Matter Failure errors.
  */
 
 /**
@@ -252,7 +252,7 @@ export default class HomeKitDevice extends EventEmitter {
   static EVEHOME = undefined; // HomeKitHistory object
   static LOGGER = undefined; // Logging object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.10.26'; // Code version
+  static VERSION = '2026.10.29'; // Code version
 
   // Persistent context namespace for this class. Subclasses may override to isolate their own context.
   static PERSISTENCE_NAMESPACE = 'HomeKitDevice';
@@ -1851,6 +1851,8 @@ export default class HomeKitDevice extends EventEmitter {
 
   /**
    * Resolve or add a HAP characteristic, then apply its handlers, properties, and initial value.
+   * Registered callbacks retain explicit HAP errors and numeric statuses. Other failures
+   * become communication errors with the original failure retained as cause.
    *
    * @param {object} service HAP service receiving the characteristic.
    * @param {Function|object|HomeKitCustomCharacteristic} characteristicType HAP type or custom definition.
@@ -1961,12 +1963,30 @@ export default class HomeKitDevice extends EventEmitter {
         this.hap.Characteristic[customName] = characteristicType;
       }
 
-      // Bind HomeKit writes and reads only when the caller supplied handlers.
-      if (typeof onSet === 'function') {
-        characteristic.onSet(onSet);
-      }
-      if (typeof onGet === 'function') {
-        characteristic.onGet(onGet);
+      // Translate at the HAP boundary rather than changing errors from internal
+      // GET/SET dispatch. Capture this runtime so late failures survive teardown.
+      let hap = this.hap;
+      for (let [method, callback] of [['onSet', onSet], ['onGet', onGet]]) {
+        if (typeof callback !== 'function') {
+          continue;
+        }
+        let handler = callback;
+        if (typeof hap?.HapStatusError === 'function') {
+          handler = async function (...args) {
+            try {
+              // Preserve HAP's callback receiver, arguments and optional result.
+              return await callback.apply(this, args);
+            } catch (error) {
+              if (error instanceof hap.HapStatusError || typeof error === 'number') {
+                throw error;
+              }
+              let failure = new hap.HapStatusError(hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE);
+              failure.cause = error;
+              throw failure;
+            }
+          };
+        }
+        characteristic[method](handler);
       }
 
       // Characteristic constraints such as range, step, unit, and valid values
@@ -2003,6 +2023,8 @@ export default class HomeKitDevice extends EventEmitter {
    * Add or extend a declarative cluster on the pending Matter accessory descriptor.
    *
    * Repeated calls merge attributes and command handlers for the same cluster.
+   * Registered callbacks preserve explicit protocol errors; other failures use
+   * the runtime's Matter Failure status with the original error retained as cause.
    *
    * @param {string} clusterName Matter cluster descriptor key.
    * @param {HomeKitMatterClusterOptions} [options={}] Initial attributes and command handlers.
@@ -2040,6 +2062,30 @@ export default class HomeKitDevice extends EventEmitter {
     this.matterAccessory.clusters = { ...currentClusters, [clusterName]: nextState };
 
     if (handlers !== null && typeof handlers === 'object' && handlers.constructor === Object) {
+      // Matter errors belong to this registration boundary even when the same
+      // device also exposes HAP. Older runtimes without status types keep their handlers.
+      let status = this.matter?.status;
+      let commandHandlers = { ...handlers };
+      if (typeof status?.Failure === 'function') {
+        for (let [name, callback] of Object.entries(commandHandlers)) {
+          if (typeof callback !== 'function') {
+            continue;
+          }
+          commandHandlers[name] = async function (...args) {
+            try {
+              return await callback.apply(this, args);
+            } catch (error) {
+              if (error instanceof status.Failure || status.isMatterProtocolError?.(error) === true) {
+                throw error;
+              }
+              let failure = new status.Failure('Device communication failed');
+              failure.cause = error;
+              throw failure;
+            }
+          };
+        }
+      }
+
       // Commands are keyed beneath the same cluster name. Merge them independently
       // from attributes because one cluster commonly declares several commands.
       let currentHandlers =
@@ -2052,7 +2098,7 @@ export default class HomeKitDevice extends EventEmitter {
           : {};
       this.matterAccessory.handlers = {
         ...currentHandlers,
-        [clusterName]: { ...clusterHandlers, ...handlers },
+        [clusterName]: { ...clusterHandlers, ...commandHandlers },
       };
     }
 
