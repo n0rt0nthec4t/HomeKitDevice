@@ -252,7 +252,7 @@ export default class HomeKitDevice extends EventEmitter {
   static EVEHOME = undefined; // HomeKitHistory object
   static LOGGER = undefined; // Logging object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.10.29'; // Code version
+  static VERSION = '2026.11.05'; // Code version
 
   // Persistent context namespace for this class. Subclasses may override to isolate their own context.
   static PERSISTENCE_NAMESPACE = 'HomeKitDevice';
@@ -1966,6 +1966,7 @@ export default class HomeKitDevice extends EventEmitter {
       // Translate at the HAP boundary rather than changing errors from internal
       // GET/SET dispatch. Capture this runtime so late failures survive teardown.
       let hap = this.hap;
+      let device = this;
       for (let [method, callback] of [['onSet', onSet], ['onGet', onGet]]) {
         if (typeof callback !== 'function') {
           continue;
@@ -1975,7 +1976,11 @@ export default class HomeKitDevice extends EventEmitter {
           handler = async function (...args) {
             try {
               // Preserve HAP's callback receiver, arguments and optional result.
-              return await callback.apply(this, args);
+              // Keep post-SET callback work inside the lifecycle queue too;
+              // otherwise incoming UPDATEs can interleave with its publication.
+              return await (method === 'onSet'
+                ? device.#queueMessage('Characteristic.onSet', () => callback.apply(this, args))
+                : callback.apply(this, args));
             } catch (error) {
               if (error instanceof hap.HapStatusError || typeof error === 'number') {
                 throw error;

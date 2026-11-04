@@ -2,6 +2,12 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2026.11.05
+
+### Fixed
+
+- Kept complete HAP write callbacks in the device lifecycle queue so source updates cannot interleave between an accepted SET and its callback's state publication
+
 ## 2026.10.29
 
 ### Fixed

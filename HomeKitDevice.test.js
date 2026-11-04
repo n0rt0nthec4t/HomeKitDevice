@@ -3570,7 +3570,7 @@ function customCharacteristicFixture() {
 
 for (let method of ['onGet', 'onSet']) {
   for (let asynchronous of [false, true]) {
-    test('HAP ' + method + ' translates callback failure, asynchronous=' + asynchronous, async () => {
+    test('HAP ' + method + ' translates callback failure, asynchronous=' + asynchronous, async (context) => {
       let { runtime, service, definition } = customCharacteristicFixture();
       runtime.HapStatusError = class extends Error {
         constructor(status) {
@@ -3590,7 +3590,10 @@ for (let method of ['onGet', 'onSet']) {
         }
         throw failure;
       };
-      let characteristic = HomeKitDevice.prototype.addCharacteristic.call({ hap: runtime }, service, definition, { [method]: callback });
+      let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('HAP-FAILURE-' + method));
+      context.after(() => device.remove());
+      device.hap = runtime;
+      let characteristic = device.addCharacteristic(service, definition, { [method]: callback });
       let handler = characteristic[method === 'onGet' ? 'getter' : 'setter'];
       for (let error of [failure, 'Fixture primitive failure']) {
         failure = error;
@@ -3605,11 +3608,14 @@ for (let method of ['onGet', 'onSet']) {
     });
   }
 
-  test('HAP ' + method + ' retains callback results and replacement on cached characteristics', async () => {
+  test('HAP ' + method + ' retains callback results and replacement on cached characteristics', async (context) => {
     let { runtime, service, definition } = customCharacteristicFixture();
     runtime.HapStatusError = class extends Error {};
     runtime.HAPStatus = { SERVICE_COMMUNICATION_FAILURE: -70402 };
-    let add = HomeKitDevice.prototype.addCharacteristic.bind({ hap: runtime });
+    let device = new HomeKitDevice(undefined, { version: 2.7, hap }, deviceData('HAP-RESULT-' + method));
+    context.after(() => device.remove());
+    device.hap = runtime;
+    let add = device.addCharacteristic.bind(device);
     let characteristic;
     let receiver = {};
     let args = [{ fixture: true }];
@@ -4392,3 +4398,40 @@ test('invalid nested writes are ignored before state ownership and strict merged
   assert.equal(calls, 2);
   assert.equal(device.deviceData.model, 'Switch');
 });
+
+for (let homebridge of [false, true]) {
+  test('complete HAP write callback precedes queued source UPDATE, Homebridge=' + homebridge, { timeout: 1000 }, async (context) => {
+    let device = new HomeKitDevice(undefined, homebridge === true ? { version: 2.7, hap } : hap, {
+      ...deviceData('HAP-CALLBACK-ORDER-' + homebridge), requested: false,
+      hkPairingCode: '031-45-154', hkUsername: 'AA:BB:CC:DD:EE:FF',
+    });
+    context.after(() => device.remove());
+    let { runtime, service, definition } = customCharacteristicFixture();
+    runtime.HapStatusError = class extends Error {};
+    runtime.HAPStatus = { SERVICE_COMMUNICATION_FAILURE: -70402 };
+    device.hap = runtime;
+    let entered = Promise.withResolvers();
+    let release = Promise.withResolvers();
+    context.after(() => release.resolve());
+    let calls = [];
+    device.onUpdate = (data) => calls.push(['update', data.requested]);
+    let characteristic = device.addCharacteristic(service, definition, {
+      onSet: async (value) => {
+        await device.set({ requested: value });
+        calls.push(['accepted', device.deviceData.requested]);
+        entered.resolve();
+        await release.promise;
+        calls.push(['callback', device.deviceData.requested]);
+      },
+    });
+    let write = characteristic.setter(true);
+    await entered.promise;
+    let update = device.update({ requested: false });
+    await setImmediate();
+    assert.deepEqual(calls, [['accepted', true]]);
+    release.resolve();
+    await Promise.all([write, update]);
+    assert.deepEqual(calls, [['accepted', true], ['callback', true], ['update', false]]);
+    assert.equal(device.deviceData.requested, false);
+  });
+}
