@@ -228,7 +228,7 @@ const LOG_LEVELS = {
  * @extends EventEmitter
  */
 export default class HomeKitDevice extends EventEmitter {
-  // Device messages
+  // Device messages below use matching on<Type>() hooks.
   static ADD = 'HomeKitDevice.onAdd';
   static UPDATE = 'HomeKitDevice.onUpdate';
   static REMOVE = 'HomeKitDevice.onRemove';
@@ -238,8 +238,10 @@ export default class HomeKitDevice extends EventEmitter {
   static MESSAGE = 'HomeKitDevice.onMessage';
   static SHUTDOWN = 'HomeKitDevice.onShutdown';
   static TIMER = 'HomeKitDevice.onTimer';
-  static ONLINE = 'HomeKitDevice._online';
-  static OFFLINE = 'HomeKitDevice._offline';
+
+  // Device messages below use registered handlers or fall back to onMessage().
+  static ONLINE = 'HomeKitDevice.online';
+  static OFFLINE = 'HomeKitDevice.offline';
 
   // HomeKit pin format and MAC address regex patterns
   static HK_PIN_3_2_3 = /^\d{3}-\d{2}-\d{3}$/;
@@ -252,7 +254,7 @@ export default class HomeKitDevice extends EventEmitter {
   static EVEHOME = undefined; // HomeKitHistory object
   static LOGGER = undefined; // Logging object
   static TYPE = 'base'; // String naming type of device
-  static VERSION = '2026.11.05'; // Code version
+  static VERSION = '2026.11.06'; // Code version
 
   // Persistent context namespace for this class. Subclasses may override to isolate their own context.
   static PERSISTENCE_NAMESPACE = 'HomeKitDevice';

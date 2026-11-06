@@ -2,6 +2,12 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2026.11.06
+
+### Changed
+
+- Renamed availability message values from `HomeKitDevice._online` / `HomeKitDevice._offline` to `HomeKitDevice.online` / `HomeKitDevice.offline`, retaining listener and `onMessage()` dispatch; callers using literal strings must update them, while `ONLINE` / `OFFLINE` constant users require no changes
+
 ## 2026.11.05
 
 ### Fixed
