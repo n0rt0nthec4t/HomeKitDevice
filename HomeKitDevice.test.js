@@ -916,9 +916,14 @@ test('independent HAP publication failures use the same failure path', async () 
     on() {},
   };
   let externalDevice = new HomeKitDevice(undefined, homebridgeApi, deviceData('EXTERNAL-PUBLISH-FAILED'));
+  let externalWarnings = [];
+  externalDevice.log = { warn: (...args) => externalWarnings.push(args) };
 
   assert.equal(await externalDevice.add({ hapAccessoryName: 'Television', externalPublish: true }), false);
   assert.equal(externalDevice.accessory, undefined);
+  assert.deepEqual(externalWarnings, [
+    ['  += Failed to advertise "%s": %s', 'Device EXTERNAL-PUBLISH-FAILED', 'External publish failed'],
+  ]);
 
   class FailingAccessory extends MockAccessory {
     async publish() {
@@ -939,11 +944,16 @@ test('independent HAP publication failures use the same failure path', async () 
     hkPairingCode: '123-45-678',
   });
 
+  let standaloneWarnings = [];
+  standaloneDevice.log = { warn: (...args) => standaloneWarnings.push(args) };
   assert.equal(
     await standaloneDevice.add({ hapAccessoryName: 'Switch', hapCategory: standaloneHap.Categories.SWITCH }),
     false,
   );
   assert.equal(standaloneDevice.accessory, undefined);
+  assert.deepEqual(standaloneWarnings, [
+    ['  += Failed to advertise "%s": %s', 'Device STANDALONE-PUBLISH-FAILED', 'Standalone publish failed'],
+  ]);
 
   await externalDevice.remove();
   await standaloneDevice.remove();
@@ -1135,7 +1145,7 @@ test('initial UPDATE rejection stops external publication and forwards its origi
   await assert.rejects(device.add({ externalPublish: true }), (error) => error === failure);
   assert.equal(published, 0);
   assert.equal(device.accessory, cachedAccessory);
-  assert.deepEqual(errors, [['Accessory setup failed for "%s"', device.deviceData.description]]);
+  assert.deepEqual(errors, [['Setup failed for "%s"', device.deviceData.description]]);
 });
 
 // Lifecycle hooks must walk every override, retaining the device as the receiver.
@@ -2190,7 +2200,7 @@ for (let outcome of ['resolve', 'reject']) {
       cleanup.resolve();
       await device.remove();
     });
-    device.log = { warn: (...args) => warnings.push(args), success: () => calls.push('success') };
+    device.log = { warn: (...args) => warnings.push(args), success: () => calls.push('success'), error: () => calls.push('error') };
     device.onShutdown = () => calls.push('gpio:off', 'gpio:close');
     let adding = device.add({ hapAccessoryName: 'Cancel', hapCategory: hap.Categories.SWITCH });
     await entered.promise;
@@ -4287,7 +4297,7 @@ test('setup rejects a HAP representation without AccessoryInformation before cal
   assert.equal(await device.add(), false);
   assert.equal(device.accessory, undefined);
   assert.equal(device.historyService, undefined);
-  assert.equal(calls[0][0].startsWith('AccessoryInformation'), true);
+  assert.deepEqual(calls, [['Setup failed for "%s"', device.deviceData.description]]);
 });
 
 test('setup fails cleanly when its only Matter representation cannot be registered after onAdd', async (context) => {
@@ -4435,3 +4445,135 @@ for (let homebridge of [false, true]) {
     assert.equal(device.deviceData.requested, false);
   });
 }
+
+// Availability belongs to the successful setup summary, after either protocol
+// can fail independently, and must never be claimed by failed registrations.
+for (let scenario of [
+  { name: 'HAP only', hap: true, matter: false },
+  { name: 'Matter only', hap: false, matter: true },
+  { name: 'dual stack', hap: true, matter: true },
+  { name: 'Matter failure', hap: true, matter: true, failMatter: true },
+  { name: 'HAP failure', hap: true, matter: true, failHap: true },
+  { name: 'both fail', hap: true, matter: true, failHap: true, failMatter: true },
+]) {
+  test('setup reports active protocols after identity at debug level: ' + scenario.name, async (context) => {
+    let api = {
+      version: 2.7,
+      hap,
+      isHapEnabled: () => scenario.hap,
+      isMatterEnabled: () => scenario.matter,
+      platformAccessory: MockAccessory,
+      registerPlatformAccessories() {
+        if (scenario.failHap === true) {
+          throw new Error('HAP registration failed');
+        }
+      },
+      unregisterPlatformAccessories() {},
+      updatePlatformAccessories() {},
+      matter: {
+        async registerPlatformAccessories() {
+          if (scenario.failMatter === true) {
+            throw new Error('Matter registration failed');
+          }
+        },
+        async unregisterPlatformAccessories() {},
+        async updatePlatformAccessories() {},
+      },
+      on() {},
+    };
+    let device = new HomeKitDevice(undefined, api, deviceData('PROTOCOL-' + scenario.name));
+    context.after(() => device.remove());
+    let calls = [];
+    device.log = Object.fromEntries(['info', 'success', 'warn', 'error', 'debug'].map(
+      (level) => [level, (...args) => calls.push([level, ...args])],
+    ));
+    let hasHap = scenario.hap === true && scenario.failHap !== true;
+    let hasMatter = scenario.matter === true && scenario.failMatter !== true;
+    assert.equal(await device.add({ matterDeviceType: { name: 'SolarPower' } }), hasHap === true || hasMatter === true);
+    let expected = [];
+    if (hasHap === true) {
+      expected.push(['debug', '  += Using HomeKit']);
+    }
+    if (hasMatter === true) {
+      expected.push(['debug', '  += Using Matter as "%s"', 'Solar Power']);
+    }
+    assert.deepEqual(calls.filter((call) => call[1] === '  += Using HomeKit' || call[1].startsWith('  += Using Matter as')), expected);
+    let warnings = calls.filter((call) => call[0] === 'warn');
+    let expectedWarnings = [];
+    if (scenario.failHap === true) {
+      expectedWarnings.push(['warn', '  += HomeKit registration failed: %s', 'HAP registration failed']);
+    }
+    if (scenario.failMatter === true) {
+      expectedWarnings.push(['warn', '  += Matter registration failed: %s', 'Matter registration failed']);
+    }
+    assert.deepEqual(warnings, expectedWarnings);
+    let details = calls.filter((call) => call[1].startsWith('  += '));
+    if (hasHap === true || hasMatter === true) {
+      assert.deepEqual(details.slice(0, expected.length + 3), [
+        ['debug', '  += Homebridge backend'],
+        ['debug', '  += Serial number "%s"', device.deviceData.serialNumber],
+        ['debug', '  += Software version "%s"', device.deviceData.softwareVersion],
+        ...expected,
+      ]);
+      assert.equal(calls.filter((call) => call[0] === 'success').length, 1);
+      assert.equal(calls.filter((call) => call[0] === 'error').length, 0);
+    } else {
+      assert.equal(details.every((call) => call[0] === 'warn'), true);
+      assert.equal(calls.filter((call) => call[0] === 'success').length, 0);
+      assert.equal(calls.filter((call) => call[0] === 'error').length, 1);
+    }
+  });
+}
+
+for (let hook of ['onAdd', 'onUpdate']) {
+  test('setup reports one failure summary and clears stale details after ' + hook + ' rejects', async (context) => {
+    let failure = new Error('Rejected ' + hook);
+    let device = new HomeKitDevice(undefined, {
+      version: 2.7,
+      hap,
+      platformAccessory: MockAccessory,
+      registerPlatformAccessories() {},
+      unregisterPlatformAccessories() {},
+      on() {},
+    }, deviceData('SUMMARY-FAILURE-' + hook));
+    context.after(() => device.remove());
+    let calls = [];
+    device.log = Object.fromEntries(['info', 'success', 'warn', 'error', 'debug'].map(
+      (level) => [level, (...args) => calls.push([level, ...args])],
+    ));
+    device.postSetupDetail('Detail from failed attempt');
+    device[hook] = () => { throw failure; };
+    await assert.rejects(device.add({ hapAccessoryName: 'Switch' }), (error) => error === failure);
+    assert.deepEqual(calls.filter((call) => call[0] === 'error'), [
+      ['error', 'Setup failed for "%s"', 'Switch'],
+    ]);
+    assert.equal(calls.some((call) => call[0] === 'success'), false);
+    assert.equal(calls.some((call) => call[1].includes('Detail from failed attempt') || call[1] === '  += Using HomeKit' || call[1].startsWith('  += Using Matter as')), false);
+    assert.deepEqual(calls.filter((call) => call[0] === 'warn'), [
+      ['warn', '  += %s', 'Rejected ' + hook],
+    ]);
+    assert.equal(calls.filter((call) => call[0] === 'debug' && call[1] === 'Error in %s(): %s').length, 1);
+    calls.length = 0;
+    device[hook] = () => {};
+    assert.equal(await device.add({ hapAccessoryName: 'Switch' }), true);
+    assert.equal(calls.filter((call) => call[0] === 'success').length, 1);
+    assert.equal(calls.some((call) => call[0] === 'error' || call[0] === 'warn'), false);
+    assert.equal(calls.some((call) => call[1].includes('Detail from failed attempt')), false);
+  });
+}
+
+test('regular update hook stack traces are debug-only and retain the original rejection', async (context) => {
+  let device = new HomeKitDevice(undefined, {
+    version: 2.7, hap, platformAccessory: MockAccessory, registerPlatformAccessories() {},
+  }, deviceData('UPDATE-DEBUG-TRACE'));
+  context.after(() => device.remove());
+  assert.equal(await device.add(), true);
+  let calls = [];
+  device.log = Object.fromEntries(['info', 'success', 'warn', 'error', 'debug'].map(
+    (level) => [level, (...args) => calls.push([level, ...args])],
+  ));
+  let failure = new Error('Live update failed');
+  device.onUpdate = () => { throw failure; };
+  await assert.rejects(device.update({ reading: 1 }), (error) => error === failure);
+  assert.deepEqual(calls, [['debug', 'Error in %s(): %s', 'HomeKitDevice.onUpdate', failure.stack]]);
+});

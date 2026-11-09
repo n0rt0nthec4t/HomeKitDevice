@@ -2,6 +2,16 @@
 
 All notable changes to the `HomeKitDevice` module are documented in this file.
 
+## 2026.11.09
+
+### Added
+
+- Added active HomeKit and Matter protocols to debug setup details
+
+### Changed
+
+- Grouped setup results and diagnostics into one ordered summary; onAdd/onUpdate stack traces now use debug logging
+
 ## 2026.11.06
 
 ### Changed
